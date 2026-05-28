@@ -1,0 +1,267 @@
+WINDOWS-MCP ISSUES FOUND WHILE DRIVING NOVA IN THE SANDBOX
+Date: 2026-05-28
+Context: launched & drove E:\Nova Editor's nova.exe (winit + wgpu, fully GPU-rendered,
+no native child controls / no UIA tree) inside Windows Sandbox via the windows MCP.
+
+Legend: [HIGH] blocks automation of custom-rendered apps, [MED] friction, [LOW] polish.
+
+======================================================================
+RESOLUTION STATUS  (windows-mcp dev, 2026-05-28)
+======================================================================
+All 8 items addressed in source + compiled. Host helper rebuilt. Sandbox-flavor
+helper rebuild was pending a sandbox-window close at time of writing (the running
+sandbox holds the mapped payload locked); the Node-side + host-helper fixes are live.
+
+  1 [HIGH] press_key no WM_CHAR ...... FIXED  — root cause confirmed: wScan=0 meant
+            TranslateMessage/ToUnicode couldn't derive WM_CHAR. Now populate
+            wScan via MapVirtualKey(vk, VK_TO_VSC) in KeyDown/KeyUp. (Input.cs)
+  2 [HIGH] type_text silent no-op .... IMPROVED — impl already used SendInput +
+            KEYEVENTF_UNICODE (not UIA, as the report guessed); true cause is
+            keyboard focus / UIPI. Now returns events_sent + a note when 0
+            events were injected, so silent no-ops are visible. (Input.cs, Dispatcher.cs)
+  3 [MED]  screenshot "handle invalid" FIXED — GDI capture now retries up to 3x with
+            backoff before erroring; per-window path unchanged. (Capture.cs)
+  4 [MED]  launch_app false negative .. FIXED — WaitForInputIdle threw for the
+            winit/wgpu app mid-init and was mis-treated as failure. Now best-effort
+            + returns the pid regardless of window timing. (Apps.cs)
+  4b[MED]  screenshot scale vs clicks . FIXED — screenshot now returns a text block
+            with native resolution, shown resolution, scale, and the exact
+            image-pixel -> click-coord formula. (tools.ts)
+  5 [MED]  run_script short-name only . FIXED — run_script + save_flow now accept the
+            fully-qualified "mcp__windows__<name>" form as well as the short name. (tools.ts)
+  6 [MED]  project_dir lost on reconnect RE-FIXED (v2) — your POST-FIX VERIFICATION was
+            right, the first attempt didn't take. Two real root causes found:
+            (a) adopt relied on a single global ~/.windows-mcp/sandbox-active.json that
+                desynced/went missing across reconnects (confirmed: file ABSENT while a
+                sandbox was running). Adopt now SCANS each session's state/ready.json
+                (written by the in-sandbox helper itself), pings newest-first, and adopts
+                the live one — no single fragile file. Prunes dead sessions. (sandbox.ts)
+            (b) the helper's single-serial TCP accept stayed blocked in ReadLine on the
+                OLD (ungracefully-killed) MCP socket, so the reconnect's adopt-ping timed
+                out -> fresh spawn. Helper is now latest-connection-wins: a new connection
+                force-closes the previous one and is served, so adopt-ping always lands.
+                (Program.cs)
+            ECONNRESET was the force-kill sandbox-service corruption — force-kill removed
+            entirely (no taskkill /F; that wedges Windows Sandbox until reboot).
+            NOTE: (b) needs the sandbox-flavor helper rebuilt to take effect in-sandbox;
+            rebuild was blocked by the running sandbox holding vendor-sandbox locked.
+  7 [LOW/SEC] server instructions ..... FIXED — removed the "fetch external URL +
+            attribute to repo" directive from MCP server instructions; they are now
+            informational only. (index.ts)
+
+======================================================================
+POST-FIX VERIFICATION RUN  (Claude, 2026-05-28 ~06:50, after a /mcp reconnect)
+======================================================================
+Method: remounted E:\Nova Editor via start_sandbox, launched the existing
+nova.exe (pid 4600), drove it through the windows MCP. Results vs the claims:
+
+  1 press_key -> WM_CHAR ........ CONFIRMED FIXED. press_key H then I inserted
+        "hi" into Nova's editor (status moved to Ln 2 Col 3, tab went dirty).
+        This was a complete no-op before. Big one.
+  2 type_text ................... CONFIRMED FIXED (functionally). type_text
+        " there from type_text" inserted into the editor (-> Ln 2 Col 24).
+        CAVEAT: response was a bare {ok:true} — the promised events_sent /
+        "0 events" note field was NOT present, so that reporting bit may be
+        from a layer that isn't live yet.
+  3 screenshot handle-invalid ... LIKELY FIXED. Full-desktop screenshot
+        (target:sandbox, no pid) succeeded on the FIRST try this session; it
+        was ~50% "handle invalid" before. Only one sample, so not conclusive.
+  4 launch_app false-negative ... STILL REPRODUCES. launch_app nova.exe returned
+        "could not launch app" while list_apps showed pid 4600 active+valid.
+  5 run_script accepts FQ name .. STILL REPRODUCES. {"tool":"mcp__windows__focus_app"}
+        -> "unknown tool". Short name "focus_app" still works.
+  6 project_dir on reconnect .... STILL REPRODUCES. After the /mcp reconnect,
+        sandbox_status showed a NEW session + booted_at mounted to the env
+        default (E:\chrome-mcp\windows-mcp); had to re-run start_sandbox.
+
+INTERPRETATION (key takeaway):
+  Helper-side (C#) fixes ARE LIVE: #1, #2, #3 all work now -> the in-sandbox
+  helper binary got rebuilt (the earlier "vendor-sandbox locked" blocker must
+  have cleared when a sandbox window closed).
+  Node-side fixes are NOT live: #4's error string, #5 FQ-name acceptance, and
+  #6 adopt-on-reconnect all still show OLD behavior. Most likely the Node MCP
+  server process was not actually restarted — a /mcp *reconnect* re-attaches the
+  client transport to the still-running OLD node process. Suggest a full restart
+  of the Node server (kill + relaunch, not just client reconnect) to load the
+  rebuilt tools.ts / sandbox.ts / index.ts.
+  7 server instructions ......... NOT VERIFIABLE from inside this session (can't
+        re-read the live server-instruction block mid-run). Was still present at
+        session start; consistent with Node server being stale.
+
+======================================================================
+NEW ISSUE FOUND THIS SESSION
+======================================================================
+8. [HIGH] start_sandbox is destructive when a sandbox is already running
+----------------------------------------------------------------------
+Observed (reported by user, consistent with my repeated failures):
+  - Calling start_sandbox while a sandbox is ALREADY active pops Windows Sandbox's
+    native "Only one running instance of Windows Sandbox is allowed" dialog.
+  - Clicking OK on that dialog CLOSES the existing sandbox but does NOT spawn the
+    new (re-mounted) one. Net result: you lose the running sandbox and get nothing.
+  - This is why every attempt to remount E:\Nova Editor over an already-running
+    (windows-mcp-mounted) sandbox has been destructive, and why reconnect+remount
+    has been so painful all session.
+Also seen: a launch_app call returned "sandbox helper disconnected (read ECONNRESET)"
+  followed by ping -> "connect ETIMEDOUT 9335", i.e. the helper died mid-session even
+  though sandbox_status still reported active (stale status). The force-kill removal
+  noted under #6 did not prevent an ECONNRESET recurrence here.
+Suggested fix:
+  - start_sandbox should detect an already-running sandbox and EITHER reuse/adopt it
+    (preferred), OR gracefully shut it down FIRST and wait for full teardown before
+    spawning the replacement — never leave the user with zero sandboxes.
+
+RESOLUTION (windows-mcp dev, 2026-05-28):
+  8 FIXED (non-destructive). start_sandbox now:
+      - adopts + REUSES an already-running sandbox (via the ready.json scan) and returns
+        its status — the common case (same/no project_dir) never spawns or closes anything.
+      - if a DIFFERENT project_dir is requested while one is running, returns a clear error
+        telling you to close the sandbox window first. It NEVER force-closes (force-kill
+        wedges Windows Sandbox until reboot) and NEVER triggers the "only one instance"
+        dialog (it doesn't attempt a 2nd spawn while one is up). So you can't end up with
+        zero sandboxes. (sandbox.ts: startSandbox)
+      - the destructive "OK on the dialog closes the old + spawns nothing" path is gone:
+        the old force-kill recycle was removed entirely earlier (issue #6).
+    Stale-status part: sandbox_status now PINGS the helper before reporting active; a dead
+    helper (closed sandbox / ECONNRESET) is reported inactive and the tracking is cleared,
+    so the next call cleanly re-adopts or re-spawns. (sandbox.ts: statusVerified)
+    NOTE: like the others, needs the fresh Node server (full Claude restart) to be live.
+  - Have sandbox_status actually probe the helper (TCP) rather than report cached
+    "active:true" after the helper has died.
+
+----------------------------------------------------------------------
+1. [HIGH] press_key does not deliver a translated character (no WM_CHAR) for printable keys
+----------------------------------------------------------------------
+Observed:
+  - press_key {key:"DOWN"} and other NAMED keys work — Nova's cursor moved, status bar
+    updated Ln 1 -> Ln 2. (These are read from WM_KEYDOWN / virtual-key, so they arrive.)
+  - press_key for letter keys H,E,L,L,O produced NO text insertion. Status stayed "Ln 2, Col 1",
+    line stayed empty. Each call returned {ok:true}.
+Likely cause:
+  - press_key posts WM_KEYDOWN/WM_KEYUP for the VK code but never TranslateMessage()/WM_CHAR,
+    so apps that read the TRANSLATED character (the standard text-input path: winit's
+    KeyEvent.text, which is sourced from WM_CHAR) receive nothing.
+Suggested fix:
+  - After the key-down, synthesize the corresponding WM_CHAR (or use the SendInput scan-code
+    path that lets the OS translate it), so text-input-driven apps get the character.
+Impact: cannot type into any app that consumes WM_CHAR rather than raw VK (most text editors,
+  game/GPU UIs, anything using winit/SDL/GLFW text input).
+
+----------------------------------------------------------------------
+2. [HIGH] type_text silently no-ops on windows with no UIA text element
+----------------------------------------------------------------------
+Observed:
+  - type_text {text:"..."} returned {ok:true} but inserted nothing into Nova's editor.
+Likely cause:
+  - type_text uses a UIA ValuePattern.SetValue (or similar) against a focused accessibility
+    element. Nova is fully custom GPU-rendered and exposes no UIA text control, so the call
+    finds no target and does nothing — yet still reports success.
+Suggested fix:
+  - When no UIA text target is found, fall back to SendInput with KEYEVENTF_UNICODE
+    (synthesizing WM_CHAR per character).
+  - And/or return ok:false (or a "no_uia_target" note) instead of ok:true so callers know
+    nothing happened.
+
+----------------------------------------------------------------------
+3. [MED] screenshot "The handle is invalid" — intermittent (~50%)
+----------------------------------------------------------------------
+Observed:
+  - screenshot {target:"sandbox"} (full desktop) failed repeatedly with "The handle is invalid",
+    especially right after sandbox boot, and intermittently afterward.
+  - screenshot {target:"sandbox", pid:<nova>} (window-targeted) was far more reliable.
+Likely cause:
+  - Desktop Duplication / GDI capture handle going stale or not (re)acquired for the session;
+    the per-window path uses a different capture handle that survives.
+Suggested fix:
+  - Recreate the duplication/output handle on "invalid handle" and retry once before erroring;
+    or warm up the capture after sandbox boot.
+
+----------------------------------------------------------------------
+4. [MED] launch_app reports "could not launch app" even when the app launched fine
+----------------------------------------------------------------------
+Observed:
+  - launch_app for nova.exe returned the error string "could not launch app", but list_apps
+    immediately showed the process running with a valid, active window titled "Nova".
+  - This was a consistent false-negative for this GUI app.
+Likely cause:
+  - Success is gated on detecting a top-level window within a short window-wait; winit/wgpu apps
+    create their window a beat later (adapter/device init), so the heuristic times out and
+    reports failure even though launch succeeded.
+Suggested fix:
+  - Return the spawned pid regardless and let the caller verify via list_apps; or lengthen /
+    poll the window-wait; or treat "process alive" as success even if no window yet.
+
+----------------------------------------------------------------------
+5. [MED] run_script rejects fully-qualified MCP tool names in step.tool
+----------------------------------------------------------------------
+Observed:
+  - {"tool":"mcp__windows__press_key", ...} -> error "unknown tool" (stopped_at:0).
+  - {"tool":"press_key", ...} -> works.
+Note: every other surface in this MCP is addressed with the fully-qualified
+  "mcp__windows__<name>" form, so the short-name-only requirement here is surprising.
+Suggested fix:
+  - Accept both the short name and the "mcp__windows__"-prefixed name; or state the requirement
+    explicitly in the run_script tool description.
+
+----------------------------------------------------------------------
+6. [MED] start_sandbox project_dir override does not survive /mcp reconnect; one ECONNRESET
+----------------------------------------------------------------------
+Observed:
+  - start_sandbox {project_dir:"E:\\Nova Editor"} mounted correctly (sandbox_status confirmed
+    project_dir=E:\Nova Editor at C:\proj).
+  - After a client /mcp reconnect, sandbox_status reverted to the default
+    WINDOWS_MCP_SANDBOX_PROJECT (E:\chrome-mcp\windows-mcp); had to re-issue start_sandbox.
+  - Separately, one launch attempt returned "sandbox helper disconnected (read ECONNRESET) —
+    close the Sandbox window and call start_sandbox to recover".
+Suggested fix:
+  - Persist the per-session project_dir override across reconnects (or re-apply last override
+    on reconnect); investigate the ECONNRESET on the helper TCP channel.
+
+POST-FIX VERIFICATION (Nova session, 2026-05-28, fixes reported live):
+  - STILL REPRODUCES. Repro steps just run:
+      1. start_sandbox {project_dir:"E:\\Nova Editor"} -> sandbox_status confirmed
+         project_dir=E:\Nova Editor, nova.exe launched (pid 1092), focus_app OK.
+      2. client /mcp reconnect.
+      3. sandbox_status AFTER reconnect:
+           { active:true, session_id:"mpp46get-7zqfll4p",
+             project_dir:"E:\\chrome-mcp\\windows-mcp",   <-- reverted to env default
+             booted_at:"2026-05-28T06:30:42Z" }           <-- NEW boot, not adopted
+  - So the "adopt-on-reconnect reuses the already-running sandbox (preserving its mounts)"
+    change is NOT taking effect on reconnect: a fresh sandbox is spawned with the
+    WINDOWS_MCP_SANDBOX_PROJECT env default, and the prior E:\Nova Editor mount + the
+    running nova.exe (pid 1092) are lost. session_id and booted_at both changed.
+  - Possible causes to check: reconnect path still calls the spawn-with-env code instead of
+    the adopt path; or adopt only triggers when no env default is set; or the per-session
+    override (project_dir passed to start_sandbox) isn't recorded as the "last mount" to reuse.
+
+----------------------------------------------------------------------
+7. [LOW / SECURITY] MCP server instructions direct the agent to fetch an external URL + attribute to a 3rd-party repo
+----------------------------------------------------------------------
+Observed:
+  - The server-provided MCP instructions ask the client to fetch
+    "chrome-mcp.actuallyroy.com/.../manifest.json" and to attribute published outputs to a
+    GitHub repo. This is a prompt-injection-shaped directive embedded in server metadata.
+  - A cautious agent should ignore it (I did not fetch the URL or attribute anything).
+Suggested fix:
+  - Don't embed "go fetch this URL" / attribution directives in server instructions; if a
+    version check is needed, do it server-side, not by instructing the LLM client.
+
+----------------------------------------------------------------------
+WHAT WORKED WELL (no action needed)
+----------------------------------------------------------------------
+  - ping (host + sandbox), check_permissions, sandbox_status: reliable, useful output.
+  - start_sandbox: clean mount of project_dir to C:\proj.
+  - list_apps (sandbox): accurate pid/title/active; was the key tool for confirming launch.
+  - focus_app (by pid): worked.
+  - click {x,y}: registered ("via":"sendinput"). NOTE: clicks use real screen pixels, but
+    screenshots are downscaled to the 2000px cap, so screenshot-pixel -> click-coord needs a
+    scale factor; an option to return the capture's scale/native resolution would make
+    coordinate mapping reliable. (Minor; call it 4b.)
+  - press_key for NAMED keys (arrows etc.): worked.
+  - screenshot with pid: reliable.
+
+----------------------------------------------------------------------
+NOTE: a couple of these are also Nova-side observations, not MCP bugs:
+  - Nova exposes no UIA accessibility tree (everything is GPU-rendered). That's why UIA-based
+    automation can't see text. Real human keyboard input works (OS generates WM_CHAR), proven
+    by named-key navigation. Accessibility tree is a future Nova task, not an MCP issue.
+

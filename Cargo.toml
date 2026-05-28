@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["renderer"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.80"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Fast iteration: our crate stays unoptimized (quick incremental compiles) while
+# dependencies are optimized once and cached, so debug runtime is smooth enough
+# to test without a release build.
+[profile.dev.package."*"]
+opt-level = 3
