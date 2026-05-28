@@ -60,16 +60,30 @@ pub const ACTIVITY_ICON_ACTIVE: Color = Color::rgb(0xFF, 0xFF, 0xFF);
 
 pub const MONO_FAMILY: &str = "Consolas";
 pub const UI_FAMILY: &str = "Segoe UI";
-pub const ICON_FAMILY: &str = "Segoe MDL2 Assets";
+// VSCode's own icon font (Codicon, MIT). Bundled at renderer/assets/codicon.ttf
+// and loaded into the FontSystem at startup; its internal family name is "codicon".
+pub const ICON_FAMILY: &str = "codicon";
 
-pub const ICON_FOLDER: char = '\u{e8b7}';
-pub const ICON_SEARCH: char = '\u{e721}';
-pub const ICON_SYNC: char = '\u{e895}';
-pub const ICON_RUN: char = '\u{e768}';
-pub const ICON_EXTENSIONS: char = '\u{ea86}';
-pub const ICON_CLOSE: char = '\u{e711}';
-pub const ICON_ACCOUNT: char = '\u{e77b}';
-pub const ICON_SETTINGS: char = '\u{e713}';
+// Activity-bar / chrome glyphs — exact Codicon codepoints (match VSCode 1:1).
+pub const ICON_FILES: char = '\u{eaf0}'; // files (Explorer)
+pub const ICON_SEARCH: char = '\u{ea6d}'; // search
+pub const ICON_SOURCE_CONTROL: char = '\u{ea68}'; // source-control
+pub const ICON_RUN: char = '\u{eb91}'; // debug-alt (Run & Debug)
+pub const ICON_EXTENSIONS: char = '\u{eae6}'; // extensions
+pub const ICON_CLOSE: char = '\u{ea76}'; // close (tab ×)
+pub const ICON_ACCOUNT: char = '\u{eb99}'; // account
+pub const ICON_SETTINGS: char = '\u{eb51}'; // settings-gear
+pub const ICON_CHEVRON_DOWN: char = '\u{eab4}';
+pub const ICON_CHEVRON_RIGHT: char = '\u{eab6}';
+// Explorer header actions.
+pub const ICON_NEW_FILE: char = '\u{ea7f}'; // new-file
+pub const ICON_NEW_FOLDER: char = '\u{ea80}'; // new-folder
+pub const ICON_REFRESH: char = '\u{eb37}'; // refresh
+pub const ICON_COLLAPSE_ALL: char = '\u{eac5}'; // collapse-all
+// Title-bar layout toggles (right group, like VSCode).
+pub const ICON_LAYOUT_SIDEBAR_LEFT: char = '\u{ebf3}'; // layout-sidebar-left
+pub const ICON_LAYOUT_PANEL: char = '\u{ebf2}'; // layout-panel
+pub const ICON_LAYOUT_SIDEBAR_RIGHT: char = '\u{ebf4}'; // layout-sidebar-right
 
 // File-type icon colours (Seti-ish), keyed by extension.
 pub fn file_icon_color(name: &str) -> Color {
@@ -86,10 +100,10 @@ pub fn file_icon_color(name: &str) -> Color {
     }
 }
 
-// File-tree glyphs (Segoe MDL2 Assets). Verified visually in the sandbox.
-pub const ICON_FOLDER_CLOSED: char = '\u{e8b7}'; // Folder
-pub const ICON_FOLDER_OPEN: char = '\u{e838}'; // FolderOpen
-pub const ICON_FILE: char = '\u{e7c3}'; // Page
+// File-tree glyphs — Codicon codepoints.
+pub const ICON_FOLDER_CLOSED: char = '\u{ea83}'; // folder
+pub const ICON_FOLDER_OPEN: char = '\u{eaf7}'; // folder-opened
+pub const ICON_FILE: char = '\u{ea7b}'; // file
 pub const ICON_FOLDER_COLOR: Color = Color::rgb(0x8A, 0xB4, 0xE8);
 pub const ICON_FILE_COLOR: Color = Color::rgb(0xC5, 0xC5, 0xC5);
 
@@ -98,14 +112,18 @@ pub const BLINK_MS: u64 = 530;
 pub const TITLE_BAR_H: f32 = 30.0;
 pub const TITLE_BAR_BG: [f32; 4] = [0.145, 0.149, 0.152, 1.0]; // #252627
 pub const TITLE_FG: Color = Color::rgb(0xCC, 0xCC, 0xCC);
+// Header command-center search field (VSCode-style centered box).
+pub const SEARCH_BG: [f32; 4] = [0.18, 0.18, 0.19, 1.0];
+pub const SEARCH_BG_HOVER: [f32; 4] = [0.22, 0.22, 0.23, 1.0];
+pub const SEARCH_BORDER: [f32; 4] = [0.27, 0.27, 0.28, 1.0];
 pub const TITLE_CLOSE_HOVER: [f32; 4] = [0.78, 0.16, 0.16, 1.0];
 pub const TITLE_BTN_HOVER: [f32; 4] = [1.0, 1.0, 1.0, 0.08];
-// Window controls as plain Unicode (rendered in the UI font) — the MDL2
-// maximize/close glyphs don't render on all Segoe MDL2 Assets versions.
-pub const ICON_MIN: char = '\u{2013}'; // –
-pub const ICON_MAX: char = '\u{25A1}'; // □
-pub const ICON_RESTORE: char = '\u{2750}';
-pub const ICON_WIN_CLOSE: char = '\u{00D7}'; // ×
+pub const MENU_HOVER: [f32; 4] = [1.0, 1.0, 1.0, 0.08];
+// Window controls — Codicon chrome-* glyphs (rendered in ICON_FAMILY).
+pub const ICON_MIN: char = '\u{eaba}'; // chrome-minimize
+pub const ICON_MAX: char = '\u{eab9}'; // chrome-maximize
+pub const ICON_RESTORE: char = '\u{eabb}'; // chrome-restore
+pub const ICON_WIN_CLOSE: char = '\u{eab8}'; // chrome-close
 pub const TITLE_BTN_W: f32 = 46.0;
 
 pub const ACTIVITY_BAR_WIDTH: f32 = 48.0;

@@ -260,6 +260,27 @@ WHAT WORKED WELL (no action needed)
   - screenshot with pid: reliable.
 
 ----------------------------------------------------------------------
+9. [MED] no mouse click-drag primitive (press-move-release)
+----------------------------------------------------------------------
+Date: 2026-05-28 (Nova session)
+Observed:
+  - The MCP exposes hover {x,y} (move, no button), click {x,y} (press+release in
+    place), try_click, scroll, press_key — but NO way to press the left button,
+    move while held, and release. i.e. no drag gesture.
+Impact:
+  - Cannot test any drag-driven UI: resizing panels (just added a draggable sidebar
+    splitter to Nova and could not exercise it), text selection by dragging in the
+    editor, drag-to-reorder tabs, scrollbar thumb dragging, window-edge resize, etc.
+    These are core editor interactions, so this blocks a whole class of verification.
+Suggested fix:
+  - Add a drag tool, e.g. drag {from:{x,y}, to:{x,y}, button?, steps?} that does
+    SendInput LEFTDOWN at `from`, several MOUSEMOVE steps to `to`, then LEFTUP —
+    with a few intermediate moves so apps that track WM_MOUSEMOVE deltas (winit
+    CursorMoved) see a continuous drag, not a teleport.
+  - Optionally expose raw mouse_down {x,y,button} / mouse_up {x,y,button} so callers
+    can compose arbitrary press-hold-move-release sequences.
+
+----------------------------------------------------------------------
 NOTE: a couple of these are also Nova-side observations, not MCP bugs:
   - Nova exposes no UIA accessibility tree (everything is GPU-rendered). That's why UIA-based
     automation can't see text. Real human keyboard input works (OS generates WM_CHAR), proven

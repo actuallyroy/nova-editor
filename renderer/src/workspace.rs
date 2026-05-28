@@ -46,12 +46,6 @@ impl FileTree {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            if name == "target" || name == "node_modules" {
-                continue;
-            }
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             children.push((path, name, is_dir));
         }
@@ -72,6 +66,24 @@ impl FileTree {
             if expanded {
                 self.add_children(&path, depth + 1);
             }
+        }
+    }
+
+    /// Re-read the tree from disk (preserving which folders are expanded).
+    pub fn refresh(&mut self) {
+        self.rebuild();
+    }
+
+    /// Collapse every folder.
+    pub fn collapse_all(&mut self) {
+        self.expanded_set.clear();
+        self.rebuild();
+    }
+
+    /// Force a folder open (used when creating an item inside it).
+    pub fn expand(&mut self, path: &Path) {
+        if self.expanded_set.insert(path.to_path_buf()) {
+            self.rebuild();
         }
     }
 
@@ -114,6 +126,24 @@ impl Workspace {
     pub fn active_doc_mut(&mut self) -> Option<&mut Document> {
         let i = self.active?;
         self.documents.get_mut(i)
+    }
+
+    /// Create a new file or folder inside `parent`, then refresh the tree
+    /// (keeping `parent` expanded so the new item is visible). Errors if the
+    /// name already exists.
+    pub fn create_entry(&mut self, parent: &Path, name: &str, is_dir: bool) -> std::io::Result<PathBuf> {
+        let path = parent.join(name);
+        if is_dir {
+            std::fs::create_dir(&path)?;
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+        }
+        self.tree.expand(parent);
+        self.tree.rebuild();
+        Ok(path)
     }
 
     pub fn open_file(&mut self, path: &Path, fs: &mut FontSystem) -> std::io::Result<()> {

@@ -34,7 +34,7 @@ use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, ModifiersState, NamedKey},
-    window::{Window, WindowId},
+    window::{CursorIcon, Window, WindowId},
 };
 
 use document::Document;
@@ -67,6 +67,7 @@ impl Rect {
 struct IconButton {
     buffer: Buffer,
     size: f32,
+    cursor: CursorIcon,
 }
 
 impl IconButton {
@@ -81,7 +82,16 @@ impl IconButton {
             Shaping::Advanced,
         );
         buffer.shape_until_scroll(fs, false);
-        Self { buffer, size }
+        // Buttons get the hand pointer by default; callers can override.
+        Self {
+            buffer,
+            size,
+            cursor: CursorIcon::Pointer,
+        }
+    }
+
+    fn cursor(&self) -> CursorIcon {
+        self.cursor
     }
 
     fn glyph_w(&self) -> f32 {
@@ -200,40 +210,115 @@ impl TextLabel {
     }
 }
 
-/// Reusable single-line text input: draws its content (or a dimmed placeholder)
-/// clipped to a supplied rect. The box/border quads are drawn by the caller from
-/// the same rect, so input chrome and text always line up.
+/// A real editable single-line text input. It OWNS its text and edit operations
+/// (`insert` / `backspace` / `clear` / `set_text`), tracks focus, and renders a
+/// blinking caret at the end of the text — so callers route keystrokes into it
+/// instead of keeping their own parallel String. A leading space pads the text
+/// off the left edge; when empty it shows `placeholder`.
 struct TextInput {
     buffer: Buffer,
-    last: String,
+    text: String,
+    placeholder: String,
+    focused: bool,
+    shown: String, // last shaped content (change detection)
+    cursor: CursorIcon,
 }
 
 impl TextInput {
     fn new(fs: &mut FontSystem, w: f32, h: f32) -> Self {
         Self {
             buffer: make_ui_buffer(fs, w, h),
-            last: String::new(),
+            text: String::new(),
+            placeholder: String::new(),
+            focused: false,
+            shown: String::new(),
+            cursor: CursorIcon::Text,
         }
     }
 
-    /// `query` is the typed text; when empty, `placeholder` is shown instead.
-    fn set(&mut self, fs: &mut FontSystem, query: &str, placeholder: &str) {
-        let shown = if query.is_empty() {
-            placeholder.to_string()
+    fn cursor(&self) -> CursorIcon {
+        self.cursor
+    }
+
+    fn text(&self) -> &str {
+        &self.text
+    }
+
+    fn focused(&self) -> bool {
+        self.focused
+    }
+
+    fn focus(&mut self, on: bool) {
+        self.focused = on;
+    }
+
+    fn reshape(&mut self, fs: &mut FontSystem) {
+        let content = if self.text.is_empty() {
+            self.placeholder.clone()
         } else {
-            format!(" {}", query)
+            format!(" {}", self.text)
         };
-        if self.last == shown {
+        if self.shown == content {
             return;
         }
         self.buffer.set_text(
             fs,
-            &shown,
+            &content,
             Attrs::new().family(Family::Name(theme::UI_FAMILY)),
             Shaping::Advanced,
         );
         self.buffer.shape_until_scroll(fs, false);
-        self.last = shown;
+        self.shown = content;
+    }
+
+    fn set_placeholder(&mut self, fs: &mut FontSystem, s: &str) {
+        if self.placeholder != s {
+            self.placeholder = s.to_string();
+            if self.text.is_empty() {
+                self.reshape(fs);
+            }
+        }
+    }
+
+    fn set_text(&mut self, fs: &mut FontSystem, s: &str) {
+        self.text = s.to_string();
+        self.reshape(fs);
+    }
+
+    fn clear(&mut self, fs: &mut FontSystem) {
+        self.text.clear();
+        self.reshape(fs);
+    }
+
+    fn insert(&mut self, fs: &mut FontSystem, s: &str) {
+        self.text.push_str(s);
+        self.reshape(fs);
+    }
+
+    fn backspace(&mut self, fs: &mut FontSystem) {
+        self.text.pop();
+        self.reshape(fs);
+    }
+
+    /// Width of the shaped content (used for caret position / label centering).
+    fn width(&self) -> f32 {
+        self.buffer
+            .layout_runs()
+            .next()
+            .map(|r| r.line_w)
+            .unwrap_or(0.0)
+    }
+
+    /// A thin caret bar at the end of the text (start when empty).
+    fn caret_quad(&self, rect: Rect, pad_x: f32) -> Quad {
+        let x = if self.text.is_empty() {
+            rect.x + pad_x + 1.0
+        } else {
+            rect.x + pad_x + self.width()
+        };
+        let h = theme::UI_LINE_HEIGHT - 6.0;
+        let y = rect.y + (rect.h - h) * 0.5;
+        Quad::new(x, y, 1.5, h, theme::CURSOR)
     }
 
     fn draw<'a>(&'a self, rect: Rect, pad_x: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
@@ -251,6 +336,126 @@ impl TextInput {
             default_color: color,
             custom_glyphs: &[],
         });
+    }
+}
+
+/// VSCode-style header "command center": a centered box with a leading search
+/// glyph and a centered label, clickable to open the command palette. Composes
+/// the reusable IconButton (search glyph) + TextInput (label) so it inherits
+/// their rendering; the box chrome is drawn from the same rect.
+struct SearchField {
+    icon: IconButton,
+    label: TextInput,
+    cursor: CursorIcon,
+}
+
+impl SearchField {
+    fn new(fs: &mut FontSystem) -> Self {
+        let mut icon = IconButton::new(fs, theme::ICON_SEARCH, theme::ICON_FAMILY, 12.0);
+        icon.cursor = CursorIcon::Pointer;
+        Self {
+            icon,
+            label: TextInput::new(fs, 700.0, theme::TITLE_BAR_H),
+            cursor: CursorIcon::Pointer,
+        }
+    }
+
+    fn cursor(&self) -> CursorIcon {
+        self.cursor
+    }
+
+    fn set(&mut self, fs: &mut FontSystem, label: &str) {
+        self.label.set_placeholder(fs, label);
+    }
+
+    /// Box fill + 1px border, drawn from `rect`.
+    fn draw_bg(&self, rect: Rect, hovered: bool, bg_quads: &mut Vec<Quad>) {
+        let fill = if hovered {
+            theme::SEARCH_BG_HOVER
+        } else {
+            theme::SEARCH_BG
+        };
+        bg_quads.push(rect.quad(fill));
+        bg_quads.push(Quad::new(rect.x, rect.y, rect.w, 1.0, theme::SEARCH_BORDER));
+        bg_quads.push(Quad::new(rect.x, rect.y + rect.h - 1.0, rect.w, 1.0, theme::SEARCH_BORDER));
+        bg_quads.push(Quad::new(rect.x, rect.y, 1.0, rect.h, theme::SEARCH_BORDER));
+        bg_quads.push(Quad::new(rect.x + rect.w - 1.0, rect.y, 1.0, rect.h, theme::SEARCH_BORDER));
+    }
+
+    fn draw<'a>(&'a self, rect: Rect, areas: &mut Vec<TextArea<'a>>) {
+        // Leading search glyph at the left edge.
+        let icon_rect = Rect { x: rect.x + 4.0, y: rect.y, w: 22.0, h: rect.h };
+        self.icon.draw(icon_rect, theme::TITLE_FG, areas);
+        // Centered label, kept clear of the icon.
+        let pad = ((rect.w - self.label.width()) * 0.5).max(28.0);
+        self.label.draw(rect, pad, theme::FG_TEXT, areas);
+    }
+}
+
+/// Top-left menu bar (File, Edit, ...). Each item is a TextLabel laid out
+/// left-to-right; the per-item rects are the single source of truth for hover
+/// backgrounds and hit-testing.
+const MENU_ITEMS: [&str; 8] = [
+    "File", "Edit", "Selection", "View", "Go", "Run", "Terminal", "Help",
+];
+
+struct MenuBar {
+    labels: Vec<TextLabel>,
+    cursor: CursorIcon,
+}
+
+impl MenuBar {
+    fn new(fs: &mut FontSystem) -> Self {
+        let labels = MENU_ITEMS
+            .iter()
+            .map(|t| {
+                let mut l = TextLabel::new(fs, 240.0, theme::TITLE_BAR_H);
+                l.set(fs, t, theme::UI_FAMILY);
+                l
+            })
+            .collect();
+        Self {
+            labels,
+            cursor: CursorIcon::Pointer,
+        }
+    }
+
+    fn cursor(&self) -> CursorIcon {
+        self.cursor
+    }
+
+    /// Per-item rects laid out from the left edge of `bar`.
+    fn item_rects(&self, bar: Rect) -> Vec<Rect> {
+        let pad = 9.0;
+        let mut x = bar.x + 6.0;
+        self.labels
+            .iter()
+            .map(|l| {
+                let w = l.width() + pad * 2.0;
+                let r = Rect { x, y: bar.y, w, h: bar.h };
+                x += w;
+                r
+            })
+            .collect()
+    }
+
+    fn item_at(&self, bar: Rect, p: (f32, f32)) -> Option<usize> {
+        self.item_rects(bar).iter().position(|r| r.contains(p))
+    }
+
+    fn draw_bg(&self, bar: Rect, hovered: Option<usize>, bg_quads: &mut Vec<Quad>) {
+        if let Some(i) = hovered {
+            if let Some(r) = self.item_rects(bar).get(i) {
+                bg_quads.push(r.quad(theme::MENU_HOVER));
+            }
+        }
+    }
+
+    fn draw<'a>(&'a self, bar: Rect, areas: &mut Vec<TextArea<'a>>) {
+        let rects = self.item_rects(bar);
+        for (l, r) in self.labels.iter().zip(rects) {
+            l.draw_center(r, theme::TITLE_FG, areas);
+        }
     }
 }
 
@@ -320,6 +525,7 @@ struct ListView {
     last_key: String,
     row_h: f32,
     pad_x: f32,
+    cursor: CursorIcon,
 }
 
 impl ListView {
@@ -329,7 +535,12 @@ impl ListView {
             last_key: String::new(),
             row_h,
             pad_x,
+            cursor: CursorIcon::Pointer,
         }
+    }
+
+    fn cursor(&self) -> CursorIcon {
+        self.cursor
     }
 
     fn set_text(&mut self, fs: &mut FontSystem, key: &str, w: f32, h: f32) {
@@ -384,16 +595,22 @@ impl ListView {
     }
 
     fn draw<'a>(&'a self, region: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
+        self.draw_at(region, region.y, color, areas);
+    }
+
+    /// Draw the buffer with row 0 placed at `top`, clipped to `clip`. Lets a
+    /// caller render a vertical slice (e.g. rows above/below an inline insert).
+    fn draw_at<'a>(&'a self, clip: Rect, top: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
         areas.push(TextArea {
             buffer: &self.buffer,
-            left: region.x + self.pad_x,
-            top: region.y,
+            left: clip.x + self.pad_x,
+            top,
             scale: 1.0,
             bounds: TextBounds {
-                left: region.x as i32,
-                top: region.y as i32,
-                right: (region.x + region.w) as i32,
-                bottom: (region.y + region.h) as i32,
+                left: clip.x as i32,
+                top: clip.y as i32,
+                right: (clip.x + clip.w) as i32,
+                bottom: (clip.y + clip.h) as i32,
             },
             default_color: color,
             custom_glyphs: &[],
@@ -410,6 +627,7 @@ struct Splitter {
     min: f32,
     max: f32,
     dragging: bool,
+    cursor: CursorIcon,
 }
 
 impl Splitter {
@@ -419,11 +637,16 @@ impl Splitter {
             min,
             max,
             dragging: false,
+            cursor: CursorIcon::ColResize,
         }
     }
 
     fn size(&self) -> f32 {
         self.size
+    }
+
+    fn cursor(&self) -> CursorIcon {
+        self.cursor
     }
 
     fn is_dragging(&self) -> bool {
@@ -645,14 +868,78 @@ impl Layout {
             .collect()
     }
 
-    /// The file-tree list region: the sidebar below its header.
-    fn tree_region(&self) -> Rect {
+    /// The layout-toggle buttons (left of the window controls).
+    fn layout_btn_rects(&self) -> Vec<Rect> {
+        let cw = 36.0;
+        let right = self.title_bar.w - 3.0 * theme::TITLE_BTN_W;
+        (0..3)
+            .map(|i| Rect {
+                x: right - (3 - i) as f32 * cw,
+                y: self.title_bar.y,
+                w: cw,
+                h: theme::TITLE_BAR_H,
+            })
+            .collect()
+    }
+
+    /// The menu-bar region (left portion of the title bar).
+    fn menu_bar_rect(&self) -> Rect {
+        Rect {
+            x: 0.0,
+            y: self.title_bar.y,
+            w: self.title_bar.w,
+            h: theme::TITLE_BAR_H,
+        }
+    }
+
+    /// The centered command-center search box in the title bar.
+    fn header_search_rect(&self) -> Rect {
+        let w = (self.title_bar.w * 0.34).clamp(280.0, 560.0);
+        let h = 22.0;
+        Rect {
+            x: (self.title_bar.w - w) * 0.5,
+            y: self.title_bar.y + (theme::TITLE_BAR_H - h) * 0.5,
+            w,
+            h,
+        }
+    }
+
+    /// The root-folder row (below the EXPLORER header, above the tree).
+    fn root_row_rect(&self) -> Rect {
         Rect {
             x: self.sidebar.x,
             y: self.sidebar.y + theme::SIDEBAR_HEADER_H,
             w: self.sidebar.w,
-            h: (self.sidebar.h - theme::SIDEBAR_HEADER_H).max(0.0),
+            h: theme::TREE_ROW_HEIGHT,
         }
+    }
+
+    /// The file-tree list region: the sidebar below the header + root row.
+    fn tree_region(&self) -> Rect {
+        let top = self.sidebar.y + theme::SIDEBAR_HEADER_H + theme::TREE_ROW_HEIGHT;
+        Rect {
+            x: self.sidebar.x,
+            y: top,
+            w: self.sidebar.w,
+            h: (self.sidebar.y + self.sidebar.h - top).max(0.0),
+        }
+    }
+
+    /// The Explorer header action buttons (New File / New Folder / Refresh /
+    /// Collapse All), right-aligned in the sidebar header.
+    fn explorer_action_rects(&self) -> Vec<Rect> {
+        let cw = 26.0;
+        let n = 4;
+        let right = self.sidebar.x + self.sidebar.w - 6.0;
+        let y = self.sidebar.y + (theme::SIDEBAR_HEADER_H - cw) * 0.5;
+        (0..n)
+            .map(|i| Rect {
+                x: right - (n - i) as f32 * cw,
+                y,
+                w: cw,
+                h: cw,
+            })
+            .collect()
     }
 
     /// The sidebar header region ("EXPLORER" + workspace name).
@@ -705,7 +992,6 @@ const COMMANDS: &[(Command, &str, &str)] = &[
 
 struct PaletteState {
     active: bool,
-    query: String,
     selected: usize,
     filtered: Vec<usize>,
 }
@@ -715,13 +1001,12 @@ impl PaletteState {
         let filtered: Vec<usize> = (0..COMMANDS.len()).collect();
         Self {
             active: false,
-            query: String::new(),
             selected: 0,
             filtered,
         }
     }
-    fn refilter(&mut self) {
-        let q = self.query.to_lowercase();
+    fn refilter(&mut self, query: &str) {
+        let q = query.to_lowercase();
         self.filtered = (0..COMMANDS.len())
             .filter(|&i| q.is_empty() || COMMANDS[i].1.to_lowercase().contains(&q))
             .collect();
@@ -731,9 +1016,8 @@ impl PaletteState {
     }
     fn open(&mut self) {
         self.active = true;
-        self.query.clear();
         self.selected = 0;
-        self.refilter();
+        self.refilter("");
     }
     fn close(&mut self) {
         self.active = false;
@@ -742,7 +1026,6 @@ impl PaletteState {
 
 struct FindBarState {
     active: bool,
-    query: String,
     last_match: Option<usize>,
 }
 
@@ -750,7 +1033,6 @@ impl FindBarState {
     fn new() -> Self {
         Self {
             active: false,
-            query: String::new(),
             last_match: None,
         }
     }
@@ -759,8 +1041,8 @@ impl FindBarState {
 // ---------- GpuState ----------
 
 struct UiBuffers {
-    title_text: TextLabel,
     sidebar_header: TextLabel,
+    root_label: TextLabel,
     sidebar: ListView,
     tabs: Buffer,
     status: TextLabel,
@@ -787,6 +1069,12 @@ struct GpuState {
     activity_btns: Vec<IconButton>,
     titlebar_btns: Vec<IconButton>,
     tab_close_btn: IconButton,
+    search: SearchField,
+    menubar: MenuBar,
+    layout_btns: Vec<IconButton>,
+    explorer_btns: Vec<IconButton>,
+    create_icons: [IconButton; 2],
+    create_input: TextInput,
 }
 
 impl GpuState {
@@ -840,6 +1128,10 @@ impl GpuState {
         surface.configure(&device, &config);
 
         let mut font_system = FontSystem::new();
+        // Load VSCode's Codicon icon font so our glyphs match VSCode exactly.
+        font_system
+            .db_mut()
+            .load_font_data(include_bytes!("../assets/codicon.ttf").to_vec());
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
@@ -850,24 +1142,42 @@ impl GpuState {
 
         let ic = theme::ICON_FAMILY;
         let activity_btns = vec![
-            IconButton::new(&mut font_system, theme::ICON_FOLDER, ic, 20.0),
+            IconButton::new(&mut font_system, theme::ICON_FILES, ic, 20.0),
             IconButton::new(&mut font_system, theme::ICON_SEARCH, ic, 20.0),
-            IconButton::new(&mut font_system, theme::ICON_SYNC, ic, 20.0),
+            IconButton::new(&mut font_system, theme::ICON_SOURCE_CONTROL, ic, 20.0),
             IconButton::new(&mut font_system, theme::ICON_RUN, ic, 20.0),
             IconButton::new(&mut font_system, theme::ICON_EXTENSIONS, ic, 20.0),
             IconButton::new(&mut font_system, theme::ICON_ACCOUNT, ic, 20.0),
             IconButton::new(&mut font_system, theme::ICON_SETTINGS, ic, 20.0),
         ];
         let titlebar_btns = vec![
-            IconButton::new(&mut font_system, theme::ICON_MIN, theme::UI_FAMILY, 14.0),
-            IconButton::new(&mut font_system, theme::ICON_MAX, theme::UI_FAMILY, 14.0),
-            IconButton::new(&mut font_system, theme::ICON_WIN_CLOSE, theme::UI_FAMILY, 14.0),
+            IconButton::new(&mut font_system, theme::ICON_MIN, ic, 12.0),
+            IconButton::new(&mut font_system, theme::ICON_MAX, ic, 12.0),
+            IconButton::new(&mut font_system, theme::ICON_WIN_CLOSE, ic, 12.0),
         ];
         let tab_close_btn = IconButton::new(&mut font_system, theme::ICON_CLOSE, ic, 12.0);
+        let search = SearchField::new(&mut font_system);
+        let menubar = MenuBar::new(&mut font_system);
+        let layout_btns = vec![
+            IconButton::new(&mut font_system, theme::ICON_LAYOUT_SIDEBAR_LEFT, ic, 16.0),
+            IconButton::new(&mut font_system, theme::ICON_LAYOUT_PANEL, ic, 16.0),
+            IconButton::new(&mut font_system, theme::ICON_LAYOUT_SIDEBAR_RIGHT, ic, 16.0),
+        ];
+        let explorer_btns = vec![
+            IconButton::new(&mut font_system, theme::ICON_NEW_FILE, ic, 16.0),
+            IconButton::new(&mut font_system, theme::ICON_NEW_FOLDER, ic, 16.0),
+            IconButton::new(&mut font_system, theme::ICON_REFRESH, ic, 16.0),
+            IconButton::new(&mut font_system, theme::ICON_COLLAPSE_ALL, ic, 16.0),
+        ];
+        let create_icons = [
+            IconButton::new(&mut font_system, theme::ICON_FILE, ic, 16.0),
+            IconButton::new(&mut font_system, theme::ICON_FOLDER_CLOSED, ic, 16.0),
+        ];
+        let create_input = TextInput::new(&mut font_system, theme::SIDEBAR_WIDTH, theme::TREE_ROW_HEIGHT);
 
         let ui = UiBuffers {
-            title_text: TextLabel::new(&mut font_system, 1200.0, theme::TITLE_BAR_H),
             sidebar_header: TextLabel::new(&mut font_system, theme::SIDEBAR_WIDTH, 60.0),
+            root_label: TextLabel::new(&mut font_system, theme::SIDEBAR_WIDTH, theme::TREE_ROW_HEIGHT),
             sidebar: ListView::new(
                 &mut font_system,
                 theme::SIDEBAR_WIDTH,
@@ -906,6 +1216,12 @@ impl GpuState {
             activity_btns,
             titlebar_btns,
             tab_close_btn,
+            search,
+            menubar,
+            layout_btns,
+            explorer_btns,
+            create_icons,
+            create_input,
         })
     }
 
@@ -945,6 +1261,14 @@ impl UiCache {
     }
 }
 
+/// In-progress New File / New Folder creation (inline name entry in the tree).
+struct PendingCreate {
+    is_dir: bool,
+    parent: PathBuf,
+    row: usize,   // insertion index in the visible tree
+    depth: usize, // indent level of the inline field
+}
+
 struct App {
     cwd: PathBuf,
     initial_file: Option<PathBuf>,
@@ -953,11 +1277,10 @@ struct App {
     mouse_pos: PhysicalPosition<f64>,
     mouse_pressed: bool,
     dragging_editor: bool,
-    resizing_sidebar: bool,
     mods: ModifiersState,
     clipboard: Option<Clipboard>,
     sidebar_visible: bool,
-    sidebar_width: f32,
+    sidebar_split: Splitter,
     palette: PaletteState,
     find: FindBarState,
     ui_cache: UiCache,
@@ -966,9 +1289,16 @@ struct App {
     hovered_tree: Option<usize>,
     hovered_activity: Option<usize>,
     hovered_titlebtn: Option<usize>,
+    hovered_search: bool,
+    hovered_menu: Option<usize>,
+    hovered_layout: Option<usize>,
+    hovered_explorer: Option<usize>,
+    selected_tree: Option<usize>,
+    creating: Option<PendingCreate>,
     pending_close: bool,
     cursor_blink_on: bool,
     last_blink: Instant,
+    cursor_icon: CursorIcon,
 }
 
 impl App {
@@ -981,11 +1311,14 @@ impl App {
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             mouse_pressed: false,
             dragging_editor: false,
-            resizing_sidebar: false,
             mods: ModifiersState::empty(),
             clipboard: Clipboard::new().ok(),
             sidebar_visible: true,
-            sidebar_width: theme::SIDEBAR_WIDTH,
+            sidebar_split: Splitter::new(
+                theme::SIDEBAR_WIDTH,
+                theme::SIDEBAR_MIN_WIDTH,
+                theme::SIDEBAR_MAX_WIDTH,
+            ),
             palette: PaletteState::new(),
             find: FindBarState::new(),
             ui_cache: UiCache::new(),
@@ -994,9 +1327,16 @@ impl App {
             hovered_tree: None,
             hovered_activity: None,
             hovered_titlebtn: None,
+            hovered_search: false,
+            hovered_menu: None,
+            hovered_layout: None,
+            hovered_explorer: None,
+            selected_tree: None,
+            creating: None,
             pending_close: false,
             cursor_blink_on: true,
             last_blink: Instant::now(),
+            cursor_icon: CursorIcon::Default,
         }
     }
 
@@ -1049,6 +1389,111 @@ impl App {
             changed = true;
         }
 
+        let new_search = layout.palette.is_none() && layout.header_search_rect().contains(p);
+        if new_search != self.hovered_search {
+            self.hovered_search = new_search;
+            changed = true;
+        }
+
+        let new_menu = if layout.palette.is_none() {
+            self.gpu
+                .as_ref()
+                .and_then(|g| g.menubar.item_at(layout.menu_bar_rect(), p))
+        } else {
+            None
+        };
+        if new_menu != self.hovered_menu {
+            self.hovered_menu = new_menu;
+            changed = true;
+        }
+
+        let new_layout = if layout.palette.is_none() {
+            layout.layout_btn_rects().iter().position(|r| r.contains(p))
+        } else {
+            None
+        };
+        if new_layout != self.hovered_layout {
+            self.hovered_layout = new_layout;
+            changed = true;
+        }
+
+        let new_explorer = if self.sidebar_visible && layout.palette.is_none() {
+            layout.explorer_action_rects().iter().position(|r| r.contains(p))
+        } else {
+            None
+        };
+        if new_explorer != self.hovered_explorer {
+            self.hovered_explorer = new_explorer;
+            changed = true;
+        }
+
+        // Resolve the cursor by asking whichever widget is under the pointer for
+        // its own cursor; regions without a widget (editor, empty chrome) fall
+        // back to explicit defaults.
+        let over_handle = self.sidebar_visible
+            && layout.palette.is_none()
+            && self.sidebar_split.handle_rect(layout.sidebar).contains(p);
+        let new_cursor = if self.sidebar_split.is_dragging() || over_handle {
+            self.sidebar_split.cursor()
+        } else if new_search {
+            self.gpu
+                .as_ref()
+                .map(|g| g.search.cursor())
+                .unwrap_or(CursorIcon::Default)
+        } else if new_menu.is_some() {
+            self.gpu
+                .as_ref()
+                .map(|g| g.menubar.cursor())
+                .unwrap_or(CursorIcon::Default)
+        } else if let Some(i) = new_layout {
+            self.gpu
+                .as_ref()
+                .map(|g| g.layout_btns[i].cursor())
+                .unwrap_or(CursorIcon::Default)
+        } else if let Some(i) = new_explorer {
+            self.gpu
+                .as_ref()
+                .map(|g| g.explorer_btns[i].cursor())
+                .unwrap_or(CursorIcon::Default)
+        } else if let Some(pal) = layout.palette.as_ref() {
+            // Palette is modal: pointer over a row, arrow elsewhere.
+            self.gpu
+                .as_ref()
+                .and_then(|g| {
+                    g.ui
+                        .palette_list
+                        .row_at(pal.list, p, self.palette.filtered.len())
+                        .map(|_| g.ui.palette_list.cursor())
+                })
+                .unwrap_or(CursorIcon::Default)
+        } else if let Some(g) = self.gpu.as_ref() {
+            if let Some(i) = new_titlebtn {
+                g.titlebar_btns[i].cursor()
+            } else if let Some(i) = new_activity {
+                g.activity_btns[i].cursor()
+            } else if new_close.is_some() {
+                g.tab_close_btn.cursor()
+            } else if new_tab.is_some() {
+                // Tab body is clickable but has no dedicated widget.
+                CursorIcon::Pointer
+            } else if new_tree.is_some() {
+                g.ui.sidebar.cursor()
+            } else if layout.editor_text.contains(p) {
+                // Editor text area: I-beam (not a component).
+                CursorIcon::Text
+            } else {
+                CursorIcon::Default
+            }
+        } else {
+            CursorIcon::Default
+        };
+        if new_cursor != self.cursor_icon {
+            self.cursor_icon = new_cursor;
+            if let Some(g) = self.gpu.as_ref() {
+                g.window.set_cursor(new_cursor);
+            }
+        }
+
         if changed {
             self.redraw();
         }
@@ -1088,7 +1533,7 @@ impl App {
             w,
             h,
             self.sidebar_visible,
-            self.sidebar_width,
+            self.sidebar_split.size(),
             self.find.active,
             self.palette.active,
         )
@@ -1119,6 +1564,97 @@ impl App {
         }
     }
 
+    /// Begin an inline New File / New Folder, scoped to the selected folder (or
+    /// the parent of a selected file, or the workspace root). Expands the target
+    /// folder so the field appears at the top of its contents.
+    fn begin_create(&mut self, is_dir: bool) {
+        let nodes = &self.workspace.tree.nodes;
+        let (parent, row, depth) = match self.selected_tree.and_then(|i| nodes.get(i).map(|n| (i, n))) {
+            Some((i, n)) if n.is_dir => {
+                let path = n.path.clone();
+                let depth = n.depth + 1;
+                self.workspace.tree.expand(&path);
+                (path, i + 1, depth)
+            }
+            Some((i, n)) => {
+                let parent = n
+                    .path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| self.workspace.tree.root.clone());
+                (parent, i, n.depth)
+            }
+            None => (self.workspace.tree.root.clone(), 0, 0),
+        };
+        self.creating = Some(PendingCreate {
+            is_dir,
+            parent,
+            row,
+            depth,
+        });
+        if let Some(g) = self.gpu.as_mut() {
+            g.create_input.clear(&mut g.font_system);
+            g.create_input
+                .set_placeholder(&mut g.font_system, if is_dir { " folder name" } else { " file name" });
+            g.create_input.focus(true);
+        }
+        self.redraw();
+    }
+
+    /// Finish an inline creation: create the entry if a non-empty name was typed
+    /// (opening it when it's a file), otherwise just dismiss the field.
+    fn commit_create(&mut self) {
+        let Some(pc) = self.creating.take() else {
+            return;
+        };
+        let name = self
+            .gpu
+            .as_ref()
+            .map(|g| g.create_input.text().trim().to_string())
+            .unwrap_or_default();
+        if let Some(g) = self.gpu.as_mut() {
+            g.create_input.focus(false);
+        }
+        if !name.is_empty() {
+            if let Ok(path) = self.workspace.create_entry(&pc.parent, &name, pc.is_dir) {
+                if !pc.is_dir {
+                    if let Some(g) = self.gpu.as_mut() {
+                        let _ = self.workspace.open_file(&path, &mut g.font_system);
+                    }
+                }
+            }
+        }
+        self.redraw();
+    }
+
+    fn cancel_create(&mut self) {
+        self.creating = None;
+        if let Some(g) = self.gpu.as_mut() {
+            g.create_input.focus(false);
+        }
+        self.redraw();
+    }
+
+    /// Open the command palette and focus its input.
+    fn open_palette(&mut self) {
+        self.palette.open();
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.palette_input.clear(&mut g.font_system);
+            g.ui.palette_input.focus(true);
+        }
+        self.redraw();
+    }
+
+    /// Re-filter the palette from its input's current text.
+    fn refilter_palette(&mut self) {
+        let q = self
+            .gpu
+            .as_ref()
+            .map(|g| g.ui.palette_input.text().to_string())
+            .unwrap_or_default();
+        self.palette.refilter(&q);
+    }
+
     fn exec_command(&mut self, cmd: Command) {
         match cmd {
             Command::Save => {
@@ -1131,7 +1667,11 @@ impl App {
             }
             Command::Find => {
                 self.find.active = true;
-                self.find.query.clear();
+                if let Some(g) = self.gpu.as_mut() {
+                    g.ui.find_input.clear(&mut g.font_system);
+                    g.ui.find_input.set_placeholder(&mut g.font_system, " Find...");
+                    g.ui.find_input.focus(true);
+                }
             }
             Command::Undo => {
                 if let Some(gpu) = self.gpu.as_mut() {
@@ -1201,7 +1741,11 @@ impl App {
     }
 
     fn find_step(&mut self, forward: bool) {
-        let needle = self.find.query.clone();
+        let needle = self
+            .gpu
+            .as_ref()
+            .map(|g| g.ui.find_input.text().to_string())
+            .unwrap_or_default();
         if needle.is_empty() {
             return;
         }
@@ -1241,18 +1785,47 @@ impl App {
     fn on_mouse_press(&mut self, x: f32, y: f32) {
         let layout = self.layout();
 
-        // Sidebar resize handle — start dragging the right edge.
-        if self.sidebar_visible && layout.palette.is_none() {
-            if let Some(h) = layout.sidebar_resize_handle() {
-                if h.contains((x, y)) {
-                    self.resizing_sidebar = true;
-                    return;
-                }
-            }
+        // A click anywhere while an inline create field is open commits it
+        // (creates if a name was typed, discards if empty), then consumes the click.
+        if self.creating.is_some() {
+            self.commit_create();
+            return;
+        }
+
+        // Sidebar resize handle — let the Splitter claim the press.
+        if self.sidebar_visible
+            && layout.palette.is_none()
+            && self.sidebar_split.press((x, y), layout.sidebar)
+        {
+            return;
         }
 
         // Title bar: window controls or drag.
         if layout.palette.is_none() && layout.title_bar.contains((x, y)) {
+            // Command-center search box opens the palette (VSCode quick open).
+            if layout.header_search_rect().contains((x, y)) {
+                self.open_palette();
+                return;
+            }
+            // Layout toggles: primary sidebar is wired; panel/secondary are
+            // placeholders until those regions exist.
+            if let Some(i) = layout.layout_btn_rects().iter().position(|r| r.contains((x, y))) {
+                if i == 0 {
+                    self.sidebar_visible = !self.sidebar_visible;
+                    self.redraw();
+                }
+                return;
+            }
+            // Menu items open the command palette for now (dropdown menus TBD).
+            let on_menu = self
+                .gpu
+                .as_ref()
+                .map(|g| g.menubar.item_at(layout.menu_bar_rect(), (x, y)).is_some())
+                .unwrap_or(false);
+            if on_menu {
+                self.open_palette();
+                return;
+            }
             match self.title_btn_at(x, y, &layout) {
                 Some(0) => {
                     if let Some(g) = self.gpu.as_ref() {
@@ -1309,6 +1882,25 @@ impl App {
             return;
         }
 
+        // Explorer header action buttons (New File / New Folder / Refresh / Collapse).
+        if self.sidebar_visible {
+            if let Some(i) = layout
+                .explorer_action_rects()
+                .iter()
+                .position(|r| r.contains((x, y)))
+            {
+                match i {
+                    0 => self.begin_create(false),
+                    1 => self.begin_create(true),
+                    2 => self.workspace.tree.refresh(),
+                    3 => self.workspace.tree.collapse_all(),
+                    _ => {}
+                }
+                self.redraw();
+                return;
+            }
+        }
+
         if self.sidebar_visible && layout.sidebar.contains((x, y)) {
             let row = self.gpu.as_ref().and_then(|gpu| {
                 gpu.ui
@@ -1316,6 +1908,7 @@ impl App {
                     .row_at(layout.tree_region(), (x, y), self.workspace.tree.nodes.len())
             });
             if let Some(idx) = row {
+                self.selected_tree = Some(idx);
                 let is_dir = self.workspace.tree.nodes[idx].is_dir;
                 if is_dir {
                     self.workspace.tree.toggle(idx);
@@ -1357,11 +1950,8 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, x: f32, y: f32) {
-        if self.resizing_sidebar && self.mouse_pressed {
-            let new_w = (x - theme::ACTIVITY_BAR_WIDTH)
-                .clamp(theme::SIDEBAR_MIN_WIDTH, theme::SIDEBAR_MAX_WIDTH);
-            if (new_w - self.sidebar_width).abs() > 0.5 {
-                self.sidebar_width = new_w;
+        if self.sidebar_split.is_dragging() && self.mouse_pressed {
+            if self.sidebar_split.drag(x, theme::ACTIVITY_BAR_WIDTH) {
                 self.redraw();
             }
             return;
@@ -1374,7 +1964,7 @@ impl App {
 
     fn on_mouse_release(&mut self) {
         self.dragging_editor = false;
-        self.resizing_sidebar = false;
+        self.sidebar_split.release();
     }
 
     fn editor_click(&mut self, x: f32, y: f32, extend: bool, layout: Layout) {
@@ -1421,6 +2011,39 @@ impl App {
         let extend = self.mods.shift_key();
         let ctrl = self.mods.control_key();
 
+        // Inline New File / New Folder name entry captures everything; the text
+        // lives in the create_input TextInput component.
+        if self.creating.is_some() {
+            match event.logical_key.as_ref() {
+                Key::Named(NamedKey::Escape) => {
+                    self.cancel_create();
+                    return;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.create_input.backspace(&mut g.font_system);
+                    }
+                    self.redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.commit_create();
+                    return;
+                }
+                _ => {}
+            }
+            if let Some(t) = event.text.as_ref() {
+                let s: &str = t;
+                if !s.chars().any(|c| c.is_control()) && !s.contains('/') && !s.contains('\\') {
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.create_input.insert(&mut g.font_system, s);
+                    }
+                    self.redraw();
+                }
+            }
+            return;
+        }
+
         // Palette captures everything when active.
         if self.palette.active {
             match event.logical_key.as_ref() {
@@ -1457,8 +2080,10 @@ impl App {
                     return;
                 }
                 Key::Named(NamedKey::Backspace) => {
-                    self.palette.query.pop();
-                    self.palette.refilter();
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.ui.palette_input.backspace(&mut g.font_system);
+                    }
+                    self.refilter_palette();
                     self.redraw();
                     return;
                 }
@@ -1467,8 +2092,10 @@ impl App {
             if let Some(t) = event.text.as_ref() {
                 let s: &str = t;
                 if !s.chars().any(|c| c.is_control()) {
-                    self.palette.query.push_str(s);
-                    self.palette.refilter();
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.ui.palette_input.insert(&mut g.font_system, s);
+                    }
+                    self.refilter_palette();
                     self.redraw();
                 }
             }
@@ -1480,6 +2107,9 @@ impl App {
             match event.logical_key.as_ref() {
                 Key::Named(NamedKey::Escape) => {
                     self.find.active = false;
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.ui.find_input.focus(false);
+                    }
                     self.redraw();
                     return;
                 }
@@ -1489,7 +2119,9 @@ impl App {
                     return;
                 }
                 Key::Named(NamedKey::Backspace) => {
-                    self.find.query.pop();
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.ui.find_input.backspace(&mut g.font_system);
+                    }
                     self.redraw();
                     return;
                 }
@@ -1498,7 +2130,9 @@ impl App {
             if let Some(t) = event.text.as_ref() {
                 let s: &str = t;
                 if !s.chars().any(|c| c.is_control()) {
-                    self.find.query.push_str(s);
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.ui.find_input.insert(&mut g.font_system, s);
+                    }
                     self.redraw();
                 }
             }
@@ -1509,8 +2143,7 @@ impl App {
         if ctrl && self.mods.shift_key() {
             if let Key::Character(c) = event.logical_key.as_ref() {
                 if c == "p" || c == "P" {
-                    self.palette.open();
-                    self.redraw();
+                    self.open_palette();
                     return;
                 }
             }
@@ -1636,6 +2269,24 @@ impl App {
 
 // ---------- Rendering ----------
 
+/// Geometry of the inline New File/Folder row within tree region `tr`:
+/// returns (row rect, icon rect, text-field rect) for the given insert row/depth.
+fn create_row_geometry(tr: Rect, row: usize, depth: usize) -> (Rect, Rect, Rect) {
+    let row_y = tr.y + row as f32 * theme::TREE_ROW_HEIGHT;
+    // Match the file tree: 12px left pad + ~8px per depth, left-aligned icon.
+    let indent = 12.0 + depth as f32 * 8.0;
+    let icon_w = 16.0;
+    let row_rect = Rect { x: tr.x, y: row_y, w: tr.w, h: theme::TREE_ROW_HEIGHT };
+    let icon_rect = Rect { x: tr.x + indent, y: row_y, w: icon_w, h: theme::TREE_ROW_HEIGHT };
+    let field = Rect {
+        x: tr.x + indent + icon_w + 4.0,
+        y: row_y,
+        w: (tr.w - indent - icon_w - 4.0).max(0.0),
+        h: theme::TREE_ROW_HEIGHT,
+    };
+    (row_rect, icon_rect, field)
+}
+
 fn cursor_pos_in_buffer(buffer: &Buffer, line: usize, col_byte: usize) -> (f32, f32, f32) {
     let mut x = 0.0f32;
     let mut y = line as f32 * theme::LINE_HEIGHT;
@@ -1693,7 +2344,7 @@ fn render(app: &mut App) -> Result<()> {
         gpu.config.width as f32,
         gpu.config.height as f32,
         app.sidebar_visible,
-        app.sidebar_width,
+        app.sidebar_split.size(),
         app.find.active,
         app.palette.active,
     );
@@ -1703,37 +2354,39 @@ fn render(app: &mut App) -> Result<()> {
         let fs = &mut gpu.font_system;
         let cache = &mut app.ui_cache;
 
-        // Title bar text (centered) — active file + app name.
-        let title = match app.workspace.active_doc() {
-            Some(d) => format!("{} — Nova", d.name),
-            None => "Nova".to_string(),
+        // Header command-center label — active file, or the project name.
+        let header_label = match app.workspace.active_doc() {
+            Some(d) => d.name.clone(),
+            None => app
+                .cwd
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Search".into()),
         };
-        gpu.ui.title_text.set(fs, &title, theme::UI_FAMILY);
+        gpu.search.set(fs, &header_label);
         // Activity-bar icons and window controls are IconButton widgets now
         // (rendered below from layout rects) — no per-glyph buffer juggling here.
 
-        // Sidebar header — "EXPLORER" + workspace name (VSCode signature).
+        // Sidebar header ("EXPLORER" title) + root folder row (chevron + name).
+        gpu.ui.sidebar_header.set(fs, "EXPLORER", theme::UI_FAMILY);
         let ws_name = app
             .cwd
             .file_name()
             .map(|n| n.to_string_lossy().to_uppercase())
-            .unwrap_or_else(|| "EXPLORER".into());
-        let header_spans = [
+            .unwrap_or_else(|| "WORKSPACE".into());
+        let root_spans = [
             (
-                "EXPLORER\n".to_string(),
-                Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_DIM),
+                format!("{}  ", theme::ICON_CHEVRON_DOWN),
+                Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(theme::FG_TEXT),
             ),
             (
                 ws_name.clone(),
                 Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_TEXT),
             ),
         ];
-        gpu.ui.sidebar_header.set_rich(
-            fs,
-            &format!("EXPLORER\n{}", ws_name),
-            &header_spans,
-            Attrs::new().family(Family::Name(theme::UI_FAMILY)),
-        );
+        gpu.ui
+            .root_label
+            .set_rich(fs, &ws_name, &root_spans, Attrs::new().family(Family::Name(theme::UI_FAMILY)));
 
         // Sidebar — file tree with monochrome MDL2 folder/file icons (rich text:
         // icon glyphs in the icon font, names in the UI font).
@@ -1853,12 +2506,8 @@ fn render(app: &mut App) -> Result<()> {
             .unwrap_or(0);
         gpu.ui.line_numbers.set(fs, line_count);
 
-        // Palette.
+        // Palette list (the input owns its own text now).
         if let Some(pal) = layout.palette.as_ref() {
-            gpu.ui
-                .palette_input
-                .set(fs, &app.palette.query, " Type to filter commands...");
-
             let mut list_text = String::new();
             for &i in app.palette.filtered.iter() {
                 let (_, label, shortcut) = COMMANDS[i];
@@ -1872,11 +2521,6 @@ fn render(app: &mut App) -> Result<()> {
                 .palette_list
                 .set_text(fs, &list_text, pal.list.w, pal.list.h);
         }
-
-        // Find bar.
-        if layout.find_bar.is_some() {
-            gpu.ui.find_input.set(fs, &app.find.query, " Find...");
-        }
     }
 
     // ---- Build quad lists ----
@@ -1885,6 +2529,15 @@ fn render(app: &mut App) -> Result<()> {
 
     // Title bar bg + window-control hover (hover rect == the button rect).
     bg_quads.push(layout.title_bar.quad(theme::TITLE_BAR_BG));
+    // Header command-center search box.
+    gpu.search
+        .draw_bg(layout.header_search_rect(), app.hovered_search, &mut bg_quads);
+    // Menu-bar hover + layout-toggle hover.
+    gpu.menubar
+        .draw_bg(layout.menu_bar_rect(), app.hovered_menu, &mut bg_quads);
+    if let Some(i) = app.hovered_layout {
+        bg_quads.push(layout.layout_btn_rects()[i].quad(theme::TITLE_BTN_HOVER));
+    }
     if let Some(b) = app.hovered_titlebtn {
         let color = if b == 2 {
             theme::TITLE_CLOSE_HOVER
@@ -1908,6 +2561,15 @@ fn render(app: &mut App) -> Result<()> {
     // Sidebar bg
     if app.sidebar_visible {
         bg_quads.push(layout.sidebar.quad(theme::SIDEBAR_BG));
+        // Explorer header action hover.
+        if let Some(i) = app.hovered_explorer {
+            bg_quads.push(layout.explorer_action_rects()[i].quad(theme::MENU_HOVER));
+        }
+        // Inline-create row highlight (at the insert position).
+        if let Some(pc) = app.creating.as_ref() {
+            let (row_rect, _, _) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
+            bg_quads.push(row_rect.quad(theme::TREE_SELECTED));
+        }
         // Tree row hover (below the header) — row rect from the ListView.
         if let Some(idx) = app.hovered_tree {
             bg_quads.push(
@@ -2072,7 +2734,7 @@ fn render(app: &mut App) -> Result<()> {
             0.0,
             gpu.config.width as f32,
             gpu.config.height as f32,
-            [0.0, 0.0, 0.0, 0.35],
+            [0.0, 0.0, 0.0, 0.6],
         ));
         bg_quads.push(pal.box_.quad(theme::PALETTE_BG));
         bg_quads.push(Quad::new(
@@ -2094,6 +2756,19 @@ fn render(app: &mut App) -> Result<()> {
         }
     }
 
+    // Text-input carets (blink-gated, drawn on top via fg_quads).
+    if app.cursor_blink_on {
+        if let Some(pal) = layout.palette.as_ref() {
+            fg_quads.push(gpu.ui.palette_input.caret_quad(pal.input, 6.0));
+        } else if let Some(fb) = layout.find_bar.as_ref() {
+            fg_quads.push(gpu.ui.find_input.caret_quad(*fb, 8.0));
+        }
+        if let Some(pc) = app.creating.as_ref() {
+            let (_, _, field) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
+            fg_quads.push(gpu.create_input.caret_quad(field, 0.0));
+        }
+    }
+
     // ---- Build text areas ----
     let active_idx = app.workspace.active;
 
@@ -2111,16 +2786,18 @@ fn render(app: &mut App) -> Result<()> {
     let ui = &gpu.ui;
     let mut areas: Vec<TextArea> = Vec::new();
 
-    // Title bar: centered title text + right-aligned window controls. Centered
-    // across the full bar but clipped to the region left of the window controls.
-    let title_left = ((layout.title_bar.w - ui.title_text.width()) * 0.5).max(140.0);
-    let title_clip = Rect {
-        x: 140.0,
-        y: layout.title_bar.y,
-        w: (layout.title_bar.w - 3.0 * theme::TITLE_BTN_W - 8.0 - 140.0).max(0.0),
-        h: theme::TITLE_BAR_H,
-    };
-    ui.title_text.push(title_left, title_clip, theme::TITLE_FG, &mut areas);
+    // When the palette (modal) is open, suppress all underlying text so it can't
+    // bleed through — text renders in one pass after the bg quads, so the dim
+    // overlay alone can't occlude it. Only the palette text is drawn below.
+    if layout.palette.is_none() {
+    // Title bar: menu bar (left) + centered search box + layout toggles and
+    // window controls (right).
+    gpu.menubar.draw(layout.menu_bar_rect(), &mut areas);
+    gpu.search.draw(layout.header_search_rect(), &mut areas);
+    let layout_rects = layout.layout_btn_rects();
+    for (i, btn) in gpu.layout_btns.iter().enumerate() {
+        btn.draw(layout_rects[i], theme::TITLE_FG, &mut areas);
+    }
     // Window controls — IconButton widgets at their layout rects (the same
     // rects the hover bg used above; glyph is centered in each).
     let tb_rects = layout.title_btn_rects();
@@ -2144,12 +2821,40 @@ fn render(app: &mut App) -> Result<()> {
         btn.draw(act_rects[i], color, &mut areas);
     }
 
-    // Sidebar header + tree
+    // Sidebar header + action buttons + root folder row + tree
     if app.sidebar_visible {
         ui.sidebar_header
             .push(layout.sidebar.x + 12.0, layout.sidebar_header_rect(), theme::FG_DIM, &mut areas);
-        ui.sidebar
-            .draw(layout.tree_region(), theme::FG_TEXT, &mut areas);
+        let er = layout.explorer_action_rects();
+        for (i, btn) in gpu.explorer_btns.iter().enumerate() {
+            btn.draw(er[i], theme::TITLE_FG, &mut areas);
+        }
+        // Root folder row (chevron + workspace name).
+        ui.root_label
+            .draw_left(layout.root_row_rect(), 10.0, theme::FG_TEXT, &mut areas);
+        let tr = layout.tree_region();
+        if let Some(pc) = app.creating.as_ref() {
+            // Insert an inline field at row `pc.row`: draw the rows above it, the
+            // field, then the rows from `pc.row` on shifted down by one row.
+            let rowh = theme::TREE_ROW_HEIGHT;
+            let (_, icon_rect, field) = create_row_geometry(tr, pc.row, pc.depth);
+            if pc.row > 0 {
+                let clip_a = Rect { x: tr.x, y: tr.y, w: tr.w, h: pc.row as f32 * rowh };
+                ui.sidebar.draw_at(clip_a, tr.y, theme::FG_TEXT, &mut areas);
+            }
+            gpu.create_icons[pc.is_dir as usize].draw(icon_rect, theme::ICON_FILE_COLOR, &mut areas);
+            gpu.create_input.draw(field, 0.0, theme::FG_TEXT, &mut areas);
+            let below_y = tr.y + (pc.row as f32 + 1.0) * rowh;
+            let clip_b = Rect {
+                x: tr.x,
+                y: below_y,
+                w: tr.w,
+                h: (tr.y + tr.h - below_y).max(0.0),
+            };
+            ui.sidebar.draw_at(clip_b, tr.y + rowh, theme::FG_TEXT, &mut areas);
+        } else {
+            ui.sidebar.draw(tr, theme::FG_TEXT, &mut areas);
+        }
     }
 
     // Tab labels — the shared `tabs` buffer holds one label per line; we render
@@ -2229,6 +2934,7 @@ fn render(app: &mut App) -> Result<()> {
     if let Some(fb) = layout.find_bar.as_ref() {
         ui.find_input.draw(*fb, 8.0, theme::FG_TEXT, &mut areas);
     }
+    } // end: palette closed
 
     // Palette text
     if let Some(pal) = layout.palette.as_ref() {
