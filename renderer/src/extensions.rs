@@ -7,6 +7,64 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::marketplace::RemoteExt;
+
+/// Which extension the detail page is showing: a locally-installed one (index
+/// into the scanned list) or a marketplace search result (index into results).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OpenExt {
+    Local(usize),
+    Remote(usize),
+}
+
+/// Display data for the detail page, unified across local + remote sources.
+pub struct OpenExtView {
+    pub name: String,
+    pub publisher: String,
+    pub description: String,
+    pub category: String,
+    pub supported: bool,
+    pub installed: bool,
+    pub remote: bool,
+}
+
+/// Build unified detail-page data for whatever extension is open. A free function
+/// over the specific slices (not a `&App` method) so callers can use it while
+/// `app.gpu` is mutably borrowed — the field borrows stay disjoint.
+pub fn open_ext_view(
+    open: Option<OpenExt>,
+    extensions: &[Extension],
+    remote: &[RemoteExt],
+) -> Option<OpenExtView> {
+    match open? {
+        OpenExt::Local(i) => {
+            let e = extensions.get(i)?;
+            Some(OpenExtView {
+                name: e.name.clone(),
+                publisher: e.publisher.clone(),
+                description: e.description.clone(),
+                category: e.category().to_string(),
+                supported: e.supported(),
+                installed: e.installed,
+                remote: false,
+            })
+        }
+        OpenExt::Remote(i) => {
+            let e = remote.get(i)?;
+            let name = if e.display.is_empty() { e.name.clone() } else { e.display.clone() };
+            Some(OpenExtView {
+                name,
+                publisher: e.namespace.clone(),
+                description: e.description.clone(),
+                category: "Marketplace".to_string(),
+                supported: true,
+                installed: false,
+                remote: true,
+            })
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ExtKind {
     Theme,       // contributes color themes — installable (applies the theme)

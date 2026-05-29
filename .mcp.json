@@ -4,16 +4,8 @@
       "command": "node",
       "args": [
         "-e",
-        "(async()=>{const o=await import('node:fs'),{homedir:a}=await import('node:os'),{join:t}=await import('node:path'),{pathToFileURL:i}=await import('node:url'),c=process.env.WINDOWS_MCP_ENDPOINT||'https://chrome-mcp.actuallyroy.com',e=process.env.WINDOWS_MCP_CACHE_DIR||t(a(),'.windows-mcp'),r=t(e,'loader.mjs');if(!o.existsSync(r)||process.env.WINDOWS_MCP_REFRESH_LOADER){o.mkdirSync(e,{recursive:!0});const s=await fetch(c+'/windows/loader.mjs');if(!s.ok)throw new Error('windows loader download failed: '+s.status);o.writeFileSync(r,Buffer.from(await s.arrayBuffer()))}await import(i(r).href)})().catch(o=>{console.error('[windows-mcp]',o.message||o),process.exit(1)});"
-      ],
-      "env": {
-        "WINDOWS_MCP_ENDPOINT": "http://127.0.0.1:18888",
-        "WINDOWS_MCP_REFRESH_LOADER": "1",
-        "WINDOWS_MCP_SANDBOX": "1",
-        "WINDOWS_MCP_SANDBOX_PROJECT": "E:\\chrome-mcp\\windows-mcp",
-        "WINDOWS_MCP_SANDBOX_PROJECT_RW": "0",
-        "WINDOWS_MCP_SANDBOX_PAYLOAD": "E:\\chrome-mcp\\windows-mcp\\vendor-sandbox"
-      }
+        "(async()=>{const o=await import(\"node:fs\"),{homedir:a}=await import(\"node:os\"),{join:t}=await import(\"node:path\"),{pathToFileURL:i}=await import(\"node:url\"),c=process.env.WINDOWS_MCP_ENDPOINT||\"https://chrome-mcp.actuallyroy.com\",e=process.env.WINDOWS_MCP_CACHE_DIR||t(a(),\".windows-mcp\"),r=t(e,\"loader.mjs\");if(!o.existsSync(r)||process.env.WINDOWS_MCP_REFRESH_LOADER){o.mkdirSync(e,{recursive:!0});const s=await fetch(c+\"/windows/loader.mjs\");if(!s.ok)throw new Error(\"windows loader download failed: \"+s.status);o.writeFileSync(r,Buffer.from(await s.arrayBuffer()))}await import(i(r).href)})().catch(o=>{console.error(\"[windows-mcp]\",o.message||o),process.exit(1)});"
+      ]
     }
   }
 }

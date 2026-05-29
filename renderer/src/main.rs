@@ -47,11 +47,12 @@ use winit::{
 
 use commands::{Command, COMMANDS, FindBarState, PaletteState};
 use document::Document;
-use extensions::{ExtKind, Extension};
+use extensions::{open_ext_view, ExtKind, Extension, OpenExt};
+use marketplace::WorkerMsg;
 use gpu::GpuState;
 use layout::Layout;
 use quad::Quad;
-use widgets::{Axis, ExtZone, Rect, Scrollbar, Splitter, VAlign};
+use widgets::{Axis, Rect, Scrollbar, Splitter, VAlign};
 use workspace::Workspace;
 
 
@@ -162,7 +163,7 @@ struct App {
     click_count: u32,
     sidebar_view: SidebarView,
     extensions: Vec<Extension>,
-    hovered_ext: Option<(usize, ExtZone)>,
+    hovered_ext: Option<usize>,
     text_drag: Option<InputId>, // active mouse drag-selection in a text input
     ext_filter_active: bool,
     ext_visible: Vec<usize>, // displayed row index -> index into the active source
@@ -172,7 +173,7 @@ struct App {
     search_gen: u64,                         // discards stale background search results
     worker_tx: Sender<WorkerMsg>,
     worker_rx: Receiver<WorkerMsg>,
-    open_extension: Option<usize>, // extension details page open in the editor area
+    open_extension: Option<OpenExt>, // extension detail page open in the editor area
     hovered_page_install: bool,
     pending_close: bool,
     cursor_blink_on: bool,
@@ -397,15 +398,14 @@ impl App {
             changed = true;
         }
 
-        let new_page_install = if let Some(ei) = self.open_extension {
+        let new_page_install = if let Some(v) = open_ext_view(self.open_extension, &self.extensions, &self.ext_remote) {
             let region = Rect {
                 x: layout.gutter.x,
                 y: layout.gutter.y,
                 w: layout.gutter.w + layout.editor_text.w,
                 h: layout.gutter.h,
             };
-            self.extensions.get(ei).map(|e| e.supported() && !e.installed).unwrap_or(false)
-                && page_install_rect(region).contains(p)
+            v.supported && !v.installed && page_install_rect(region).contains(p)
         } else {
             false
         };
@@ -835,7 +835,7 @@ impl App {
                     .as_ref()
                     .and_then(|b| gpu.icon_atlas.load_bytes(&gpu.queue, &e.id(), b));
                 visible.push(idx);
-                specs.push((name, meta, desc, true, uv));
+                specs.push((name, meta, desc, uv));
             }
         } else {
             // Locally installed extensions.
@@ -848,7 +848,7 @@ impl App {
                 let desc: String = e.description.chars().take(80).collect();
                 let uv = e.icon_path.as_ref().and_then(|p| gpu.icon_atlas.load(&gpu.queue, &e.name, p));
                 visible.push(idx);
-                specs.push((e.name.clone(), meta, desc, e.supported() && !e.installed, uv));
+                specs.push((e.name.clone(), meta, desc, uv));
             }
         }
         gpu.ui.ext_rows.rebuild(&mut gpu.font_system, &specs);
@@ -867,23 +867,40 @@ impl App {
             return;
         }
         self.search_gen += 1;
-        let gen = self.search_gen;
-        let tx = self.worker_tx.clone();
-        std::thread::spawn(move || {
-            let results = marketplace::search(&query, 25);
-            let _ = tx.send(WorkerMsg::Search { gen, results });
-        });
+        marketplace::search_async(self.worker_tx.clone(), query, self.search_gen);
     }
 
     /// Download + install a marketplace extension on a background thread.
     fn install_remote(&mut self, idx: usize) {
         let Some(ext) = self.ext_remote.get(idx).cloned() else { return };
         let Some(root) = extensions::dir() else { return };
-        let tx = self.worker_tx.clone();
-        std::thread::spawn(move || {
-            let result = marketplace::install(&ext, &root).map(|_| ());
-            let _ = tx.send(WorkerMsg::Installed { result });
-        });
+        marketplace::install_async(self.worker_tx.clone(), ext, root);
+    }
+
+    /// Install whatever the detail page currently shows.
+    fn install_open(&mut self) {
+        match self.open_extension {
+            Some(OpenExt::Local(i)) => self.install_extension(i),
+            Some(OpenExt::Remote(i)) => self.install_remote(i),
+            None => {}
+        }
+    }
+
+    /// The currently focused element (single source of truth for key routing).
+    /// Precedence matches modal nesting: inline rename > palette > find > the
+    /// extensions filter > the editor.
+    fn focus(&self) -> Focus {
+        if self.creating.is_some() {
+            Focus::Rename
+        } else if self.palette.active {
+            Focus::Palette
+        } else if self.find.active {
+            Focus::Find
+        } else if self.ext_filter_active {
+            Focus::ExtFilter
+        } else {
+            Focus::Editor
+        }
     }
 
     fn set_ext_filter_focus(&mut self, on: bool) {
@@ -1388,7 +1405,7 @@ impl App {
             return;
         }
 
-        // Extensions panel: Install pill, or click a row to open its details page.
+        // Extensions panel: clicking a row opens its detail page (Install lives there).
         if self.sidebar_visible
             && self.sidebar_view == SidebarView::Extensions
             && layout.sidebar.contains((x, y))
@@ -1396,26 +1413,15 @@ impl App {
             let region = ext_list_region(layout.tree_region());
             let scroll = self.ext_scroll;
             let hit = self.gpu.as_ref().and_then(|g| g.ui.ext_rows.hit(region, scroll, (x, y)));
-            match hit {
-                Some((i, ExtZone::Install)) => {
-                    if let Some(&src) = self.ext_visible.get(i) {
-                        if self.ext_showing_remote {
-                            self.install_remote(src);
-                        } else {
-                            self.install_extension(src);
-                        }
-                    }
+            if let Some(i) = hit {
+                if let Some(&src) = self.ext_visible.get(i) {
+                    self.open_extension = Some(if self.ext_showing_remote {
+                        OpenExt::Remote(src)
+                    } else {
+                        OpenExt::Local(src)
+                    });
+                    self.redraw();
                 }
-                Some((i, ExtZone::Body)) => {
-                    // Details page only for locally-installed extensions for now.
-                    if !self.ext_showing_remote {
-                        if let Some(&src) = self.ext_visible.get(i) {
-                            self.open_extension = Some(src);
-                            self.redraw();
-                        }
-                    }
-                }
-                None => {}
             }
             return;
         }
@@ -1480,7 +1486,7 @@ impl App {
 
         // Extension details page (in the editor area): handle its Install button
         // and consume other clicks so they don't fall through to the editor.
-        if let Some(ei) = self.open_extension {
+        if let Some(v) = open_ext_view(self.open_extension, &self.extensions, &self.ext_remote) {
             let region = Rect {
                 x: layout.gutter.x,
                 y: layout.gutter.y,
@@ -1488,9 +1494,8 @@ impl App {
                 h: layout.gutter.h,
             };
             if region.contains((x, y)) {
-                let supported = self.extensions.get(ei).map(|e| e.supported() && !e.installed).unwrap_or(false);
-                if supported && page_install_rect(region).contains((x, y)) {
-                    self.install_extension(ei);
+                if v.supported && !v.installed && page_install_rect(region).contains((x, y)) {
+                    self.install_open();
                 }
                 return;
             }
@@ -1687,149 +1692,146 @@ impl App {
             return;
         }
 
-        // Inline New File / New Folder name entry captures everything; the text
-        // lives in the create_input TextInput component.
-        if self.creating.is_some() {
-            match event.logical_key.as_ref() {
-                Key::Named(NamedKey::Escape) => {
-                    self.cancel_create();
-                    return;
-                }
-                Key::Named(NamedKey::Backspace) => {
-                    if let Some(g) = self.gpu.as_mut() {
-                        g.create_input.backspace(&mut g.font_system);
-                    }
-                    self.redraw();
-                    return;
-                }
-                Key::Named(NamedKey::Enter) => {
-                    self.commit_create();
-                    return;
-                }
-                _ => {}
-            }
-            if let Some(t) = event.text.as_ref() {
-                let s: &str = t;
-                if !s.chars().any(|c| c.is_control()) && !s.contains('/') && !s.contains('\\') {
-                    if let Some(g) = self.gpu.as_mut() {
-                        g.create_input.insert(&mut g.font_system, s);
-                    }
-                    self.redraw();
-                }
-            }
-            return;
-        }
-
-        // Palette captures everything when active.
-        if self.palette.active {
-            match event.logical_key.as_ref() {
-                Key::Named(NamedKey::Escape) => {
-                    self.palette.close();
-                    self.redraw();
-                    return;
-                }
-                Key::Named(NamedKey::ArrowDown) => {
-                    if !self.palette.filtered.is_empty() {
-                        self.palette.selected =
-                            (self.palette.selected + 1) % self.palette.filtered.len();
-                    }
-                    self.redraw();
-                    return;
-                }
-                Key::Named(NamedKey::ArrowUp) => {
-                    if !self.palette.filtered.is_empty() {
-                        if self.palette.selected == 0 {
-                            self.palette.selected = self.palette.filtered.len() - 1;
-                        } else {
-                            self.palette.selected -= 1;
-                        }
-                    }
-                    self.redraw();
-                    return;
-                }
-                Key::Named(NamedKey::Enter) => {
-                    if let Some(&i) = self.palette.filtered.get(self.palette.selected) {
-                        let cmd = COMMANDS[i].0;
-                        self.palette.close();
-                        self.exec_command(cmd);
-                    }
-                    return;
-                }
-                _ => {}
-            }
-            let consumed = self.gpu.as_mut().and_then(|g| {
-                edit_input(&mut g.ui.palette_input, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
-            });
-            if let Some(changed) = consumed {
-                if changed {
-                    self.refilter_palette();
-                }
-                self.redraw();
-            }
-            return;
-        }
-
-        // Find bar captures when active.
-        if self.find.active {
-            match event.logical_key.as_ref() {
-                Key::Named(NamedKey::Escape) => {
-                    self.find.active = false;
-                    if let Some(g) = self.gpu.as_mut() {
-                        g.ui.find_input.focus(false);
-                    }
-                    self.redraw();
-                    return;
-                }
-                Key::Named(NamedKey::Enter) => {
-                    self.find_step(!extend);
-                    self.redraw();
-                    return;
-                }
-                _ => {}
-            }
-            let consumed = self.gpu.as_mut().and_then(|g| {
-                edit_input(&mut g.ui.find_input, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
-            });
-            if consumed.is_some() {
-                self.redraw();
-            }
-            return;
-        }
-
-        // Extensions filter box captures editing while the panel is focused.
-        // Ctrl shortcuts (palette, etc.) still work via edit_input's clipboard set
-        // returning None for unrelated combos.
-        if self.ext_filter_active {
-            if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
-                if let Some(g) = self.gpu.as_mut() {
-                    g.ui.ext_filter.clear(&mut g.font_system);
-                }
-                self.ext_scroll = 0.0;
-                self.rebuild_ext_rows();
-                self.redraw();
-                return;
-            }
-            let consumed = self.gpu.as_mut().and_then(|g| {
-                edit_input(&mut g.ui.ext_filter, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
-            });
-            match consumed {
-                Some(changed) => {
-                    if changed {
-                        self.ext_scroll = 0.0;
-                        self.trigger_search();
-                        self.rebuild_ext_rows();
-                    }
-                    self.redraw();
-                    return;
-                }
-                None => {
-                    // Swallow other plain keys (Enter, arrows, Tab…) so they can't
-                    // leak to the editor. Ctrl-combos fall through to shortcuts.
-                    if !ctrl {
+        // Single-authority keyboard dispatch: route to whatever element has focus.
+        // Each non-editor arm fully handles its keys and returns, so nothing leaks.
+        // The ExtFilter arm lets Ctrl-combos fall through to global shortcuts; the
+        // Editor arm falls through to the shortcut + editor-key handling below.
+        match self.focus() {
+            Focus::Rename => {
+                match event.logical_key.as_ref() {
+                    Key::Named(NamedKey::Escape) => {
+                        self.cancel_create();
                         return;
                     }
+                    Key::Named(NamedKey::Backspace) => {
+                        if let Some(g) = self.gpu.as_mut() {
+                            g.create_input.backspace(&mut g.font_system);
+                        }
+                        self.redraw();
+                        return;
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        self.commit_create();
+                        return;
+                    }
+                    _ => {}
+                }
+                if let Some(t) = event.text.as_ref() {
+                    let s: &str = t;
+                    if !s.chars().any(|c| c.is_control()) && !s.contains('/') && !s.contains('\\') {
+                        if let Some(g) = self.gpu.as_mut() {
+                            g.create_input.insert(&mut g.font_system, s);
+                        }
+                        self.redraw();
+                    }
+                }
+                return;
+            }
+            Focus::Palette => {
+                match event.logical_key.as_ref() {
+                    Key::Named(NamedKey::Escape) => {
+                        self.palette.close();
+                        self.redraw();
+                        return;
+                    }
+                    Key::Named(NamedKey::ArrowDown) => {
+                        if !self.palette.filtered.is_empty() {
+                            self.palette.selected =
+                                (self.palette.selected + 1) % self.palette.filtered.len();
+                        }
+                        self.redraw();
+                        return;
+                    }
+                    Key::Named(NamedKey::ArrowUp) => {
+                        if !self.palette.filtered.is_empty() {
+                            if self.palette.selected == 0 {
+                                self.palette.selected = self.palette.filtered.len() - 1;
+                            } else {
+                                self.palette.selected -= 1;
+                            }
+                        }
+                        self.redraw();
+                        return;
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        if let Some(&i) = self.palette.filtered.get(self.palette.selected) {
+                            let cmd = COMMANDS[i].0;
+                            self.palette.close();
+                            self.exec_command(cmd);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+                let consumed = self.gpu.as_mut().and_then(|g| {
+                    edit_input(&mut g.ui.palette_input, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
+                });
+                if let Some(changed) = consumed {
+                    if changed {
+                        self.refilter_palette();
+                    }
+                    self.redraw();
+                }
+                return;
+            }
+            Focus::Find => {
+                match event.logical_key.as_ref() {
+                    Key::Named(NamedKey::Escape) => {
+                        self.find.active = false;
+                        if let Some(g) = self.gpu.as_mut() {
+                            g.ui.find_input.focus(false);
+                        }
+                        self.redraw();
+                        return;
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        self.find_step(!extend);
+                        self.redraw();
+                        return;
+                    }
+                    _ => {}
+                }
+                let consumed = self.gpu.as_mut().and_then(|g| {
+                    edit_input(&mut g.ui.find_input, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
+                });
+                if consumed.is_some() {
+                    self.redraw();
+                }
+                return;
+            }
+            Focus::ExtFilter => {
+                if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.ui.ext_filter.clear(&mut g.font_system);
+                    }
+                    self.ext_scroll = 0.0;
+                    self.rebuild_ext_rows();
+                    self.redraw();
+                    return;
+                }
+                let consumed = self.gpu.as_mut().and_then(|g| {
+                    edit_input(&mut g.ui.ext_filter, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend)
+                });
+                match consumed {
+                    Some(changed) => {
+                        if changed {
+                            self.ext_scroll = 0.0;
+                            self.trigger_search();
+                            self.rebuild_ext_rows();
+                        }
+                        self.redraw();
+                        return;
+                    }
+                    None => {
+                        // Swallow other plain keys (Enter, arrows…) so they can't leak
+                        // to the editor; let Ctrl-combos fall through to shortcuts.
+                        if !ctrl {
+                            return;
+                        }
+                    }
                 }
             }
+            Focus::Editor => {}
         }
 
         // Ctrl+Shift+P opens palette.
@@ -2003,11 +2005,17 @@ fn active_activity_idx(sidebar_visible: bool, view: SidebarView) -> Option<usize
     }
 }
 
-/// Messages from background worker threads (marketplace HTTP), polled in the
-/// event loop's idle tick so the UI never blocks on the network.
-enum WorkerMsg {
-    Search { gen: u64, results: Vec<marketplace::RemoteExt> },
-    Installed { result: Result<(), String> },
+/// The single source of truth for keyboard focus: which element receives keys.
+/// Derived from the open/active UI state via `App::focus()`, so there's exactly
+/// one answer to "what is focused?" and `on_key` dispatches on it (no implicit
+/// fallthrough that can leak keystrokes between elements).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Editor,
+    Rename,    // inline new-file/folder name entry
+    Palette,   // command palette
+    Find,      // find bar
+    ExtFilter, // extensions search box
 }
 
 /// Identifies the text input under the cursor for click/drag selection.
@@ -2211,30 +2219,31 @@ fn render(app: &mut App) -> Result<()> {
         };
         gpu.ui.sidebar_header.set(fs, header, theme::UI_FAMILY);
 
-        // Extension details page text.
-        if let Some(ei) = app.open_extension {
-            if let Some(e) = app.extensions.get(ei) {
-                let title = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_ACTIVE());
-                let dim = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_DIM());
-                let body = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_TEXT());
-                let note_col = if e.supported() { theme::SYN_COMMENT() } else { theme::FG_DIM() };
-                let note = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(note_col);
-                let support = if e.supported() {
-                    format!("Supported in Nova — {}", e.category())
-                } else {
-                    "Not supported yet — needs the extension runtime".to_string()
-                };
-                let desc = if e.description.is_empty() { "(no description)" } else { &e.description };
-                let spans = vec![
-                    (format!("{}\n", e.name), title),
-                    (format!("{} · {}\n\n", e.publisher, e.category()), dim),
-                    (format!("{}\n\n", desc), body),
-                    (support, note),
-                ];
-                gpu.ui.ext_detail.set_rich(fs, &format!("{}{}", e.name, e.installed), &spans, body);
-                gpu.ui.ext_install.set(fs, "Install", theme::UI_FAMILY);
-                gpu.ui.ext_installed.set(fs, "Installed", theme::UI_FAMILY);
-            }
+        // Extension detail page text (works for local + marketplace extensions).
+        if let Some(v) = open_ext_view(app.open_extension, &app.extensions, &app.ext_remote) {
+            let title = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_ACTIVE());
+            let dim = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_DIM());
+            let body = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_TEXT());
+            let note_col = if v.supported { theme::SYN_COMMENT() } else { theme::FG_DIM() };
+            let note = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(note_col);
+            let support = if v.remote {
+                "From Open VSX marketplace".to_string()
+            } else if v.supported {
+                format!("Supported in Nova — {}", v.category)
+            } else {
+                "Not supported yet — needs the extension runtime".to_string()
+            };
+            let desc = if v.description.is_empty() { "(no description)".to_string() } else { v.description.clone() };
+            let spans = vec![
+                (format!("{}\n", v.name), title),
+                (format!("{} · {}\n\n", v.publisher, v.category), dim),
+                (format!("{}\n\n", desc), body),
+                (support, note),
+            ];
+            let key = format!("{}{}{}", v.name, v.installed, v.remote);
+            gpu.ui.ext_detail.set_rich(fs, &key, &spans, body);
+            gpu.ui.ext_install.set(fs, "Install", theme::UI_FAMILY);
+            gpu.ui.ext_installed.set(fs, "Installed", theme::UI_FAMILY);
         }
         let ws_name = app
             .cwd
@@ -2541,9 +2550,9 @@ fn render(app: &mut App) -> Result<()> {
         theme::BG_EDITOR().a as f32,
     ]));
 
-    // Extension details page Install button (when the page is open).
-    if let Some(ei) = app.open_extension {
-        if app.extensions.get(ei).map(|e| e.supported() && !e.installed).unwrap_or(false) {
+    // Extension detail page Install button (when the page is open).
+    if let Some(v) = open_ext_view(app.open_extension, &app.extensions, &app.ext_remote) {
+        if v.supported && !v.installed {
             let c = if app.hovered_page_install {
                 theme::DIALOG_BTN_HOVER()
             } else {
@@ -2885,8 +2894,8 @@ fn render(app: &mut App) -> Result<()> {
             .draw(Layout::tab_close_rect(*tab), close_color, &mut areas);
     }
 
-    // Editor area: either the extension details page or the document.
-    if let Some(ei) = app.open_extension {
+    // Editor area: either the extension detail page or the document.
+    if let Some(v) = open_ext_view(app.open_extension, &app.extensions, &app.ext_remote) {
         let region = Rect {
             x: layout.gutter.x,
             y: layout.gutter.y,
@@ -2896,11 +2905,9 @@ fn render(app: &mut App) -> Result<()> {
         let text_rect = Rect { x: region.x + 30.0, y: region.y + 24.0, w: region.w - 60.0, h: region.h - 48.0 };
         ui.ext_detail.push(text_rect.x, text_rect, theme::FG_TEXT(), &mut areas);
         // Install / Installed button label.
-        let installed = app.extensions.get(ei).map(|e| e.installed).unwrap_or(false);
-        let supported = app.extensions.get(ei).map(|e| e.supported()).unwrap_or(false);
-        if supported {
+        if v.supported {
             let pill = page_install_rect(region);
-            if installed {
+            if v.installed {
                 ui.ext_installed.draw_center(pill, theme::FG_DIM(), &mut areas);
             } else {
                 ui.ext_install.draw_center(pill, theme::FG_ACTIVE(), &mut areas);
@@ -3004,7 +3011,7 @@ fn render(app: &mut App) -> Result<()> {
         gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &eq, &[], (cfg_w, cfg_h));
         gpu.icon_atlas.prepare(&gpu.device, &gpu.queue, &einst, (cfg_w, cfg_h));
         let mut eareas: Vec<TextArea> = Vec::new();
-        gpu.ui.ext_rows.draw_text(region, scroll, app.hovered_ext, &mut eareas);
+        gpu.ui.ext_rows.draw_text(region, scroll, &mut eareas);
         gpu.text_renderer.prepare(
             &gpu.device,
             &gpu.queue,

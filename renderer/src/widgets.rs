@@ -1145,26 +1145,17 @@ impl Splitter {
     }
 }
 
-/// Which interactive zone of an extension row is under the cursor.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ExtZone {
-    Body,    // anywhere on the row — opens the details page
-    Install, // the Install pill — installs the extension
-}
-
-/// A self-contained, reactive extensions-list row. It owns its text buffers and a
-/// placeholder icon color, derives every sub-rect (icon tile, name/meta/desc
-/// lines, Install pill) from its bounds — so geometry can't drift — and exposes
-/// `hit`/`draw` that react to the hover/installed state passed in. No magic
-/// offsets leak to the caller.
+/// A self-contained extensions-list row: a clickable entry showing an icon +
+/// name + publisher·category + description. It owns its text buffers and derives
+/// every sub-rect from its bounds (no magic offsets leak to the caller). There's
+/// no inline action button — clicking the row opens the detail page, which is
+/// where Install lives (VSCode-style).
 pub struct ExtensionRow {
     name: TextLabel,
     meta: TextLabel,
     desc: TextLabel,
-    install: TextLabel,
     icon_color: [f32; 4],
     icon_uv: Option<[f32; 4]>, // atlas UV rect when a real icon is available
-    installable: bool,
 }
 
 impl ExtensionRow {
@@ -1173,17 +1164,8 @@ impl ExtensionRow {
     const ICON: f32 = 42.0;
     const GAP: f32 = 12.0;
     const TOP: f32 = 9.0;
-    const BTN_W: f32 = 62.0;
-    const BTN_H: f32 = 24.0;
 
-    pub fn new(
-        fs: &mut FontSystem,
-        name: &str,
-        meta: &str,
-        desc: &str,
-        installable: bool,
-        icon_uv: Option<[f32; 4]>,
-    ) -> Self {
+    pub fn new(fs: &mut FontSystem, name: &str, meta: &str, desc: &str, icon_uv: Option<[f32; 4]>) -> Self {
         let mut nl = TextLabel::new(fs, theme::SIDEBAR_WIDTH, theme::UI_LINE_HEIGHT);
         nl.align = VAlign::Center;
         nl.set(fs, name, theme::UI_FAMILY);
@@ -1193,17 +1175,12 @@ impl ExtensionRow {
         let mut dl = TextLabel::new(fs, 800.0, theme::UI_LINE_HEIGHT);
         dl.align = VAlign::Center;
         dl.set(fs, desc, theme::UI_FAMILY);
-        let mut il = TextLabel::new(fs, 80.0, Self::BTN_H);
-        il.align = VAlign::Center;
-        il.set(fs, "Install", theme::UI_FAMILY);
         Self {
             name: nl,
             meta: ml,
             desc: dl,
-            install: il,
             icon_color: icon_color(name),
             icon_uv,
-            installable,
         }
     }
 
@@ -1223,61 +1200,28 @@ impl ExtensionRow {
         let x = Self::text_x(b);
         Rect { x, y: b.y + Self::TOP + n * theme::UI_LINE_HEIGHT, w: b.x + b.w - Self::PAD_X - x, h: theme::UI_LINE_HEIGHT }
     }
-    fn install_rect(b: Rect) -> Rect {
-        Rect {
-            x: b.x + b.w - Self::BTN_W - Self::PAD_X,
-            y: b.y + (b.h - Self::BTN_H) * 0.5,
-            w: Self::BTN_W,
-            h: Self::BTN_H,
-        }
+
+    /// True if `p` is on this row.
+    pub fn hit(&self, bounds: Rect, p: (f32, f32)) -> bool {
+        bounds.contains(p)
     }
 
-    /// The zone of this row under `p`, given the row's `bounds`.
-    pub fn hit(&self, bounds: Rect, p: (f32, f32)) -> Option<ExtZone> {
-        if self.installable && Self::install_rect(bounds).contains(p) {
-            Some(ExtZone::Install)
-        } else if bounds.contains(p) {
-            Some(ExtZone::Body)
-        } else {
-            None
-        }
-    }
-
-    /// Background quads (hover highlight, icon tile, Install pill) — drawn in the
-    /// quad pass. Split from `draw_text` only because the renderer batches all
-    /// quads before all glyphs; both derive from the same internal rects.
-    pub fn draw_quads(&self, bounds: Rect, hovered: Option<ExtZone>, quads: &mut Vec<Quad>) {
-        if hovered.is_some() {
+    /// Background quads (hover highlight + placeholder icon tile) — quad pass.
+    pub fn draw_quads(&self, bounds: Rect, hovered: bool, quads: &mut Vec<Quad>) {
+        if hovered {
             quads.push(bounds.quad(theme::TREE_HOVER()));
         }
         // Colored placeholder only when there's no real icon (the atlas draws those).
         if self.icon_uv.is_none() {
             quads.push(Self::icon_rect(bounds).quad(self.icon_color));
         }
-        // The Install pill appears only while the row is hovered (VSCode-like).
-        if self.installable && hovered.is_some() {
-            let c = if hovered == Some(ExtZone::Install) {
-                theme::DIALOG_BTN_HOVER()
-            } else {
-                theme::DIALOG_BTN()
-            };
-            quads.push(Self::install_rect(bounds).quad(c));
-        }
     }
 
-    /// Text areas (name, meta, description, Install label) — drawn in the glyph pass.
-    pub fn draw_text<'a>(
-        &'a self,
-        bounds: Rect,
-        hovered: Option<ExtZone>,
-        areas: &mut Vec<TextArea<'a>>,
-    ) {
+    /// Text areas (name, meta, description) — glyph pass.
+    pub fn draw_text<'a>(&'a self, bounds: Rect, areas: &mut Vec<TextArea<'a>>) {
         self.name.draw_left(Self::line_rect(bounds, 0.0), 0.0, theme::FG_TEXT(), areas);
         self.meta.draw_left(Self::line_rect(bounds, 1.0), 0.0, theme::FG_DIM(), areas);
         self.desc.draw_left(Self::line_rect(bounds, 2.0), 0.0, theme::FG_DIM(), areas);
-        if self.installable && hovered.is_some() {
-            self.install.draw_center(Self::install_rect(bounds), theme::FG_ACTIVE(), areas);
-        }
     }
 }
 
@@ -1301,8 +1245,8 @@ fn icon_color(name: &str) -> [f32; 4] {
 /// A vertical list of `ExtensionRow`s. Owns the rows, stacks them at a fixed row
 /// height (single source of truth for row bounds shared by hit-test and draw),
 /// and routes hover/click to the row under the cursor.
-/// Row spec: (name, meta, description, installable, icon atlas UV).
-pub type ExtSpec = (String, String, String, bool, Option<[f32; 4]>);
+/// Row spec: (name, meta, description, icon atlas UV).
+pub type ExtSpec = (String, String, String, Option<[f32; 4]>);
 
 pub struct ExtensionList {
     rows: Vec<ExtensionRow>,
@@ -1317,12 +1261,12 @@ impl ExtensionList {
         self.rows.len()
     }
 
-    /// Rebuild from `(name, meta, desc, installable, icon_uv)` specs (call when the
-    /// extension data changes — after a scan or an install).
+    /// Rebuild from `(name, meta, desc, icon_uv)` specs (call when the extension
+    /// data changes — after a scan, a search, or an install).
     pub fn rebuild(&mut self, fs: &mut FontSystem, specs: &[ExtSpec]) {
         self.rows = specs
             .iter()
-            .map(|(n, m, d, ins, uv)| ExtensionRow::new(fs, n, m, d, *ins, *uv))
+            .map(|(n, m, d, uv)| ExtensionRow::new(fs, n, m, d, *uv))
             .collect();
     }
 
@@ -1344,42 +1288,31 @@ impl ExtensionList {
         b.y + b.h > region.y && b.y < region.y + region.h
     }
 
-    /// The (row index, zone) under `p`, or None.
-    pub fn hit(&self, region: Rect, scroll: f32, p: (f32, f32)) -> Option<(usize, ExtZone)> {
+    /// The row index under `p`, or None.
+    pub fn hit(&self, region: Rect, scroll: f32, p: (f32, f32)) -> Option<usize> {
         if !region.contains(p) {
             return None;
         }
-        for i in 0..self.rows.len() {
+        (0..self.rows.len()).find(|&i| {
             let b = self.row_bounds(region, scroll, i);
-            if Self::visible(b, region) {
-                if let Some(z) = self.rows[i].hit(b, p) {
-                    return Some((i, z));
-                }
-            }
-        }
-        None
+            Self::visible(b, region) && self.rows[i].hit(b, p)
+        })
     }
 
-    pub fn draw_quads(&self, region: Rect, scroll: f32, hovered: Option<(usize, ExtZone)>, quads: &mut Vec<Quad>) {
+    pub fn draw_quads(&self, region: Rect, scroll: f32, hovered: Option<usize>, quads: &mut Vec<Quad>) {
         for (i, row) in self.rows.iter().enumerate() {
             let b = self.row_bounds(region, scroll, i);
             if Self::visible(b, region) {
-                row.draw_quads(b, Self::hov(hovered, i), quads);
+                row.draw_quads(b, hovered == Some(i), quads);
             }
         }
     }
 
-    pub fn draw_text<'a>(
-        &'a self,
-        region: Rect,
-        scroll: f32,
-        hovered: Option<(usize, ExtZone)>,
-        areas: &mut Vec<TextArea<'a>>,
-    ) {
+    pub fn draw_text<'a>(&'a self, region: Rect, scroll: f32, areas: &mut Vec<TextArea<'a>>) {
         for (i, row) in self.rows.iter().enumerate() {
             let b = self.row_bounds(region, scroll, i);
             if Self::visible(b, region) {
-                row.draw_text(b, Self::hov(hovered, i), areas);
+                row.draw_text(b, areas);
             }
         }
     }
@@ -1394,9 +1327,5 @@ impl ExtensionList {
                 }
             }
         }
-    }
-
-    fn hov(hovered: Option<(usize, ExtZone)>, i: usize) -> Option<ExtZone> {
-        hovered.and_then(|(hi, z)| (hi == i).then_some(z))
     }
 }

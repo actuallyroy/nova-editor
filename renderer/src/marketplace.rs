@@ -5,10 +5,35 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 
 use serde_json::Value;
 
 const BASE: &str = "https://open-vsx.org";
+
+/// Messages from marketplace worker threads, polled in the event loop's idle tick
+/// so the UI never blocks on the network.
+pub enum WorkerMsg {
+    Search { gen: u64, results: Vec<RemoteExt> },
+    Installed { result: Result<(), String> },
+}
+
+/// Run a search on a background thread and send the results back over `tx`. The
+/// `gen` lets the receiver discard stale responses from superseded queries.
+pub fn search_async(tx: Sender<WorkerMsg>, query: String, gen: u64) {
+    std::thread::spawn(move || {
+        let results = search(&query, 25);
+        let _ = tx.send(WorkerMsg::Search { gen, results });
+    });
+}
+
+/// Download + install an extension on a background thread, reporting back over `tx`.
+pub fn install_async(tx: Sender<WorkerMsg>, ext: RemoteExt, root: PathBuf) {
+    std::thread::spawn(move || {
+        let result = install(&ext, &root).map(|_| ());
+        let _ = tx.send(WorkerMsg::Installed { result });
+    });
+}
 
 /// One marketplace search result (icon bytes fetched eagerly, best-effort).
 #[derive(Clone)]
