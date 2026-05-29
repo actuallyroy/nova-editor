@@ -16,6 +16,8 @@ const BASE: &str = "https://open-vsx.org";
 pub enum WorkerMsg {
     Search { gen: u64, results: Vec<RemoteExt> },
     Installed { result: Result<(), String> },
+    Readme { gen: u64, text: Option<String> },
+    Changelog { gen: u64, text: Option<String> },
 }
 
 /// Run a search on a background thread and send the results back over `tx`. The
@@ -35,6 +37,23 @@ pub fn install_async(tx: Sender<WorkerMsg>, ext: RemoteExt, root: PathBuf) {
     });
 }
 
+/// Fetch a README over HTTP on a background thread; `gen` discards stale fetches.
+/// Returns the raw markdown — the Markdown widget does the rendering.
+pub fn readme_async(tx: Sender<WorkerMsg>, url: String, gen: u64) {
+    std::thread::spawn(move || {
+        let text = get_string(&url);
+        let _ = tx.send(WorkerMsg::Readme { gen, text });
+    });
+}
+
+/// Fetch a CHANGELOG over HTTP on a background thread; `gen` discards stale fetches.
+pub fn changelog_async(tx: Sender<WorkerMsg>, url: String, gen: u64) {
+    std::thread::spawn(move || {
+        let text = get_string(&url);
+        let _ = tx.send(WorkerMsg::Changelog { gen, text });
+    });
+}
+
 /// One marketplace search result (icon bytes fetched eagerly, best-effort).
 #[derive(Clone)]
 pub struct RemoteExt {
@@ -43,7 +62,11 @@ pub struct RemoteExt {
     pub display: String,
     pub description: String,
     pub version: String,
+    pub downloads: u64,
+    pub rating: f32, // average rating 0..5 (0 = unrated)
     pub download_url: Option<String>,
+    pub readme_url: Option<String>,
+    pub changelog_url: Option<String>,
     pub icon: Option<Vec<u8>>, // raw PNG/JPG bytes, decoded on the GPU thread
 }
 
@@ -102,7 +125,11 @@ pub fn search(query: &str, size: usize) -> Vec<RemoteExt> {
                 display: e["displayName"].as_str().unwrap_or("").to_string(),
                 description: e["description"].as_str().unwrap_or("").to_string(),
                 version: e["version"].as_str().unwrap_or("").to_string(),
+                downloads: e["downloadCount"].as_u64().unwrap_or(0),
+                rating: e["averageRating"].as_f64().unwrap_or(0.0) as f32,
                 download_url: files.get("download").and_then(|u| u.as_str()).map(String::from),
+                readme_url: files.get("readme").and_then(|u| u.as_str()).map(String::from),
+                changelog_url: files.get("changelog").and_then(|u| u.as_str()).map(String::from),
                 icon,
             });
         }

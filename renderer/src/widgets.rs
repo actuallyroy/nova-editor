@@ -200,6 +200,24 @@ impl TextLabel {
         self.push(rect.x + pad, rect, color, areas);
     }
 
+    /// Push with an explicit `top` (for vertical scroll) clipped to `clip`.
+    pub fn push_clipped<'a>(&'a self, left: f32, top: f32, clip: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
+        areas.push(TextArea {
+            buffer: &self.buffer,
+            left,
+            top,
+            scale: 1.0,
+            bounds: TextBounds {
+                left: clip.x as i32,
+                top: clip.y as i32,
+                right: (clip.x + clip.w) as i32,
+                bottom: (clip.y + clip.h) as i32,
+            },
+            default_color: color,
+            custom_glyphs: &[],
+        });
+    }
+
     pub fn draw_center<'a>(&'a self, rect: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
         self.push(rect.x + (rect.w - self.width()) * 0.5, rect, color, areas);
     }
@@ -1227,7 +1245,7 @@ impl ExtensionRow {
 
 /// A stable, distinct placeholder color for an extension icon (real PNG icons
 /// aren't rendered yet). Derived from the name so it stays consistent per row.
-fn icon_color(name: &str) -> [f32; 4] {
+pub(crate) fn icon_color(name: &str) -> [f32; 4] {
     const PALETTE: [[f32; 4]; 8] = [
         [0.20, 0.45, 0.78, 1.0],
         [0.55, 0.36, 0.72, 1.0],

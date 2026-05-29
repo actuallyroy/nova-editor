@@ -17,6 +17,7 @@ use winit::window::Window;
 use crate::icon::IconAtlas;
 use crate::quad::QuadRenderer;
 use crate::theme;
+use crate::ext_detail::ExtensionDetail;
 use crate::widgets::{
     make_ui_buffer, Dialog, ExtensionList, Gutter, IconButton, ListView, Menu, MenuBar,
     SearchField, TextInput, TextLabel,
@@ -37,9 +38,7 @@ pub struct UiBuffers {
     pub dialog: Dialog,
     pub ext_rows: ExtensionList,
     pub ext_filter: TextInput, // extensions panel search/filter box
-    pub ext_install: TextLabel, // details-page Install button label
-    pub ext_detail: TextLabel,
-    pub ext_installed: TextLabel,
+    pub ext_detail: ExtensionDetail,
 }
 
 pub struct GpuState {
@@ -193,13 +192,7 @@ impl GpuState {
             dialog: Dialog::new(&mut font_system),
             ext_rows: ExtensionList::new(),
             ext_filter: TextInput::new(&mut font_system, theme::SIDEBAR_WIDTH, 30.0),
-            ext_install: TextLabel::new(&mut font_system, 120.0, 34.0),
-            ext_detail: {
-                let mut l = TextLabel::new(&mut font_system, 1400.0, 400.0);
-                l.align = crate::widgets::VAlign::Top;
-                l
-            },
-            ext_installed: TextLabel::new(&mut font_system, 120.0, 22.0),
+            ext_detail: ExtensionDetail::new(&mut font_system),
         };
 
         Ok(Self {

@@ -9,13 +9,16 @@
 
 mod commands;
 mod document;
+mod ext_detail;
 mod ext_runtime;
 mod extensions;
 mod gpu;
 mod icon;
 mod layout;
+mod markdown;
 mod marketplace;
 mod quad;
+mod render;
 mod syntax;
 mod textmate;
 mod theme;
@@ -29,13 +32,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use arboard::Clipboard;
-use glyphon::{
-    Attrs, Buffer, Family, Resolution, Shaping, TextArea, TextBounds,
-};
-use wgpu::{
-    CommandEncoderDescriptor, LoadOp, Operations, RenderPassColorAttachment,
-    RenderPassDescriptor, StoreOp, TextureViewDescriptor,
-};
+use glyphon::Buffer;
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition},
@@ -47,19 +44,18 @@ use winit::{
 
 use commands::{Command, COMMANDS, FindBarState, PaletteState};
 use document::Document;
-use extensions::{open_ext_view, ExtKind, Extension, OpenExt};
+use extensions::{ExtKind, Extension, OpenExt};
 use marketplace::WorkerMsg;
 use gpu::GpuState;
 use layout::Layout;
-use quad::Quad;
-use widgets::{Axis, Rect, Scrollbar, Splitter, VAlign};
+use widgets::{Axis, Rect, Scrollbar, Splitter};
 use workspace::Workspace;
 
 
 // ---------- App ----------
 
-struct UiCache {
-    tabs: String,
+pub(crate) struct UiCache {
+    pub(crate) tabs: String,
 }
 
 impl UiCache {
@@ -73,16 +69,16 @@ impl UiCache {
 /// In-progress inline name entry in the tree — either a New File/Folder
 /// (`rename_from` = None, inserts a row) or a Rename (`rename_from` = Some,
 /// replaces the target's row).
-struct PendingCreate {
-    is_dir: bool,
-    parent: PathBuf,
-    row: usize,   // tree row the field occupies
-    depth: usize, // indent level of the inline field
-    rename_from: Option<PathBuf>,
+pub(crate) struct PendingCreate {
+    pub(crate) is_dir: bool,
+    pub(crate) parent: PathBuf,
+    pub(crate) row: usize,   // tree row the field occupies
+    pub(crate) depth: usize, // indent level of the inline field
+    pub(crate) rename_from: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
-enum MenuAction {
+pub(crate) enum MenuAction {
     NewFile,
     NewFolder,
     Rename,
@@ -90,7 +86,7 @@ enum MenuAction {
     CopyPath,
 }
 
-const MENU_ACTIONS: &[(MenuAction, &str)] = &[
+pub(crate) const MENU_ACTIONS: &[(MenuAction, &str)] = &[
     (MenuAction::NewFile, "New File"),
     (MenuAction::NewFolder, "New Folder"),
     (MenuAction::Rename, "Rename"),
@@ -99,86 +95,92 @@ const MENU_ACTIONS: &[(MenuAction, &str)] = &[
 ];
 
 /// An open right-click context menu over the file tree.
-struct ContextMenu {
-    anchor: (f32, f32),
-    target: Option<usize>, // tree node index; None = empty area (root scope)
+pub(crate) struct ContextMenu {
+    pub(crate) anchor: (f32, f32),
+    pub(crate) target: Option<usize>, // tree node index; None = empty area (root scope)
 }
 
 /// Which sidebar view the activity bar has selected.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SidebarView {
+pub(crate) enum SidebarView {
     Explorer,
     Extensions,
 }
 
 /// What a modal dialog confirms.
-enum DialogAction {
+pub(crate) enum DialogAction {
     DeleteNode(usize),
     CloseDoc(usize),
 }
 
-struct DialogState {
-    action: DialogAction,
-    buttons: &'static [&'static str],
-    has_check: bool,
-    checked: bool,
-    hovered: Option<usize>,
+pub(crate) struct DialogState {
+    pub(crate) action: DialogAction,
+    pub(crate) buttons: &'static [&'static str],
+    pub(crate) has_check: bool,
+    pub(crate) checked: bool,
+    pub(crate) hovered: Option<usize>,
 }
 
-struct App {
-    cwd: PathBuf,
-    initial_file: Option<PathBuf>,
-    workspace: Workspace,
-    gpu: Option<GpuState>,
-    mouse_pos: PhysicalPosition<f64>,
-    mouse_pressed: bool,
-    dragging_editor: bool,
-    mods: ModifiersState,
-    clipboard: Option<Clipboard>,
-    sidebar_visible: bool,
-    sidebar_split: Splitter,
-    palette: PaletteState,
-    find: FindBarState,
-    ui_cache: UiCache,
-    hovered_tab: Option<usize>,
-    hovered_tab_close: Option<usize>,
-    hovered_tree: Option<usize>,
-    hovered_activity: Option<usize>,
-    hovered_titlebtn: Option<usize>,
-    hovered_search: bool,
-    hovered_menu: Option<usize>,
-    hovered_layout: Option<usize>,
-    hovered_explorer: Option<usize>,
-    selected_tree: Option<usize>,
-    creating: Option<PendingCreate>,
-    context_menu: Option<ContextMenu>,
-    hovered_menu_item: Option<usize>,
-    dialog: Option<DialogState>,
-    skip_delete_confirm: bool,
-    editor_scroll: Scrollbar,
-    editor_hscroll: Scrollbar,
-    hovered_scrollbar: bool,
-    last_click: Instant,
-    last_click_pos: (f32, f32),
-    click_count: u32,
-    sidebar_view: SidebarView,
-    extensions: Vec<Extension>,
-    hovered_ext: Option<usize>,
-    text_drag: Option<InputId>, // active mouse drag-selection in a text input
-    ext_filter_active: bool,
-    ext_visible: Vec<usize>, // displayed row index -> index into the active source
-    ext_scroll: f32,
-    ext_remote: Vec<marketplace::RemoteExt>, // current marketplace search results
-    ext_showing_remote: bool,                // true while a search query is active
-    search_gen: u64,                         // discards stale background search results
-    worker_tx: Sender<WorkerMsg>,
-    worker_rx: Receiver<WorkerMsg>,
-    open_extension: Option<OpenExt>, // extension detail page open in the editor area
-    hovered_page_install: bool,
-    pending_close: bool,
-    cursor_blink_on: bool,
-    last_blink: Instant,
-    cursor_icon: CursorIcon,
+pub(crate) struct App {
+    pub(crate) cwd: PathBuf,
+    pub(crate) initial_file: Option<PathBuf>,
+    pub(crate) workspace: Workspace,
+    pub(crate) gpu: Option<GpuState>,
+    pub(crate) mouse_pos: PhysicalPosition<f64>,
+    pub(crate) mouse_pressed: bool,
+    pub(crate) dragging_editor: bool,
+    pub(crate) mods: ModifiersState,
+    pub(crate) clipboard: Option<Clipboard>,
+    pub(crate) sidebar_visible: bool,
+    pub(crate) sidebar_split: Splitter,
+    pub(crate) palette: PaletteState,
+    pub(crate) find: FindBarState,
+    pub(crate) ui_cache: UiCache,
+    pub(crate) hovered_tab: Option<usize>,
+    pub(crate) hovered_tab_close: Option<usize>,
+    pub(crate) hovered_tree: Option<usize>,
+    pub(crate) hovered_activity: Option<usize>,
+    pub(crate) hovered_titlebtn: Option<usize>,
+    pub(crate) hovered_search: bool,
+    pub(crate) hovered_menu: Option<usize>,
+    pub(crate) hovered_layout: Option<usize>,
+    pub(crate) hovered_explorer: Option<usize>,
+    pub(crate) selected_tree: Option<usize>,
+    pub(crate) creating: Option<PendingCreate>,
+    pub(crate) context_menu: Option<ContextMenu>,
+    pub(crate) hovered_menu_item: Option<usize>,
+    pub(crate) dialog: Option<DialogState>,
+    pub(crate) skip_delete_confirm: bool,
+    pub(crate) editor_scroll: Scrollbar,
+    pub(crate) editor_hscroll: Scrollbar,
+    pub(crate) hovered_scrollbar: bool,
+    pub(crate) last_click: Instant,
+    pub(crate) last_click_pos: (f32, f32),
+    pub(crate) click_count: u32,
+    pub(crate) sidebar_view: SidebarView,
+    pub(crate) extensions: Vec<Extension>,
+    pub(crate) hovered_ext: Option<usize>,
+    pub(crate) text_drag: Option<InputId>, // active mouse drag-selection in a text input
+    pub(crate) ext_filter_active: bool,
+    pub(crate) ext_visible: Vec<usize>, // displayed row index -> index into the active source
+    pub(crate) ext_scroll: f32,
+    pub(crate) ext_remote: Vec<marketplace::RemoteExt>, // current marketplace search results
+    pub(crate) ext_showing_remote: bool,                // true while a search query is active
+    pub(crate) search_gen: u64,                         // discards stale background search results
+    pub(crate) worker_tx: Sender<WorkerMsg>,
+    pub(crate) worker_rx: Receiver<WorkerMsg>,
+    pub(crate) open_extension: Option<OpenExt>, // extension detail page open in the editor area
+    pub(crate) ext_readme: Option<String>,      // README text for the open detail page
+    pub(crate) ext_changelog: Option<String>,   // CHANGELOG text for the open detail page
+    pub(crate) ext_features: String,            // generated Features-tab markdown
+    pub(crate) ext_doc_gen: u64,                // discards stale async README/changelog fetches
+    pub(crate) ext_detail_scroll: f32,          // detail-page body scroll offset
+    pub(crate) hovered_detail_tab: Option<ext_detail::DetailTab>,
+    pub(crate) hovered_page_install: bool,
+    pub(crate) pending_close: bool,
+    pub(crate) cursor_blink_on: bool,
+    pub(crate) last_blink: Instant,
+    pub(crate) cursor_icon: CursorIcon,
 }
 
 impl App {
@@ -237,6 +239,12 @@ impl App {
             worker_tx,
             worker_rx,
             open_extension: None,
+            ext_readme: None,
+            ext_changelog: None,
+            ext_features: String::new(),
+            ext_doc_gen: 0,
+            ext_detail_scroll: 0.0,
+            hovered_detail_tab: None,
             hovered_page_install: false,
             pending_close: false,
             cursor_blink_on: true,
@@ -398,17 +406,23 @@ impl App {
             changed = true;
         }
 
-        let new_page_install = if let Some(v) = open_ext_view(self.open_extension, &self.extensions, &self.ext_remote) {
-            let region = Rect {
-                x: layout.gutter.x,
-                y: layout.gutter.y,
-                w: layout.gutter.w + layout.editor_text.w,
-                h: layout.gutter.h,
-            };
-            v.supported && !v.installed && page_install_rect(region).contains(p)
+        let new_page_install = if self.open_extension.is_some() {
+            let region = render::editor_region(&layout);
+            self.gpu.as_ref().map(|g| g.ui.ext_detail.hit_install(region, p)).unwrap_or(false)
         } else {
             false
         };
+
+        let new_detail_tab = if self.open_extension.is_some() {
+            let region = render::editor_region(&layout);
+            self.gpu.as_ref().and_then(|g| g.ui.ext_detail.hit_tab(region, p))
+        } else {
+            None
+        };
+        if new_detail_tab != self.hovered_detail_tab {
+            self.hovered_detail_tab = new_detail_tab;
+            changed = true;
+        }
         if new_page_install != self.hovered_page_install {
             self.hovered_page_install = new_page_install;
             changed = true;
@@ -454,7 +468,7 @@ impl App {
                 .unwrap_or(CursorIcon::Default)
         } else if self.focused_input_at(&layout, p).is_some() {
             CursorIcon::Text
-        } else if new_ext.is_some() || new_page_install {
+        } else if new_ext.is_some() || new_page_install || new_detail_tab.is_some() {
             CursorIcon::Pointer
         } else if self.open_extension.is_some() && layout.editor_text.contains(p) {
             CursorIcon::Default
@@ -875,6 +889,71 @@ impl App {
         let Some(ext) = self.ext_remote.get(idx).cloned() else { return };
         let Some(root) = extensions::dir() else { return };
         marketplace::install_async(self.worker_tx.clone(), ext, root);
+    }
+
+    /// Open the detail page for an extension and load its README (local read /
+    /// remote fetch), resetting the page scroll.
+    fn open_ext_detail(&mut self, which: OpenExt) {
+        self.open_extension = Some(which);
+        self.ext_detail_scroll = 0.0;
+        self.ext_readme = None;
+        self.ext_changelog = None;
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.ext_detail.set_tab(ext_detail::DetailTab::Details);
+        }
+        self.ext_features = self.build_features_md(which);
+        self.ext_doc_gen += 1;
+        let gen = self.ext_doc_gen;
+        match which {
+            OpenExt::Local(i) => {
+                let e = self.extensions.get(i);
+                self.ext_readme = e
+                    .and_then(|e| e.readme_path.clone())
+                    .and_then(|p| std::fs::read_to_string(&p).ok());
+                self.ext_changelog = self
+                    .extensions
+                    .get(i)
+                    .and_then(|e| e.changelog_path.clone())
+                    .and_then(|p| std::fs::read_to_string(&p).ok());
+            }
+            OpenExt::Remote(i) => {
+                if let Some(e) = self.ext_remote.get(i) {
+                    if let Some(url) = e.readme_url.clone() {
+                        marketplace::readme_async(self.worker_tx.clone(), url, gen);
+                    }
+                    if let Some(url) = e.changelog_url.clone() {
+                        marketplace::changelog_async(self.worker_tx.clone(), url, gen);
+                    }
+                }
+            }
+        }
+        self.redraw();
+    }
+
+    /// Build the Features-tab markdown from what Nova knows about the extension.
+    fn build_features_md(&self, which: OpenExt) -> String {
+        match which {
+            OpenExt::Local(i) => {
+                let Some(e) = self.extensions.get(i) else { return String::new() };
+                let mut s = String::new();
+                match e.kind {
+                    ExtKind::Theme => s.push_str("### Color Theme\nContributes a color theme Nova can apply natively.\n\n"),
+                    ExtKind::Grammar => s.push_str("### Syntax Highlighting\nShips TextMate grammars Nova runs natively for syntax coloring.\n\n"),
+                    ExtKind::Declarative => s.push_str("### Language Support\nContributes snippets / language configuration.\n\n"),
+                    ExtKind::Code => s.push_str("### Code Extension\nNeeds the JavaScript extension runtime (not yet supported in Nova).\n\n"),
+                }
+                if !e.grammar_paths.is_empty() {
+                    s.push_str(&format!("- {} grammar file(s)\n", e.grammar_paths.len()));
+                }
+                if e.theme_path.is_some() {
+                    s.push_str("- 1 color theme\n");
+                }
+                s
+            }
+            OpenExt::Remote(_) => {
+                "Feature details are available after install.".to_string()
+            }
+        }
     }
 
     /// Install whatever the detail page currently shows.
@@ -1397,9 +1476,10 @@ impl App {
                     self.sidebar_view = v;
                     self.sidebar_visible = true;
                 }
-                // The filter box is focused while the Extensions panel is showing.
-                let ext_focus = self.sidebar_visible && v == SidebarView::Extensions;
-                self.set_ext_filter_focus(ext_focus);
+                // Opening the panel does NOT focus the filter — focus (and its
+                // caret) only happens when the user clicks the box. Switching views
+                // clears any prior filter focus.
+                self.set_ext_filter_focus(false);
                 self.redraw();
             }
             return;
@@ -1415,12 +1495,12 @@ impl App {
             let hit = self.gpu.as_ref().and_then(|g| g.ui.ext_rows.hit(region, scroll, (x, y)));
             if let Some(i) = hit {
                 if let Some(&src) = self.ext_visible.get(i) {
-                    self.open_extension = Some(if self.ext_showing_remote {
+                    let which = if self.ext_showing_remote {
                         OpenExt::Remote(src)
                     } else {
                         OpenExt::Local(src)
-                    });
-                    self.redraw();
+                    };
+                    self.open_ext_detail(which);
                 }
             }
             return;
@@ -1486,15 +1566,20 @@ impl App {
 
         // Extension details page (in the editor area): handle its Install button
         // and consume other clicks so they don't fall through to the editor.
-        if let Some(v) = open_ext_view(self.open_extension, &self.extensions, &self.ext_remote) {
-            let region = Rect {
-                x: layout.gutter.x,
-                y: layout.gutter.y,
-                w: layout.gutter.w + layout.editor_text.w,
-                h: layout.gutter.h,
-            };
+        if self.open_extension.is_some() {
+            let region = render::editor_region(&layout);
             if region.contains((x, y)) {
-                if v.supported && !v.installed && page_install_rect(region).contains((x, y)) {
+                let tab = self.gpu.as_ref().and_then(|g| g.ui.ext_detail.hit_tab(region, (x, y)));
+                if let Some(tab) = tab {
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.ui.ext_detail.set_tab(tab);
+                    }
+                    self.ext_detail_scroll = 0.0; // each tab scrolls from the top
+                    self.redraw();
+                    return;
+                }
+                let hit = self.gpu.as_ref().map(|g| g.ui.ext_detail.hit_install(region, (x, y))).unwrap_or(false);
+                if hit {
                     self.install_open();
                 }
                 return;
@@ -1645,6 +1730,23 @@ impl App {
                 self.redraw();
                 return;
             }
+        }
+        // The extension detail page (README) scrolls when it's open and the cursor
+        // is over the editor area.
+        if self.open_extension.is_some() && layout.editor_text.contains(p) {
+            let region = render::editor_region(&layout);
+            let max = self
+                .gpu
+                .as_ref()
+                .map(|g| {
+                    (g.ui.ext_detail.body_content_height()
+                        - ext_detail::ExtensionDetail::body_viewport_height(region))
+                    .max(0.0)
+                })
+                .unwrap_or(0.0);
+            self.ext_detail_scroll = (self.ext_detail_scroll - dy).clamp(0.0, max);
+            self.redraw();
+            return;
         }
         if !layout.editor_text.contains(p) {
             // Could route to sidebar tree, but flat list fits fine for now.
@@ -1978,7 +2080,7 @@ impl App {
 
 /// Geometry of the inline New File/Folder row within tree region `tr`:
 /// returns (row rect, icon rect, text-field rect) for the given insert row/depth.
-fn create_row_geometry(tr: Rect, row: usize, depth: usize) -> (Rect, Rect, Rect) {
+pub(crate) fn create_row_geometry(tr: Rect, row: usize, depth: usize) -> (Rect, Rect, Rect) {
     let row_y = tr.y + row as f32 * theme::TREE_ROW_HEIGHT;
     // Match the file tree: 12px left pad + ~8px per depth, left-aligned icon.
     let indent = 12.0 + depth as f32 * 8.0;
@@ -1995,7 +2097,7 @@ fn create_row_geometry(tr: Rect, row: usize, depth: usize) -> (Rect, Rect, Rect)
 }
 
 /// The activity-bar icon index that's currently "active" (highlighted).
-fn active_activity_idx(sidebar_visible: bool, view: SidebarView) -> Option<usize> {
+pub(crate) fn active_activity_idx(sidebar_visible: bool, view: SidebarView) -> Option<usize> {
     if !sidebar_visible {
         return None;
     }
@@ -2116,22 +2218,17 @@ fn edit_input(
 }
 
 /// The search/filter box rect at the top of the Extensions sidebar.
-fn ext_filter_rect(tree: Rect) -> Rect {
+pub(crate) fn ext_filter_rect(tree: Rect) -> Rect {
     Rect { x: tree.x + 10.0, y: tree.y + 8.0, w: tree.w - 20.0, h: 30.0 }
 }
 
 /// The scrollable extension-row list region (below the filter box).
-fn ext_list_region(tree: Rect) -> Rect {
+pub(crate) fn ext_list_region(tree: Rect) -> Rect {
     const STRIP: f32 = 46.0; // filter box + padding
     Rect { x: tree.x, y: tree.y + STRIP, w: tree.w, h: (tree.h - STRIP).max(0.0) }
 }
 
-/// The Install button rect on the extension details page (top-right of region).
-fn page_install_rect(region: Rect) -> Rect {
-    Rect { x: region.x + region.w - 180.0, y: region.y + 28.0, w: 130.0, h: 34.0 }
-}
-
-fn cursor_pos_in_buffer(buffer: &Buffer, line: usize, col_byte: usize) -> (f32, f32, f32) {
+pub(crate) fn cursor_pos_in_buffer(buffer: &Buffer, line: usize, col_byte: usize) -> (f32, f32, f32) {
     let mut x = 0.0f32;
     let mut y = line as f32 * theme::LINE_HEIGHT;
     let mut h = theme::LINE_HEIGHT;
@@ -2159,7 +2256,7 @@ fn cursor_pos_in_buffer(buffer: &Buffer, line: usize, col_byte: usize) -> (f32, 
     (x, y, h)
 }
 
-fn x_range_in_run(
+pub(crate) fn x_range_in_run(
     run: &glyphon::cosmic_text::LayoutRun,
     col_start: usize,
     col_end: usize,
@@ -2180,971 +2277,6 @@ fn x_range_in_run(
     (x_start.unwrap_or(last_end), x_end.unwrap_or(last_end))
 }
 
-fn render(app: &mut App) -> Result<()> {
-    let Some(gpu) = app.gpu.as_mut() else {
-        return Ok(());
-    };
-    let layout = Layout::compute(
-        gpu.config.width as f32,
-        gpu.config.height as f32,
-        app.sidebar_visible,
-        app.sidebar_split.size(),
-        app.find.active,
-        app.palette.active,
-    );
-
-    // ---- Update UI buffer texts (only on cache miss) ----
-    {
-        let fs = &mut gpu.font_system;
-        let cache = &mut app.ui_cache;
-
-        // Header command-center label — active file, or the project name.
-        let header_label = match app.workspace.active_doc() {
-            Some(d) => d.name.clone(),
-            None => app
-                .cwd
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Search".into()),
-        };
-        gpu.search.set(fs, &header_label);
-        // Activity-bar icons and window controls are IconButton widgets now
-        // (rendered below from layout rects) — no per-glyph buffer juggling here.
-
-        // Sidebar header — title depends on the active view.
-        let header = if app.sidebar_view == SidebarView::Extensions {
-            "EXTENSIONS"
-        } else {
-            "EXPLORER"
-        };
-        gpu.ui.sidebar_header.set(fs, header, theme::UI_FAMILY);
-
-        // Extension detail page text (works for local + marketplace extensions).
-        if let Some(v) = open_ext_view(app.open_extension, &app.extensions, &app.ext_remote) {
-            let title = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_ACTIVE());
-            let dim = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_DIM());
-            let body = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_TEXT());
-            let note_col = if v.supported { theme::SYN_COMMENT() } else { theme::FG_DIM() };
-            let note = Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(note_col);
-            let support = if v.remote {
-                "From Open VSX marketplace".to_string()
-            } else if v.supported {
-                format!("Supported in Nova — {}", v.category)
-            } else {
-                "Not supported yet — needs the extension runtime".to_string()
-            };
-            let desc = if v.description.is_empty() { "(no description)".to_string() } else { v.description.clone() };
-            let spans = vec![
-                (format!("{}\n", v.name), title),
-                (format!("{} · {}\n\n", v.publisher, v.category), dim),
-                (format!("{}\n\n", desc), body),
-                (support, note),
-            ];
-            let key = format!("{}{}{}", v.name, v.installed, v.remote);
-            gpu.ui.ext_detail.set_rich(fs, &key, &spans, body);
-            gpu.ui.ext_install.set(fs, "Install", theme::UI_FAMILY);
-            gpu.ui.ext_installed.set(fs, "Installed", theme::UI_FAMILY);
-        }
-        let ws_name = app
-            .cwd
-            .file_name()
-            .map(|n| n.to_string_lossy().to_uppercase())
-            .unwrap_or_else(|| "WORKSPACE".into());
-        let root_spans = [
-            (
-                format!("{}  ", theme::ICON_CHEVRON_DOWN),
-                Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(theme::FG_TEXT()),
-            ),
-            (
-                ws_name.clone(),
-                Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_TEXT()),
-            ),
-        ];
-        gpu.ui
-            .root_label
-            .set_rich(fs, &ws_name, &root_spans, Attrs::new().family(Family::Name(theme::UI_FAMILY)));
-
-        // Sidebar — file tree with monochrome MDL2 folder/file icons (rich text:
-        // icon glyphs in the icon font, names in the UI font).
-        let mut sidebar_key = String::new();
-        for node in app.workspace.tree.nodes.iter() {
-            sidebar_key.push_str(&node.depth.to_string());
-            sidebar_key.push(if node.is_dir {
-                if node.expanded {
-                    'v'
-                } else {
-                    '>'
-                }
-            } else {
-                '.'
-            });
-            sidebar_key.push_str(&node.name);
-            sidebar_key.push('\n');
-        }
-        {
-            let ui_attrs = Attrs::new()
-                .family(Family::Name(theme::UI_FAMILY))
-                .color(theme::FG_TEXT());
-            let folder_attrs = Attrs::new()
-                .family(Family::Name(theme::ICON_FAMILY))
-                .color(theme::ICON_FOLDER_COLOR());
-            let mut spans: Vec<(String, Attrs)> = Vec::new();
-            for node in app.workspace.tree.nodes.iter() {
-                spans.push(("  ".repeat(node.depth), ui_attrs));
-                if node.is_dir {
-                    let g = if node.expanded {
-                        theme::ICON_FOLDER_OPEN
-                    } else {
-                        theme::ICON_FOLDER_CLOSED
-                    };
-                    spans.push((format!("{}  ", g), folder_attrs));
-                } else {
-                    let fc = Attrs::new()
-                        .family(Family::Name(theme::ICON_FAMILY))
-                        .color(theme::file_icon_color(&node.name));
-                    spans.push((format!("{}  ", theme::ICON_FILE), fc));
-                }
-                spans.push((format!("{}\n", node.name), ui_attrs));
-            }
-            gpu.ui.sidebar.set_rich(
-                fs,
-                &sidebar_key,
-                &spans,
-                layout.sidebar.w,
-                layout.sidebar.h.max(800.0),
-            );
-        }
-
-        // Tab strip.
-        let mut tab_text = String::new();
-        for (i, d) in app.workspace.documents.iter().enumerate() {
-            if i > 0 {
-                tab_text.push('\n');
-            }
-            tab_text.push_str(&d.name);
-            if d.dirty {
-                tab_text.push_str(" •");
-            }
-        }
-        if cache.tabs != tab_text {
-            // Wide (no wrap) + tall so every tab's label line is shaped on its own
-            // line; per-tab bounds clip horizontally & vertically.
-            gpu.ui.tabs.set_size(fs, Some(4000.0), Some(4000.0));
-            gpu.ui.tabs.set_text(
-                fs,
-                &tab_text,
-                Attrs::new().family(Family::Name(theme::UI_FAMILY)),
-                Shaping::Advanced,
-            );
-            gpu.ui.tabs.shape_until_scroll(fs, false);
-            cache.tabs = tab_text;
-        }
-
-
-        // Status bar — left: path; right: position/indent/encoding/EOL/language.
-        let (status_text, status_right_text) = if let Some(d) = app.workspace.active_doc() {
-            let (line, col) = d.head_line_col();
-            let path = d
-                .path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "Untitled".into());
-            let dirty = if d.dirty { " ●" } else { "" };
-            let lang: String = d
-                .path
-                .as_ref()
-                .and_then(|p| p.extension())
-                .map(|e| match e.to_string_lossy().as_ref() {
-                    "rs" => "Rust".to_string(),
-                    "md" => "Markdown".to_string(),
-                    "toml" | "lock" => "TOML".to_string(),
-                    "json" => "JSON".to_string(),
-                    "wgsl" => "WGSL".to_string(),
-                    other => other.to_uppercase(),
-                })
-                .unwrap_or_else(|| "Plain Text".to_string());
-            (
-                format!(" {}{}", path, dirty),
-                format!("Ln {}, Col {}    Spaces: 4    UTF-8    LF    {}    ", line + 1, col + 1, lang),
-            )
-        } else {
-            ("Nova".to_string(), String::new())
-        };
-        gpu.ui.status.set(fs, &status_text, theme::UI_FAMILY);
-        gpu.ui.status_right.set(fs, &status_right_text, theme::UI_FAMILY);
-
-        // Line numbers.
-        let line_count = app
-            .workspace
-            .active
-            .and_then(|i| app.workspace.documents.get(i))
-            .map(|d| d.rope.len_lines().max(1))
-            .unwrap_or(0);
-        gpu.ui.line_numbers.set(fs, line_count);
-
-        // Palette list (the input owns its own text now).
-        if let Some(pal) = layout.palette.as_ref() {
-            let mut list_text = String::new();
-            for &i in app.palette.filtered.iter() {
-                let (_, label, shortcut) = COMMANDS[i];
-                if shortcut.is_empty() {
-                    list_text.push_str(&format!(" {}\n", label));
-                } else {
-                    list_text.push_str(&format!(" {}   [{}]\n", label, shortcut));
-                }
-            }
-            gpu.ui
-                .palette_list
-                .set_text(fs, &list_text, pal.list.w, pal.list.h);
-        }
-
-        // Context menu items.
-        if app.context_menu.is_some() {
-            let labels: Vec<&str> = MENU_ACTIONS.iter().map(|(_, l)| *l).collect();
-            gpu.ui.menu.set_items(fs, &labels);
-        }
-    }
-
-    // ---- Build quad lists ----
-    let mut bg_quads: Vec<Quad> = Vec::new();
-    let mut fg_quads: Vec<Quad> = Vec::new();
-
-    // Title bar bg + window-control hover (hover rect == the button rect).
-    bg_quads.push(layout.title_bar.quad(theme::TITLE_BAR_BG()));
-    // Header command-center search box.
-    gpu.search
-        .draw_bg(layout.header_search_rect(), app.hovered_search, &mut bg_quads);
-    // Menu-bar hover + layout-toggle hover.
-    gpu.menubar
-        .draw_bg(layout.menu_bar_rect(), app.hovered_menu, &mut bg_quads);
-    if let Some(i) = app.hovered_layout {
-        bg_quads.push(layout.layout_btn_rects()[i].quad(theme::TITLE_BTN_HOVER()));
-    }
-    if let Some(b) = app.hovered_titlebtn {
-        let color = if b == 2 {
-            theme::TITLE_CLOSE_HOVER()
-        } else {
-            theme::TITLE_BTN_HOVER()
-        };
-        bg_quads.push(layout.title_btn_rects()[b].quad(color));
-    }
-
-    // Activity bar bg + hover (hover rect == the button rect).
-    bg_quads.push(layout.activity_bar.quad(theme::ACTIVITY_BAR_BG()));
-    let act_rects = layout.activity_rects();
-    if let Some(idx) = app.hovered_activity {
-        bg_quads.push(act_rects[idx].quad(theme::ACTIVITY_BAR_ACTIVE()));
-    }
-    // Active-section accent stripe on the active view's icon.
-    if let Some(ai) = active_activity_idx(app.sidebar_visible, app.sidebar_view) {
-        let r = act_rects[ai];
-        bg_quads.push(Quad::new(r.x, r.y, 2.0, r.h, [1.0, 1.0, 1.0, 0.85]));
-    }
-    // Sidebar bg
-    if app.sidebar_visible {
-        bg_quads.push(layout.sidebar.quad(theme::SIDEBAR_BG()));
-        if app.sidebar_view == SidebarView::Explorer {
-            // Explorer header action hover.
-            if let Some(i) = app.hovered_explorer {
-                bg_quads.push(layout.explorer_action_rects()[i].quad(theme::MENU_HOVER()));
-            }
-            // Inline-create row highlight (at the insert position).
-            if let Some(pc) = app.creating.as_ref() {
-                let (row_rect, _, _) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
-                bg_quads.push(row_rect.quad(theme::TREE_SELECTED()));
-            }
-            // Active-file highlight: the tree row matching the open document.
-            if app.creating.is_none() {
-                if let Some(path) = app.workspace.active_doc().and_then(|d| d.path.clone()) {
-                    if let Some(idx) = app.workspace.tree.nodes.iter().position(|n| n.path == path) {
-                        bg_quads.push(
-                            gpu.ui
-                                .sidebar
-                                .row_rect(layout.tree_region(), idx)
-                                .quad(theme::TREE_ACTIVE_FILE()),
-                        );
-                    }
-                }
-            }
-            // Tree row hover (below the header) — row rect from the ListView.
-            if let Some(idx) = app.hovered_tree {
-                bg_quads.push(
-                    gpu.ui
-                        .sidebar
-                        .row_rect(layout.tree_region(), idx)
-                        .quad(theme::TREE_HOVER()),
-                );
-            }
-        } else {
-            // Extensions view: filter box chrome (fixed at top). The scrollable rows
-            // are drawn in their own clipped pass after the main pass.
-            let fr = ext_filter_rect(layout.tree_region());
-            let border = Rect { x: fr.x - 1.0, y: fr.y - 1.0, w: fr.w + 2.0, h: fr.h + 2.0 };
-            bg_quads.push(border.quad(theme::SEARCH_BORDER()));
-            bg_quads.push(fr.quad(theme::SEARCH_BG()));
-        }
-        // Subtle right border.
-        bg_quads.push(Quad::new(
-            layout.sidebar.x + layout.sidebar.w - 1.0,
-            layout.sidebar.y,
-            1.0,
-            layout.sidebar.h,
-            [0.10, 0.10, 0.10, 1.0],
-        ));
-    }
-    // Tab strip bg
-    bg_quads.push(layout.tab_strip.quad(theme::TAB_BAR_BG()));
-    // Per-tab styling — geometry from the single-source tab rects.
-    let n_tabs = app.workspace.documents.len();
-    let tab_rects = layout.tab_rects(n_tabs);
-    for (i, tab) in tab_rects.iter().enumerate() {
-        let active = app.workspace.active == Some(i);
-        let hover = app.hovered_tab == Some(i);
-        let fill = if active {
-            theme::TAB_ACTIVE()
-        } else if hover {
-            theme::TAB_HOVER()
-        } else {
-            theme::TAB_INACTIVE()
-        };
-        bg_quads.push(tab.quad(fill));
-        // Top accent stripe for active tab.
-        if active {
-            bg_quads.push(Quad::new(tab.x, tab.y, tab.w, 2.0, [0.0, 0.475, 0.78, 1.0]));
-        }
-        // Subtle vertical divider between tabs.
-        if i + 1 < n_tabs {
-            bg_quads.push(Quad::new(
-                tab.x + tab.w - 1.0,
-                tab.y + 4.0,
-                1.0,
-                tab.h - 8.0,
-                [0.30, 0.30, 0.30, 0.6],
-            ));
-        }
-        // Close button hover background — same rect the × glyph uses.
-        if app.hovered_tab_close == Some(i) {
-            bg_quads.push(Layout::tab_close_rect(*tab).quad([1.0, 1.0, 1.0, 0.10]));
-        }
-    }
-    // Bottom border of tab strip.
-    bg_quads.push(Quad::new(
-        layout.tab_strip.x,
-        layout.tab_strip.y + layout.tab_strip.h - 1.0,
-        layout.tab_strip.w,
-        1.0,
-        [0.10, 0.10, 0.10, 1.0],
-    ));
-
-    // Editor bg
-    let editor_full = Rect {
-        x: layout.gutter.x,
-        y: layout.gutter.y,
-        w: layout.gutter.w + layout.editor_text.w,
-        h: layout.gutter.h,
-    };
-    bg_quads.push(editor_full.quad([
-        theme::BG_EDITOR().r as f32,
-        theme::BG_EDITOR().g as f32,
-        theme::BG_EDITOR().b as f32,
-        theme::BG_EDITOR().a as f32,
-    ]));
-
-    // Extension detail page Install button (when the page is open).
-    if let Some(v) = open_ext_view(app.open_extension, &app.extensions, &app.ext_remote) {
-        if v.supported && !v.installed {
-            let c = if app.hovered_page_install {
-                theme::DIALOG_BTN_HOVER()
-            } else {
-                theme::DIALOG_BTN()
-            };
-            bg_quads.push(page_install_rect(editor_full).quad(c));
-        }
-    }
-
-    // Current-line highlight + selection. All editor quads must be clipped to
-    // the editor's vertical band so scrolled-off rows don't bleed into the tab
-    // strip / title bar above (text is clipped via its TextArea bounds; quads
-    // have no implicit clip, so we clamp them here). Skipped while the extension
-    // page occupies the editor area.
-    if let Some(d) = app.open_extension.is_none().then(|| app.workspace.active_doc()).flatten() {
-        let etop = layout.editor_text.y;
-        let ebot = layout.editor_text.y + layout.editor_text.h;
-        let clip_v = |y: f32, h: f32| -> Option<(f32, f32)> {
-            let top = y.max(etop);
-            let bot = (y + h).min(ebot);
-            (bot > top).then_some((top, bot - top))
-        };
-
-        let (cur_line, _) = d.head_line_col();
-        // Current line highlight across full editor width.
-        let line_y = layout.editor_text.y + theme::EDITOR_PAD
-            + cur_line as f32 * theme::LINE_HEIGHT
-            - d.scroll_y;
-        if let Some((qy, qh)) = clip_v(line_y, theme::LINE_HEIGHT) {
-            bg_quads.push(Quad::new(
-                editor_full.x,
-                qy,
-                editor_full.w,
-                qh,
-                theme::LINE_HIGHLIGHT(),
-            ));
-        }
-
-        // Selection quads.
-        if !d.sel.is_empty() {
-            let (lo, hi) = d.sel.range();
-            let lo_line = d.rope.byte_to_line(lo);
-            let hi_line = d.rope.byte_to_line(hi);
-            let lo_col = lo - d.rope.line_to_byte(lo_line);
-            let hi_col = hi - d.rope.line_to_byte(hi_line);
-            for run in d.buffer.layout_runs() {
-                let line = run.line_i;
-                if line < lo_line || line > hi_line {
-                    continue;
-                }
-                let (col_start, col_end) = if lo_line == hi_line {
-                    (lo_col, hi_col)
-                } else if line == lo_line {
-                    (lo_col, usize::MAX)
-                } else if line == hi_line {
-                    (0, hi_col)
-                } else {
-                    (0, usize::MAX)
-                };
-                let (xs, xe) = x_range_in_run(&run, col_start, col_end);
-                let w = (xe - xs).max(2.0);
-                let sel_y = layout.editor_text.y + theme::EDITOR_PAD + run.line_top - d.scroll_y;
-                if let Some((qy, qh)) = clip_v(sel_y, run.line_height) {
-                    bg_quads.push(Quad::new(
-                        layout.editor_text.x + theme::EDITOR_PAD + xs - d.scroll_x,
-                        qy,
-                        w,
-                        qh,
-                        theme::SELECTION(),
-                    ));
-                }
-            }
-        }
-
-        // Cursor (foreground so it sits over glyphs) — gated by blink.
-        if app.cursor_blink_on {
-            let (cur_line2, cur_col_byte) = d.head_line_col();
-            let (cx, cy, ch) = cursor_pos_in_buffer(&d.buffer, cur_line2, cur_col_byte);
-            let cursor_y = layout.editor_text.y + theme::EDITOR_PAD + cy - d.scroll_y;
-            if let Some((qy, qh)) = clip_v(cursor_y, ch) {
-                fg_quads.push(Quad::new(
-                    layout.editor_text.x + theme::EDITOR_PAD + cx - d.scroll_x,
-                    qy,
-                    theme::CURSOR_WIDTH,
-                    qh,
-                    theme::CURSOR(),
-                ));
-            }
-        }
-
-        // Editor scrollbar thumb (over text).
-        let view = layout.editor_text.h;
-        let content = d.rope.len_lines() as f32 * theme::LINE_HEIGHT + theme::EDITOR_PAD * 2.0;
-        let track = Rect {
-            x: layout.editor_text.x + layout.editor_text.w - theme::SCROLLBAR_WIDTH,
-            y: layout.editor_text.y,
-            w: theme::SCROLLBAR_WIDTH,
-            h: layout.editor_text.h,
-        };
-        if let Some(th) = app.editor_scroll.thumb(track, content, view, d.scroll_y) {
-            let color = if app.hovered_scrollbar || app.editor_scroll.is_dragging() {
-                theme::SCROLLBAR_THUMB_HOVER()
-            } else {
-                theme::SCROLLBAR_THUMB()
-            };
-            fg_quads.push(th.quad(color));
-        }
-
-        // Horizontal scrollbar thumb.
-        let hview = layout.editor_text.w;
-        let hcontent = d.max_line_width() + theme::EDITOR_PAD * 2.0;
-        if hcontent > hview {
-            let htrack = Rect {
-                x: layout.editor_text.x,
-                y: layout.editor_text.y + layout.editor_text.h - theme::SCROLLBAR_WIDTH,
-                w: layout.editor_text.w - theme::SCROLLBAR_WIDTH,
-                h: theme::SCROLLBAR_WIDTH,
-            };
-            if let Some(th) = app.editor_hscroll.thumb(htrack, hcontent, hview, d.scroll_x) {
-                let color = if app.editor_hscroll.is_dragging() {
-                    theme::SCROLLBAR_THUMB_HOVER()
-                } else {
-                    theme::SCROLLBAR_THUMB()
-                };
-                fg_quads.push(th.quad(color));
-            }
-        }
-    }
-
-    // Status bar
-    bg_quads.push(layout.status_bar.quad(theme::STATUS_BAR_BG()));
-
-    // Find bar
-    if let Some(fb) = layout.find_bar.as_ref() {
-        bg_quads.push(fb.quad(theme::TAB_BAR_BG()));
-        bg_quads.push(Quad::new(
-            fb.x,
-            fb.y + fb.h - 1.0,
-            fb.w,
-            1.0,
-            theme::BORDER(),
-        ));
-    }
-
-    // Palette dim overlay + box
-    if let Some(pal) = layout.palette.as_ref() {
-        bg_quads.push(Quad::new(
-            0.0,
-            0.0,
-            gpu.config.width as f32,
-            gpu.config.height as f32,
-            [0.0, 0.0, 0.0, 0.6],
-        ));
-        bg_quads.push(pal.box_.quad(theme::PALETTE_BG()));
-        bg_quads.push(Quad::new(
-            pal.box_.x - 1.0,
-            pal.box_.y - 1.0,
-            pal.box_.w + 2.0,
-            pal.box_.h + 2.0,
-            theme::PALETTE_BORDER(),
-        ));
-        bg_quads.push(pal.input.quad(theme::PALETTE_INPUT_BG()));
-        // Selected row highlight — row rect from the ListView.
-        if !app.palette.filtered.is_empty() {
-            bg_quads.push(
-                gpu.ui
-                    .palette_list
-                    .row_rect(pal.list, app.palette.selected)
-                    .quad(theme::PALETTE_SELECTED()),
-            );
-        }
-    }
-
-    // Text-input carets (blink-gated, drawn on top via fg_quads).
-    if app.cursor_blink_on {
-        if let Some(pal) = layout.palette.as_ref() {
-            fg_quads.push(gpu.ui.palette_input.caret_quad(pal.input, 6.0));
-        } else if let Some(fb) = layout.find_bar.as_ref() {
-            fg_quads.push(gpu.ui.find_input.caret_quad(*fb, 8.0));
-        }
-        if let Some(pc) = app.creating.as_ref() {
-            let (_, _, field) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
-            fg_quads.push(gpu.create_input.caret_quad(field, 0.0));
-        }
-        if app.ext_filter_active && app.sidebar_visible && app.sidebar_view == SidebarView::Extensions {
-            let fr = ext_filter_rect(layout.tree_region());
-            fg_quads.push(gpu.ui.ext_filter.caret_quad(fr, 6.0));
-        }
-    }
-
-    // Text-input selection highlights — drawn into bg_quads (under glyphs, over
-    // the input box). Not blink-gated.
-    if let Some(pal) = layout.palette.as_ref() {
-        gpu.ui.palette_input.selection_quads(pal.input, 6.0, &mut bg_quads);
-    }
-    if let Some(fb) = layout.find_bar.as_ref() {
-        gpu.ui.find_input.selection_quads(*fb, 8.0, &mut bg_quads);
-    }
-    if app.ext_filter_active && app.sidebar_visible && app.sidebar_view == SidebarView::Extensions {
-        let fr = ext_filter_rect(layout.tree_region());
-        gpu.ui.ext_filter.selection_quads(fr, 6.0, &mut bg_quads);
-    }
-
-    // ---- Build text areas ----
-    let active_idx = app.workspace.active;
-
-    let (cfg_w, cfg_h) = (gpu.config.width, gpu.config.height);
-    gpu.quad_renderer
-        .prepare(&gpu.device, &gpu.queue, &bg_quads, &fg_quads, (cfg_w, cfg_h));
-    gpu.viewport.update(
-        &gpu.queue,
-        Resolution {
-            width: cfg_w,
-            height: cfg_h,
-        },
-    );
-
-    let ui = &gpu.ui;
-    let mut areas: Vec<TextArea> = Vec::new();
-
-    // When the palette (modal) is open, suppress all underlying text so it can't
-    // bleed through — text renders in one pass after the bg quads, so the dim
-    // overlay alone can't occlude it. Only the palette text is drawn below.
-    if layout.palette.is_none() {
-    // Title bar: menu bar (left) + centered search box + layout toggles and
-    // window controls (right).
-    gpu.menubar.draw(layout.menu_bar_rect(), &mut areas);
-    gpu.search.draw(layout.header_search_rect(), &mut areas);
-    let layout_rects = layout.layout_btn_rects();
-    for (i, btn) in gpu.layout_btns.iter().enumerate() {
-        btn.draw(layout_rects[i], theme::TITLE_FG(), &mut areas);
-    }
-    // Window controls — IconButton widgets at their layout rects (the same
-    // rects the hover bg used above; glyph is centered in each).
-    let tb_rects = layout.title_btn_rects();
-    for (b, btn) in gpu.titlebar_btns.iter().enumerate() {
-        let color = if app.hovered_titlebtn == Some(b) {
-            theme::FG_ACTIVE()
-        } else {
-            theme::TITLE_FG()
-        };
-        btn.draw(tb_rects[b], color, &mut areas);
-    }
-
-    // Activity-bar icons — IconButton widgets at their cell rects.
-    let act_rects = layout.activity_rects();
-    let active_act = active_activity_idx(app.sidebar_visible, app.sidebar_view);
-    for (i, btn) in gpu.activity_btns.iter().enumerate() {
-        let color = if Some(i) == active_act {
-            theme::ACTIVITY_ICON_ACTIVE()
-        } else {
-            theme::ACTIVITY_ICON_FG()
-        };
-        btn.draw(act_rects[i], color, &mut areas);
-    }
-
-    // Sidebar header + (Explorer tree | Extensions list)
-    if app.sidebar_visible {
-        ui.sidebar_header
-            .push(layout.sidebar.x + 12.0, layout.sidebar_header_rect(), theme::FG_DIM(), &mut areas);
-        let tr = layout.tree_region();
-        if app.sidebar_view == SidebarView::Explorer {
-            let er = layout.explorer_action_rects();
-            for (i, btn) in gpu.explorer_btns.iter().enumerate() {
-                btn.draw(er[i], theme::TITLE_FG(), &mut areas);
-            }
-            // Root folder row (chevron + workspace name).
-            ui.root_label
-                .draw_left(layout.root_row_rect(), 10.0, theme::FG_TEXT(), &mut areas);
-            if let Some(pc) = app.creating.as_ref() {
-                let rowh = theme::TREE_ROW_HEIGHT;
-                let (_, icon_rect, field) = create_row_geometry(tr, pc.row, pc.depth);
-                if pc.row > 0 {
-                    let clip_a = Rect { x: tr.x, y: tr.y, w: tr.w, h: pc.row as f32 * rowh };
-                    ui.sidebar.draw_at(clip_a, tr.y, theme::FG_TEXT(), &mut areas);
-                }
-                gpu.create_icons[pc.is_dir as usize].draw(icon_rect, theme::ICON_FILE_COLOR(), &mut areas);
-                gpu.create_input.draw(field, 0.0, theme::FG_TEXT(), &mut areas);
-                let below_y = tr.y + (pc.row as f32 + 1.0) * rowh;
-                let clip_b = Rect {
-                    x: tr.x,
-                    y: below_y,
-                    w: tr.w,
-                    h: (tr.y + tr.h - below_y).max(0.0),
-                };
-                ui.sidebar.draw_at(clip_b, tr.y + rowh, theme::FG_TEXT(), &mut areas);
-            } else {
-                ui.sidebar.draw(tr, theme::FG_TEXT(), &mut areas);
-            }
-        } else {
-            // Extensions filter box text (fixed). The scrollable row text is drawn
-            // in the dedicated clipped pass after the main pass.
-            let fr = ext_filter_rect(tr);
-            let fc = if ui.ext_filter.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
-            ui.ext_filter.draw(fr, 6.0, fc, &mut areas);
-        }
-    }
-
-    // Tab labels — the shared `tabs` buffer holds one label per line; we render
-    // it once per tab, shifted up by one line and clipped to that tab's column,
-    // so each tab shows only its own label. Geometry comes from `tab_rects`.
-    let tab_rects = layout.tab_rects(n_tabs);
-    for (i, tab) in tab_rects.iter().enumerate() {
-        let active = app.workspace.active == Some(i);
-        let line_top = i as f32 * theme::UI_LINE_HEIGHT;
-        let color = if active {
-            theme::TAB_FG_ACTIVE()
-        } else {
-            theme::TAB_FG_INACTIVE()
-        };
-        let label_top = tab.text_top(theme::UI_LINE_HEIGHT, VAlign::Center);
-        areas.push(TextArea {
-            buffer: &ui.tabs,
-            left: tab.x + 12.0,
-            top: label_top - line_top,
-            scale: 1.0,
-            // Clip to just this label's line band (the buffer holds every tab's
-            // label, one per line) so neighbours don't bleed in.
-            bounds: TextBounds {
-                left: tab.x as i32 + 6,
-                top: (label_top - 2.0) as i32,
-                right: (tab.x + tab.w - 26.0) as i32,
-                bottom: (label_top + theme::UI_LINE_HEIGHT) as i32,
-            },
-            default_color: color,
-            custom_glyphs: &[],
-        });
-
-        // Close × — reusable IconButton at the close-button rect (same rect as
-        // its hover bg + hit region). Hidden unless the tab is active/hovered.
-        let close_color = if app.hovered_tab_close == Some(i) {
-            theme::CLOSE_FG_HOVER()
-        } else if active || app.hovered_tab == Some(i) {
-            theme::CLOSE_FG()
-        } else {
-            glyphon::Color::rgba(0xD4, 0xD4, 0xD4, 0)
-        };
-        gpu.tab_close_btn
-            .draw(Layout::tab_close_rect(*tab), close_color, &mut areas);
-    }
-
-    // Editor area: either the extension detail page or the document.
-    if let Some(v) = open_ext_view(app.open_extension, &app.extensions, &app.ext_remote) {
-        let region = Rect {
-            x: layout.gutter.x,
-            y: layout.gutter.y,
-            w: layout.gutter.w + layout.editor_text.w,
-            h: layout.gutter.h,
-        };
-        let text_rect = Rect { x: region.x + 30.0, y: region.y + 24.0, w: region.w - 60.0, h: region.h - 48.0 };
-        ui.ext_detail.push(text_rect.x, text_rect, theme::FG_TEXT(), &mut areas);
-        // Install / Installed button label.
-        if v.supported {
-            let pill = page_install_rect(region);
-            if v.installed {
-                ui.ext_installed.draw_center(pill, theme::FG_DIM(), &mut areas);
-            } else {
-                ui.ext_install.draw_center(pill, theme::FG_ACTIVE(), &mut areas);
-            }
-        }
-    } else if let Some(i) = active_idx {
-        let d = &app.workspace.documents[i];
-
-        // Line numbers — clipped to the gutter region so they never bleed over
-        // the tab strip when scrolled.
-        ui.line_numbers
-            .draw(layout.gutter, d.scroll_y, theme::FG_GUTTER(), &mut areas);
-
-        // Document text
-        areas.push(TextArea {
-            buffer: &d.buffer,
-            left: layout.editor_text.x + theme::EDITOR_PAD - d.scroll_x,
-            top: layout.editor_text.y + theme::EDITOR_PAD - d.scroll_y,
-            scale: 1.0,
-            bounds: TextBounds {
-                left: layout.editor_text.x as i32,
-                top: layout.editor_text.y as i32,
-                right: (layout.editor_text.x + layout.editor_text.w) as i32,
-                bottom: (layout.editor_text.y + layout.editor_text.h) as i32,
-            },
-            default_color: theme::FG_TEXT(),
-            custom_glyphs: &[],
-        });
-    }
-
-    // Status bar — left: path; right: position/encoding/etc. Both via the
-    // reusable TextLabel (left-padded and right-padded alignment helpers).
-    ui.status
-        .draw_left(layout.status_bar, 12.0, theme::STATUS_BAR_FG(), &mut areas);
-    ui.status_right
-        .draw_right(layout.status_bar, 8.0, theme::STATUS_BAR_FG(), &mut areas);
-
-    // Find bar
-    if let Some(fb) = layout.find_bar.as_ref() {
-        ui.find_input.draw(*fb, 8.0, theme::FG_TEXT(), &mut areas);
-    }
-    } // end: palette closed
-
-    // Palette text
-    if let Some(pal) = layout.palette.as_ref() {
-        ui.palette_input
-            .draw(pal.input, 6.0, theme::FG_TEXT(), &mut areas);
-        ui.palette_list
-            .draw(pal.list, theme::FG_TEXT(), &mut areas);
-    }
-
-    gpu.text_renderer.prepare(
-        &gpu.device,
-        &gpu.queue,
-        &mut gpu.font_system,
-        &mut gpu.atlas,
-        &gpu.viewport,
-        areas,
-        &mut gpu.swash_cache,
-    )?;
-
-    // ---- Submit ----
-    let frame = gpu.surface.get_current_texture()?;
-    let view = frame.texture.create_view(&TextureViewDescriptor::default());
-    let mut encoder = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-        label: Some("nova-encoder"),
-    });
-    {
-        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-            label: Some("nova-pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: Operations {
-                    load: LoadOp::Clear(theme::BG_EDITOR()),
-                    store: StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        gpu.quad_renderer.render_bg(&mut pass);
-        gpu.text_renderer
-            .render(&gpu.atlas, &gpu.viewport, &mut pass)?;
-        gpu.quad_renderer.render_fg(&mut pass);
-    }
-    gpu.queue.submit(Some(encoder.finish()));
-
-    // ---- Extensions list: clipped, scrollable pass over the sidebar ----
-    if app.sidebar_visible
-        && layout.palette.is_none()
-        && app.sidebar_view == SidebarView::Extensions
-    {
-        let region = ext_list_region(layout.tree_region());
-        let scroll = app.ext_scroll;
-        let mut eq: Vec<Quad> = Vec::new();
-        gpu.ui.ext_rows.draw_quads(region, scroll, app.hovered_ext, &mut eq);
-        let mut einst: Vec<icon::IconInstance> = Vec::new();
-        gpu.ui.ext_rows.icon_instances(region, scroll, &mut einst);
-        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &eq, &[], (cfg_w, cfg_h));
-        gpu.icon_atlas.prepare(&gpu.device, &gpu.queue, &einst, (cfg_w, cfg_h));
-        let mut eareas: Vec<TextArea> = Vec::new();
-        gpu.ui.ext_rows.draw_text(region, scroll, &mut eareas);
-        gpu.text_renderer.prepare(
-            &gpu.device,
-            &gpu.queue,
-            &mut gpu.font_system,
-            &mut gpu.atlas,
-            &gpu.viewport,
-            eareas,
-            &mut gpu.swash_cache,
-        )?;
-        let mut enc = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("nova-ext-pass"),
-        });
-        {
-            let mut pass = enc.begin_render_pass(&RenderPassDescriptor {
-                label: Some("nova-ext"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            // Clip to the list region so scrolled rows can't bleed over the filter
-            // box above or the status bar below.
-            let sx = region.x.max(0.0) as u32;
-            let sy = region.y.max(0.0) as u32;
-            let sw = (region.w.min(cfg_w as f32 - region.x)).max(0.0) as u32;
-            let sh = (region.h.min(cfg_h as f32 - region.y)).max(0.0) as u32;
-            if sw > 0 && sh > 0 {
-                pass.set_scissor_rect(sx, sy, sw, sh);
-                gpu.quad_renderer.render_bg(&mut pass);
-                gpu.icon_atlas.render(&mut pass);
-                gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
-            }
-        }
-        gpu.queue.submit(Some(enc.finish()));
-    }
-
-    // ---- Context menu overlay (second pass, drawn over everything) ----
-    if let Some(cm) = app.context_menu.as_ref() {
-        let menu = gpu.ui.menu.rect(cm.anchor, (cfg_w as f32, cfg_h as f32));
-        let mut mq: Vec<Quad> = Vec::new();
-        gpu.ui.menu.draw_bg(menu, app.hovered_menu_item, &mut mq);
-        gpu.quad_renderer
-            .prepare(&gpu.device, &gpu.queue, &mq, &[], (cfg_w, cfg_h));
-        let mut mareas: Vec<TextArea> = Vec::new();
-        gpu.ui.menu.draw(menu, &mut mareas);
-        gpu.text_renderer.prepare(
-            &gpu.device,
-            &gpu.queue,
-            &mut gpu.font_system,
-            &mut gpu.atlas,
-            &gpu.viewport,
-            mareas,
-            &mut gpu.swash_cache,
-        )?;
-        let mut enc2 = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("nova-menu-pass"),
-        });
-        {
-            let mut pass = enc2.begin_render_pass(&RenderPassDescriptor {
-                label: Some("nova-menu"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            gpu.quad_renderer.render_bg(&mut pass);
-            gpu.text_renderer
-                .render(&gpu.atlas, &gpu.viewport, &mut pass)?;
-        }
-        gpu.queue.submit(Some(enc2.finish()));
-    }
-
-    // ---- Modal dialog overlay (third pass) ----
-    if let Some(ds) = app.dialog.as_ref() {
-        let win = (cfg_w as f32, cfg_h as f32);
-        let box_ = gpu.ui.dialog.box_rect(win, ds.has_check);
-        let mut dq: Vec<Quad> = Vec::new();
-        gpu.ui
-            .dialog
-            .draw_bg(box_, win, ds.hovered, ds.checked, ds.has_check, &mut dq);
-        gpu.quad_renderer
-            .prepare(&gpu.device, &gpu.queue, &dq, &[], (cfg_w, cfg_h));
-        let mut dareas: Vec<TextArea> = Vec::new();
-        gpu.ui.dialog.draw(box_, ds.has_check, &mut dareas);
-        gpu.text_renderer.prepare(
-            &gpu.device,
-            &gpu.queue,
-            &mut gpu.font_system,
-            &mut gpu.atlas,
-            &gpu.viewport,
-            dareas,
-            &mut gpu.swash_cache,
-        )?;
-        let mut enc3 = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("nova-dialog-pass"),
-        });
-        {
-            let mut pass = enc3.begin_render_pass(&RenderPassDescriptor {
-                label: Some("nova-dialog"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            gpu.quad_renderer.render_bg(&mut pass);
-            gpu.text_renderer
-                .render(&gpu.atlas, &gpu.viewport, &mut pass)?;
-        }
-        gpu.queue.submit(Some(enc3.finish()));
-    }
-
-    frame.present();
-    gpu.atlas.trim();
-    Ok(())
-}
 
 // ---------- winit glue ----------
 
@@ -3166,6 +2298,18 @@ impl ApplicationHandler for App {
                     }
                     self.rebuild_ext_rows();
                     self.redraw();
+                }
+                WorkerMsg::Readme { gen, text } => {
+                    if gen == self.ext_doc_gen {
+                        self.ext_readme = text;
+                        self.redraw();
+                    }
+                }
+                WorkerMsg::Changelog { gen, text } => {
+                    if gen == self.ext_doc_gen {
+                        self.ext_changelog = text;
+                        self.redraw();
+                    }
                 }
             }
         }
@@ -3270,7 +2414,7 @@ impl ApplicationHandler for App {
                 self.on_key(event);
             }
             WindowEvent::RedrawRequested => {
-                if let Err(e) = render(self) {
+                if let Err(e) = render::render(self) {
                     eprintln!("render: {e}");
                 }
             }

@@ -23,9 +23,13 @@ pub struct OpenExtView {
     pub publisher: String,
     pub description: String,
     pub category: String,
+    pub version: String,
+    pub downloads: u64,
+    pub rating: f32,
     pub supported: bool,
     pub installed: bool,
     pub remote: bool,
+    pub key: String, // icon-atlas key (name for local, "publisher.name" for remote)
 }
 
 /// Build unified detail-page data for whatever extension is open. A free function
@@ -44,9 +48,13 @@ pub fn open_ext_view(
                 publisher: e.publisher.clone(),
                 description: e.description.clone(),
                 category: e.category().to_string(),
+                version: e.version.clone(),
+                downloads: 0,
+                rating: 0.0,
                 supported: e.supported(),
                 installed: e.installed,
                 remote: false,
+                key: e.name.clone(),
             })
         }
         OpenExt::Remote(i) => {
@@ -57,9 +65,13 @@ pub fn open_ext_view(
                 publisher: e.namespace.clone(),
                 description: e.description.clone(),
                 category: "Marketplace".to_string(),
+                version: e.version.clone(),
+                downloads: e.downloads,
+                rating: e.rating,
                 supported: true,
                 installed: false,
                 remote: true,
+                key: e.id(),
             })
         }
     }
@@ -77,10 +89,13 @@ pub struct Extension {
     pub name: String,
     pub publisher: String,
     pub description: String,
+    pub version: String,
     pub kind: ExtKind,
     pub theme_path: Option<PathBuf>,
     pub grammar_paths: Vec<PathBuf>,
     pub icon_path: Option<PathBuf>, // raster icon shipped by the extension, if any
+    pub readme_path: Option<PathBuf>, // README.md shipped by the extension, if any
+    pub changelog_path: Option<PathBuf>, // CHANGELOG.md shipped by the extension, if any
     pub installed: bool, // user clicked Install in Nova this session
 }
 
@@ -165,6 +180,16 @@ fn parse(v: &Value, ext_dir: &std::path::Path) -> Option<Extension> {
         let d = v["description"].as_str().unwrap_or("");
         if d.starts_with('%') { String::new() } else { d.to_string() }
     };
+    let version = v["version"].as_str().unwrap_or("").to_string();
+    // README shipped alongside package.json (case-insensitive common names).
+    let readme_path = ["README.md", "readme.md", "README.MD", "Readme.md"]
+        .iter()
+        .map(|n| ext_dir.join(n))
+        .find(|p| p.is_file());
+    let changelog_path = ["CHANGELOG.md", "changelog.md", "CHANGELOG.MD", "Changelog.md"]
+        .iter()
+        .map(|n| ext_dir.join(n))
+        .find(|p| p.is_file());
 
     let contributes = &v["contributes"];
     let themes = contributes.get("themes").and_then(|t| t.as_array());
@@ -206,10 +231,13 @@ fn parse(v: &Value, ext_dir: &std::path::Path) -> Option<Extension> {
         name,
         publisher,
         description,
+        version,
         kind,
         theme_path,
         grammar_paths,
         icon_path,
+        readme_path,
+        changelog_path,
         installed: false,
     })
 }
