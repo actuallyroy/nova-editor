@@ -628,8 +628,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 }
             }
             // Our own block cursor only when the shell shows the hardware cursor
-            // (DECTCEM). TUIs hide it and draw their own via reverse video above.
-            if app.terminal_focused && t.cursor_visible() {
+            // (DECTCEM), and not while scrolled up into history. TUIs hide it and
+            // draw their own via reverse video above.
+            if app.terminal_focused && t.cursor_visible() && !t.scrolled() {
                 let (cc, cr) = t.cursor();
                 let cx = panel.x + 8.0 + cc as f32 * char_w;
                 let cy = panel.y + 4.0 + cr as f32 * line_h;

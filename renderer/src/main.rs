@@ -1940,6 +1940,24 @@ impl App {
     fn on_scroll(&mut self, dy: f32) {
         let layout = self.layout();
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+        // Terminal scrollback: wheel up goes back in history. dy is in pixels;
+        // convert to whole lines. Consumes the event so the editor doesn't scroll.
+        if self.terminal_visible {
+            if let Some(panel) = layout.terminal_panel {
+                if panel.contains(p) {
+                    let lines = (dy / theme::LINE_HEIGHT()).round() as i64;
+                    if lines != 0 {
+                        if let Some(t) = self.terminal.as_mut() {
+                            if t.scroll_by_lines(lines) {
+                                self.terminal_dirty = true;
+                                self.redraw();
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
         // Extensions list scrolls when the cursor is over its region.
         if self.sidebar_visible && self.sidebar_view == SidebarView::Extensions {
             let region = ext_list_region(layout.tree_region());
