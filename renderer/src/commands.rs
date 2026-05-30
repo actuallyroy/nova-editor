@@ -13,11 +13,13 @@ pub enum Command {
     OpenSettings,
     OpenDefaultSettings,
     ToggleTerminal,
+    OpenFolder,
 }
 
 pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Save, "File: Save", "Ctrl+S"),
     (Command::NewFile, "File: New Untitled", ""),
+    (Command::OpenFolder, "File: Open Folder", "Ctrl+O"),
     (Command::Close, "File: Close Tab", "Ctrl+W"),
     (Command::Find, "Edit: Find", "Ctrl+F"),
     (Command::Undo, "Edit: Undo", "Ctrl+Z"),

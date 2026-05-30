@@ -565,10 +565,20 @@ impl App {
             && layout
                 .terminal_panel
                 .map_or(false, |panel| self.terminal_split.handle_rect(panel).contains(p));
+        // Terminal panel header buttons + tab-list rows are clickable IconButtons/rows.
+        let over_term_btn = self.terminal_visible
+            && layout.palette.is_none()
+            && layout.terminal_panel.map_or(false, |panel| {
+                terminal_header_button_rects(panel).iter().any(|r| r.contains(p))
+                    || terminal_tablist_rect(terminal_content(panel), self.term_groups.len())
+                        .map_or(false, |tl| tl.contains(p))
+            });
         let new_cursor = if self.sidebar_split.is_dragging() || over_handle {
             self.sidebar_split.cursor()
         } else if self.terminal_split.is_dragging() || over_term_handle {
             self.terminal_split.cursor()
+        } else if over_term_btn {
+            CursorIcon::Pointer
         } else if new_search {
             self.gpu
                 .as_ref()
@@ -1470,7 +1480,27 @@ impl App {
             Command::OpenSettings => self.open_settings_file(settings::user_settings_path()),
             Command::OpenDefaultSettings => self.open_settings_file(settings::default_settings_path()),
             Command::ToggleTerminal => self.toggle_terminal(),
+            Command::OpenFolder => {
+                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                    self.open_folder(folder);
+                }
+            }
         }
+        self.redraw();
+    }
+
+    /// Switch the workspace to `folder`: re-root the file tree (and the find-in-files
+    /// root), update the explorer header, and clear stale search state. Open editors
+    /// are kept, like VSCode.
+    fn open_folder(&mut self, folder: PathBuf) {
+        self.cwd = folder.clone();
+        self.workspace.tree = crate::workspace::FileTree::new(folder);
+        self.sidebar_view = SidebarView::Explorer;
+        self.sidebar_visible = true;
+        self.search_results.clear();
+        self.search_collapsed.clear();
+        self.find_gen += 1;
+        self.find_pending = false;
         self.redraw();
     }
 
@@ -2715,6 +2745,10 @@ impl App {
                     }
                     KeyCode::KeyW => {
                         self.exec_command(Command::Close);
+                        return;
+                    }
+                    KeyCode::KeyO => {
+                        self.exec_command(Command::OpenFolder);
                         return;
                     }
                     KeyCode::KeyZ => {
