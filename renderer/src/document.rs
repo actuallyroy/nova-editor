@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap};
 use ropey::Rope;
 
 use crate::syntax::{self, Lang};
@@ -63,12 +63,18 @@ pub struct Document {
     pub buffer: Buffer,
     lang: Lang,
     ext: String,
+    wrap_width: Option<f32>, // Some(w) when word-wrap is on (wraps at w px)
+    eol: String,             // this file's actual line ending ("\n" or "\r\n")
 }
 
-fn apply_buffer_text(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, lines: usize, lang: Lang, ext: &str) {
-    let h = (lines as f32 + 2.0) * theme::LINE_HEIGHT + 200.0;
-    buffer.set_size(fs, None, Some(h));
-    let mono = Attrs::new().family(Family::Name(theme::MONO_FAMILY));
+fn apply_buffer_text(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, lines: usize, lang: Lang, ext: &str, wrap_width: Option<f32>) {
+    // Pick up the current editor font size / line height (driven by settings).
+    buffer.set_metrics(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+    // editor.wordWrap: Some(width) wraps at that width; None = unbounded (no wrap).
+    buffer.set_wrap(fs, if wrap_width.is_some() { Wrap::WordOrGlyph } else { Wrap::None });
+    let h = (lines as f32 + 2.0) * theme::LINE_HEIGHT() + 200.0;
+    buffer.set_size(fs, wrap_width, Some(h));
+    let mono = Attrs::new().family(Family::Name(theme::MONO_FAMILY()));
     // An installed extension grammar (parsed natively) takes priority for its
     // file types; then markdown; then tree-sitter; else plain.
     let spans = crate::textmate::spans_for(ext, text)
@@ -90,7 +96,7 @@ fn apply_buffer_text(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, lines
 /// Line-level markdown highlighting (headings, quotes, rules, list markers,
 /// fenced code). Returns (text, attrs) spans for set_rich_text.
 fn md_spans(text: &str) -> Vec<(String, Attrs<'static>)> {
-    let mono = |c| Attrs::new().family(Family::Name(theme::MONO_FAMILY)).color(c);
+    let mono = |c| Attrs::new().family(Family::Name(theme::MONO_FAMILY())).color(c);
     let mut out: Vec<(String, Attrs)> = Vec::new();
     let mut in_fence = false;
     for line in text.split_inclusive('\n') {
@@ -131,12 +137,23 @@ impl Document {
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         let lang = Lang::from_ext(&ext);
-        let mut buffer = Buffer::new(fs, Metrics::new(theme::FONT_SIZE, theme::LINE_HEIGHT));
+        let mut buffer = Buffer::new(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
         // Strip CR for display: cosmic-text renders a stray \r (from CRLF files)
         // as an extra line break, double-spacing the whole document. The rope
         // keeps the original \r\n so saving preserves line endings.
         let display = contents.replace('\r', "");
-        apply_buffer_text(&mut buffer, fs, &display, display.matches('\n').count(), lang, &ext);
+        let wrap_width = None;
+        // Detect the file's actual EOL from its content; new/empty files fall back
+        // to the files.eol default. The status bar shows this (truthful), and save
+        // preserves it — changing files.eol only affects new files.
+        let eol = if contents.contains("\r\n") {
+            "\r\n".to_string()
+        } else if contents.contains('\n') {
+            "\n".to_string()
+        } else {
+            crate::settings::eol()
+        };
+        apply_buffer_text(&mut buffer, fs, &display, display.matches('\n').count(), lang, &ext, wrap_width);
         let name = match &path {
             Some(p) => p
                 .file_name()
@@ -157,6 +174,27 @@ impl Document {
             buffer,
             lang,
             ext,
+            wrap_width,
+            eol,
+        }
+    }
+
+    /// This file's line ending: "\n" or "\r\n".
+    pub fn eol(&self) -> &str {
+        &self.eol
+    }
+
+    /// Toggle word-wrap: `Some(width)` wraps the buffer at that pixel width, `None`
+    /// disables wrapping. Reshapes only when the value changes.
+    pub fn set_wrap(&mut self, fs: &mut FontSystem, width: Option<f32>) {
+        let changed = match (self.wrap_width, width) {
+            (Some(a), Some(b)) => (a - b).abs() > 0.5,
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            self.wrap_width = width;
+            self.reshape(fs);
         }
     }
 
@@ -168,10 +206,59 @@ impl Document {
             .fold(0.0_f32, f32::max)
     }
 
+    // ---- Visual geometry (single source of truth for wrap-aware positions). ----
+    // A logical line can span several visual rows when word-wrap is on; these
+    // resolve buffer-local positions from the shaped layout so the caret, the
+    // current-line highlight, and anything else stay consistent.
+
+    /// Buffer-local (x, y, height) of the caret. y is the top of the visual row the
+    /// caret is on; x is the offset within that row.
+    pub fn caret_visual(&self) -> (f32, f32, f32) {
+        let (line, col_byte) = self.head_line_col();
+        let mut last_top = line as f32 * theme::LINE_HEIGHT();
+        let mut last_h = theme::LINE_HEIGHT();
+        let mut last_end_x = 0.0f32;
+        for run in self.buffer.layout_runs() {
+            if run.line_i != line {
+                continue;
+            }
+            last_top = run.line_top;
+            last_h = run.line_height;
+            let mut run_end = 0.0f32;
+            for g in run.glyphs.iter() {
+                if (g.start as usize) >= col_byte {
+                    return (g.x, run.line_top, run.line_height);
+                }
+                run_end = g.x + g.w;
+            }
+            last_end_x = run_end;
+        }
+        (last_end_x, last_top, last_h)
+    }
+
+    /// Buffer-local (top, height) covering all visual rows of a logical line — used
+    /// to highlight the current line even when it wraps across several rows.
+    pub fn line_visual_bounds(&self, line: usize) -> (f32, f32) {
+        let mut top: Option<f32> = None;
+        let mut bottom = 0.0f32;
+        for run in self.buffer.layout_runs() {
+            if run.line_i == line {
+                if top.is_none() {
+                    top = Some(run.line_top);
+                }
+                bottom = run.line_top + run.line_height;
+            }
+        }
+        match top {
+            Some(t) => (t, (bottom - t).max(theme::LINE_HEIGHT())),
+            None => (line as f32 * theme::LINE_HEIGHT(), theme::LINE_HEIGHT()),
+        }
+    }
+
     pub fn reshape(&mut self, fs: &mut FontSystem) {
         let text = self.rope.to_string().replace('\r', "");
         let lines = self.rope.len_lines();
-        apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, &self.ext);
+        apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, &self.ext, self.wrap_width);
     }
 
     fn apply_op(&mut self, op: &EditOp, at_byte: usize) {
@@ -306,7 +393,17 @@ impl Document {
         let Some(path) = self.path.clone() else {
             return Ok(false);
         };
-        std::fs::write(&path, self.rope.to_string())?;
+        let mut text = self.rope.to_string();
+        // files.trimTrailingWhitespace — strip trailing spaces/tabs per line.
+        if crate::settings::trim_trailing() {
+            let trimmed: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches([' ', '\t'])).collect();
+            text = trimmed.join("\n");
+        }
+        // Preserve THIS file's line ending (detected on open / set for new files).
+        if self.eol == "\r\n" {
+            text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+        }
+        std::fs::write(&path, text)?;
         self.dirty = false;
         Ok(true)
     }

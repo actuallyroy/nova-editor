@@ -35,7 +35,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use arboard::Clipboard;
-use glyphon::Buffer;
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition},
@@ -186,6 +185,7 @@ pub(crate) struct App {
     pub(crate) pending_close: bool,
     pub(crate) cursor_blink_on: bool,
     pub(crate) last_blink: Instant,
+    pub(crate) last_edit: Instant,  // for files.autoSave (afterDelay)
     pub(crate) anim_start: Instant, // monotonic clock for GIF playback
     pub(crate) cursor_icon: CursorIcon,
 }
@@ -259,6 +259,7 @@ impl App {
             pending_close: false,
             cursor_blink_on: true,
             last_blink: Instant::now(),
+            last_edit: Instant::now(),
             anim_start: Instant::now(),
             cursor_icon: CursorIcon::Default,
         }
@@ -547,6 +548,11 @@ impl App {
     }
 
     fn open_initial(&mut self) {
+        // Load user settings and apply the startup-time ones.
+        let s = settings::reload();
+        self.sidebar_visible = s.workbench_sidebar_visible;
+        self.apply_theme_by_name(&s.workbench_color_theme);
+
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
@@ -591,7 +597,7 @@ impl App {
     fn editor_scroll_metrics(&self, layout: &Layout) -> Option<(Rect, f32, f32, f32)> {
         let d = self.workspace.active_doc()?;
         let view = layout.editor_text.h;
-        let content = d.rope.len_lines() as f32 * theme::LINE_HEIGHT + theme::EDITOR_PAD * 2.0;
+        let content = d.rope.len_lines() as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD * 2.0;
         if content <= view {
             return None;
         }
@@ -632,8 +638,8 @@ impl App {
             return;
         };
         let (line, _) = doc.head_line_col();
-        let cursor_top = line as f32 * theme::LINE_HEIGHT;
-        let cursor_bottom = cursor_top + theme::LINE_HEIGHT;
+        let cursor_top = line as f32 * theme::LINE_HEIGHT();
+        let cursor_bottom = cursor_top + theme::LINE_HEIGHT();
         if cursor_top < doc.scroll_y {
             doc.scroll_y = cursor_top.max(0.0);
         } else if cursor_bottom > doc.scroll_y + editor_inner_h {
@@ -1213,8 +1219,15 @@ impl App {
     fn exec_command(&mut self, cmd: Command) {
         match cmd {
             Command::Save => {
+                let saved_path = self.workspace.active_doc().and_then(|d| d.path.clone());
                 if let Some(d) = self.workspace.active_doc_mut() {
                     let _ = d.save();
+                }
+                // Saving settings.json applies the new values immediately.
+                if let Some(p) = saved_path {
+                    if settings::is_user_settings(&p) {
+                        self.apply_settings();
+                    }
                 }
             }
             Command::Close => {
@@ -1263,6 +1276,42 @@ impl App {
             Command::OpenDefaultSettings => self.open_settings_file(settings::default_settings_path()),
         }
         self.redraw();
+    }
+
+    /// Re-read settings.json and apply everything: sidebar visibility, color theme,
+    /// and editor font (size/family/line-height) by reshaping open documents and the
+    /// gutter. tabSize/insertSpaces/cursorBlinking are read on demand elsewhere.
+    fn apply_settings(&mut self) {
+        let s = settings::reload();
+        self.sidebar_visible = s.workbench_sidebar_visible;
+        self.apply_theme_by_name(&s.workbench_color_theme);
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.ui.line_numbers.invalidate();
+            for d in self.workspace.documents.iter_mut() {
+                d.reshape(&mut gpu.font_system);
+            }
+        }
+        self.redraw();
+    }
+
+    /// Apply a color theme by its `workbench.colorTheme` name. "Nova Dark" is the
+    /// built-in default; other names match against installed theme extensions.
+    fn apply_theme_by_name(&self, name: &str) {
+        if name.eq_ignore_ascii_case("Nova Dark") || name.is_empty() {
+            theme::set(theme::Theme::dark());
+            return;
+        }
+        for e in &self.extensions {
+            if e.kind == ExtKind::Theme && e.name.eq_ignore_ascii_case(name) {
+                if let Some(p) = &e.theme_path {
+                    if let Some(t) = theme::load_vscode(p) {
+                        theme::set(t);
+                        return;
+                    }
+                }
+            }
+        }
+        // Unknown theme name — keep the current theme.
     }
 
     /// Open a settings file (user or default) as a document tab, dismissing any
@@ -1813,7 +1862,7 @@ impl App {
             return;
         };
         let total_lines = d.rope.len_lines() as f32;
-        let max = (total_lines * theme::LINE_HEIGHT - (layout.editor_text.h - theme::EDITOR_PAD * 2.0)).max(0.0);
+        let max = (total_lines * theme::LINE_HEIGHT() - (layout.editor_text.h - theme::EDITOR_PAD * 2.0)).max(0.0);
         d.scroll_y = (d.scroll_y - dy).clamp(0.0, max);
         self.redraw();
     }
@@ -1993,60 +2042,60 @@ impl App {
             Focus::Editor => {}
         }
 
-        // Ctrl+Shift+P opens palette.
-        if ctrl && self.mods.shift_key() {
-            if let Key::Character(c) = event.logical_key.as_ref() {
-                if c == "p" || c == "P" {
-                    self.open_palette();
-                    return;
-                }
-            }
-        }
-
+        // Ctrl shortcuts — matched on the PHYSICAL key, not the logical character.
+        // With Ctrl held, winit's logical_key can arrive as a control character
+        // (e.g. U+0003 for Ctrl+C), so `== "c"` would silently miss; the physical
+        // KeyCode is reliable.
         if ctrl {
-            if let Key::Character(c) = event.logical_key.as_ref() {
-                match c {
-                    "a" | "A" => {
+            use winit::keyboard::{KeyCode, PhysicalKey};
+            if let PhysicalKey::Code(code) = event.physical_key {
+                let shift = self.mods.shift_key();
+                match code {
+                    KeyCode::KeyP if shift => {
+                        self.open_palette();
+                        return;
+                    }
+                    KeyCode::KeyA => {
                         self.exec_command(Command::SelectAll);
                         return;
                     }
-                    "c" | "C" => {
+                    KeyCode::KeyC => {
                         self.copy();
                         return;
                     }
-                    "x" | "X" => {
+                    KeyCode::KeyX => {
                         self.cut();
                         return;
                     }
-                    "v" | "V" => {
+                    KeyCode::KeyV => {
                         self.paste();
                         return;
                     }
-                    "s" | "S" => {
+                    KeyCode::KeyS => {
                         self.exec_command(Command::Save);
                         return;
                     }
-                    "w" | "W" => {
+                    KeyCode::KeyW => {
                         self.exec_command(Command::Close);
                         return;
                     }
-                    "z" | "Z" => {
+                    KeyCode::KeyZ => {
                         self.exec_command(Command::Undo);
                         return;
                     }
-                    "y" | "Y" => {
+                    KeyCode::KeyY => {
                         self.exec_command(Command::Redo);
                         return;
                     }
-                    "f" | "F" => {
+                    KeyCode::KeyF => {
                         self.exec_command(Command::Find);
                         return;
                     }
-                    "b" | "B" => {
+                    KeyCode::KeyB => {
                         self.exec_command(Command::ToggleSidebar);
                         return;
                     }
-                    "n" | "N" => {
+                    KeyCode::KeyN => {
                         self.exec_command(Command::NewFile);
                         return;
                     }
@@ -2104,7 +2153,13 @@ impl App {
                 d.insert_str("\n", &mut gpu.font_system);
             }
             Key::Named(NamedKey::Tab) => {
-                d.insert_str("    ", &mut gpu.font_system);
+                let s = settings::current();
+                let tab = if s.editor_insert_spaces {
+                    " ".repeat(s.editor_tab_size)
+                } else {
+                    "\t".to_string()
+                };
+                d.insert_str(&tab, &mut gpu.font_system);
             }
             Key::Named(NamedKey::PageUp) => {
                 let (line, _) = d.head_line_col();
@@ -2128,6 +2183,7 @@ impl App {
             }
         }
         let _ = (d, gpu);
+        self.last_edit = Instant::now(); // for files.autoSave idle timer
         self.ensure_cursor_visible();
         self.redraw();
     }
@@ -2210,21 +2266,22 @@ fn edit_input(
     ctrl: bool,
     shift: bool,
 ) -> Option<bool> {
-    use winit::keyboard::{Key, NamedKey};
+    use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
     if ctrl {
-        if let Key::Character(c) = event.logical_key.as_ref() {
-            match c.to_lowercase().as_str() {
-                "a" => {
+        // Match the physical key (Ctrl can turn the logical key into a control char).
+        if let PhysicalKey::Code(code) = event.physical_key {
+            match code {
+                KeyCode::KeyA => {
                     input.select_all();
                     return Some(false);
                 }
-                "c" => {
+                KeyCode::KeyC => {
                     if let Some(cb) = clip {
                         let _ = cb.set_text(input.selected_text().to_string());
                     }
                     return Some(false);
                 }
-                "x" => {
+                KeyCode::KeyX => {
                     if input.has_selection() {
                         if let Some(cb) = clip {
                             let _ = cb.set_text(input.selected_text().to_string());
@@ -2234,7 +2291,7 @@ fn edit_input(
                     }
                     return Some(false);
                 }
-                "v" => {
+                KeyCode::KeyV => {
                     if let Some(cb) = clip {
                         if let Ok(t) = cb.get_text() {
                             let t: String = t.chars().filter(|c| *c != '\n' && *c != '\r').collect();
@@ -2296,34 +2353,6 @@ pub(crate) fn ext_filter_rect(tree: Rect) -> Rect {
 pub(crate) fn ext_list_region(tree: Rect) -> Rect {
     const STRIP: f32 = 46.0; // filter box + padding
     Rect { x: tree.x, y: tree.y + STRIP, w: tree.w, h: (tree.h - STRIP).max(0.0) }
-}
-
-pub(crate) fn cursor_pos_in_buffer(buffer: &Buffer, line: usize, col_byte: usize) -> (f32, f32, f32) {
-    let mut x = 0.0f32;
-    let mut y = line as f32 * theme::LINE_HEIGHT;
-    let mut h = theme::LINE_HEIGHT;
-    for run in buffer.layout_runs() {
-        if run.line_i != line {
-            continue;
-        }
-        y = run.line_top;
-        h = run.line_height;
-        let mut last_end = 0.0f32;
-        let mut placed = false;
-        for glyph in run.glyphs.iter() {
-            if (glyph.start as usize) >= col_byte {
-                x = glyph.x;
-                placed = true;
-                break;
-            }
-            last_end = glyph.x + glyph.w;
-        }
-        if !placed {
-            x = last_end;
-        }
-        break;
-    }
-    (x, y, h)
 }
 
 pub(crate) fn x_range_in_run(
@@ -2392,6 +2421,20 @@ impl ApplicationHandler for App {
 
         let now = Instant::now();
 
+        // files.autoSave (afterDelay): save dirty docs ~1s after the last edit.
+        if settings::auto_save() && now.duration_since(self.last_edit) > Duration::from_millis(1000) {
+            let mut saved = false;
+            for d in self.workspace.documents.iter_mut() {
+                if d.dirty && d.path.is_some() {
+                    let _ = d.save();
+                    saved = true;
+                }
+            }
+            if saved {
+                self.redraw();
+            }
+        }
+
         // If an animated GIF is visible on the detail page, tick ~20fps to play it.
         let animating = self.open_extension.is_some()
             && self
@@ -2402,6 +2445,23 @@ impl ApplicationHandler for App {
         if animating {
             self.redraw();
             el.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(66)));
+            return;
+        }
+
+        // Solid cursor (editor.cursorBlinking: "solid") stays on without blinking.
+        if !settings::current().editor_cursor_blink {
+            if !self.cursor_blink_on {
+                self.cursor_blink_on = true;
+                self.redraw();
+            }
+            // Without blink wakeups, still wake to run the auto-save idle timer.
+            let autosave_pending = settings::auto_save()
+                && self.workspace.documents.iter().any(|d| d.dirty && d.path.is_some());
+            el.set_control_flow(if autosave_pending {
+                ControlFlow::WaitUntil(self.last_edit + Duration::from_millis(1100))
+            } else {
+                ControlFlow::Wait
+            });
             return;
         }
 
@@ -2483,7 +2543,7 @@ impl ApplicationHandler for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 let (mut dx, mut dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => {
-                        (x * theme::LINE_HEIGHT * 3.0, y * theme::LINE_HEIGHT * 3.0)
+                        (x * theme::LINE_HEIGHT() * 3.0, y * theme::LINE_HEIGHT() * 3.0)
                     }
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
                 };

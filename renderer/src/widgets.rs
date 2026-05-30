@@ -16,7 +16,7 @@ pub fn make_ui_buffer(fs: &mut FontSystem, w: f32, h: f32) -> Buffer {
 }
 
 pub fn make_ui_buffer_mono(fs: &mut FontSystem, w: f32, h: f32) -> Buffer {
-    let mut b = Buffer::new(fs, Metrics::new(theme::FONT_SIZE, theme::LINE_HEIGHT));
+    let mut b = Buffer::new(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
     b.set_size(fs, Some(w), Some(h));
     b
 }
@@ -287,7 +287,7 @@ impl TextInput {
         self.buffer.set_text(
             fs,
             &content,
-            Attrs::new().family(Family::Name(theme::UI_FAMILY)),
+            Attrs::new().family(Family::Name(theme::UI_FAMILY())),
             Shaping::Advanced,
         );
         self.buffer.shape_until_scroll(fs, false);
@@ -627,7 +627,7 @@ impl MenuBar {
             .iter()
             .map(|t| {
                 let mut l = TextLabel::new(fs, 240.0, theme::TITLE_BAR_H);
-                l.set(fs, t, theme::UI_FAMILY);
+                l.set(fs, t, theme::UI_FAMILY());
                 l
             })
             .collect();
@@ -681,38 +681,68 @@ impl MenuBar {
 /// quirk in one place (see the known-issue note in `set`).
 pub struct Gutter {
     buffer: Buffer,
-    last_count: usize,
+    last_lines: usize,
+    last_rows: usize,
 }
 
 impl Gutter {
     pub fn new(fs: &mut FontSystem, w: f32) -> Self {
         Self {
             buffer: make_ui_buffer_mono(fs, w, 4000.0),
-            last_count: usize::MAX,
+            last_lines: usize::MAX,
+            last_rows: usize::MAX,
         }
     }
 
-    pub fn set(&mut self, fs: &mut FontSystem, count: usize) {
-        if self.last_count == count {
+    /// Force a rebuild on next `set_from_buffer` (e.g. after the editor font changed).
+    pub fn invalidate(&mut self) {
+        self.last_rows = usize::MAX;
+    }
+
+    /// Build line numbers aligned to the editor buffer's VISUAL rows: the number
+    /// on each logical line's first row, blanks on wrap-continuation rows. This
+    /// keeps numbers aligned whether or not word-wrap is on (with wrap off there's
+    /// one visual row per logical line, so it's just 1..n).
+    pub fn set_from_buffer(&mut self, fs: &mut FontSystem, src: &Buffer) {
+        // Cheap change-detection: (logical line count, total visual rows).
+        let mut rows = 0usize;
+        let mut lines = 0usize;
+        let mut prev = usize::MAX;
+        for run in src.layout_runs() {
+            rows += 1;
+            if run.line_i != prev {
+                lines = run.line_i + 1;
+                prev = run.line_i;
+            }
+        }
+        if rows == self.last_rows && lines == self.last_lines {
             return;
         }
+
         // NOTE: line 1's "1" doesn't render on real GPUs (glyphon drops this
-        // buffer's first laid-out line). A spacer workaround caused bleed over the
-        // tab strip when scrolled, so it's left as a known minor issue.
-        let mut s = String::with_capacity(count * 6);
-        for i in 1..=count {
-            s.push_str(&format!("{:>4} \n", i));
+        // buffer's first laid-out line) — known minor issue.
+        let mut s = String::with_capacity(rows * 6);
+        let mut prev = usize::MAX;
+        for run in src.layout_runs() {
+            if run.line_i != prev {
+                s.push_str(&format!("{:>4} \n", run.line_i + 1));
+                prev = run.line_i;
+            } else {
+                s.push('\n'); // wrap-continuation row → blank
+            }
         }
+        self.buffer.set_metrics(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
         self.buffer
-            .set_size(fs, None, Some(count as f32 * theme::LINE_HEIGHT + 200.0));
+            .set_size(fs, None, Some(rows as f32 * theme::LINE_HEIGHT() + 200.0));
         self.buffer.set_text(
             fs,
             &s,
-            Attrs::new().family(Family::Name(theme::MONO_FAMILY)),
+            Attrs::new().family(Family::Name(theme::MONO_FAMILY())),
             Shaping::Advanced,
         );
         self.buffer.shape_until_scroll(fs, false);
-        self.last_count = count;
+        self.last_lines = lines;
+        self.last_rows = rows;
     }
 
     pub fn draw<'a>(&'a self, region: Rect, scroll_y: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
@@ -768,7 +798,7 @@ impl ListView {
         self.buffer.set_text(
             fs,
             key,
-            Attrs::new().family(Family::Name(theme::UI_FAMILY)),
+            Attrs::new().family(Family::Name(theme::UI_FAMILY())),
             Shaping::Advanced,
         );
         self.buffer.shape_until_scroll(fs, false);
@@ -781,7 +811,7 @@ impl ListView {
         }
         self.buffer.set_size(fs, Some(w), Some(h));
         let default = Attrs::new()
-            .family(Family::Name(theme::UI_FAMILY))
+            .family(Family::Name(theme::UI_FAMILY()))
             .color(theme::FG_TEXT());
         self.buffer.set_rich_text(
             fs,
@@ -922,15 +952,15 @@ impl Dialog {
     }
 
     pub fn set(&mut self, fs: &mut FontSystem, message: &str, buttons: &[&str], check: Option<&str>) {
-        self.message.set(fs, message, theme::UI_FAMILY);
+        self.message.set(fs, message, theme::UI_FAMILY());
         if self.buttons.len() != buttons.len() {
             self.buttons = buttons.iter().map(|_| TextLabel::new(fs, 200.0, theme::DIALOG_BTN_H)).collect();
         }
         for (b, l) in self.buttons.iter_mut().zip(buttons) {
-            b.set(fs, l, theme::UI_FAMILY);
+            b.set(fs, l, theme::UI_FAMILY());
         }
         if let Some(c) = check {
-            self.check.set(fs, c, theme::UI_FAMILY);
+            self.check.set(fs, c, theme::UI_FAMILY());
         }
     }
 
@@ -1186,13 +1216,13 @@ impl ExtensionRow {
     pub fn new(fs: &mut FontSystem, name: &str, meta: &str, desc: &str, icon_uv: Option<[f32; 4]>) -> Self {
         let mut nl = TextLabel::new(fs, theme::SIDEBAR_WIDTH, theme::UI_LINE_HEIGHT);
         nl.align = VAlign::Center;
-        nl.set(fs, name, theme::UI_FAMILY);
+        nl.set(fs, name, theme::UI_FAMILY());
         let mut ml = TextLabel::new(fs, theme::SIDEBAR_WIDTH, theme::UI_LINE_HEIGHT);
         ml.align = VAlign::Center;
-        ml.set(fs, meta, theme::UI_FAMILY);
+        ml.set(fs, meta, theme::UI_FAMILY());
         let mut dl = TextLabel::new(fs, 800.0, theme::UI_LINE_HEIGHT);
         dl.align = VAlign::Center;
-        dl.set(fs, desc, theme::UI_FAMILY);
+        dl.set(fs, desc, theme::UI_FAMILY());
         Self {
             name: nl,
             meta: ml,

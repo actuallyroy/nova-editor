@@ -117,7 +117,7 @@ fn config_for(lang: Lang) -> Option<&'static HighlightConfiguration> {
 /// for languages without a tree-sitter config (caller uses plain text).
 pub fn highlight_spans(lang: Lang, text: &str) -> Option<Vec<(String, Attrs<'static>)>> {
     let config = config_for(lang)?;
-    let mono = |c: Color| Attrs::new().family(Family::Name(theme::MONO_FAMILY)).color(c);
+    let mono = |c: Color| Attrs::new().family(Family::Name(theme::MONO_FAMILY())).color(c);
     let mut hl = Highlighter::new();
     let events = hl.highlight(config, text.as_bytes(), None, |_| None).ok()?;
     let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();

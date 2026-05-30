@@ -170,7 +170,7 @@ pub fn has(ext: &str) -> bool {
 /// Produce rich-text spans for `text` if a grammar is registered for `ext`.
 pub fn spans_for(ext: &str, text: &str) -> Option<Vec<(String, Attrs<'static>)>> {
     let g = registry().read().unwrap().get(&ext.to_lowercase())?.clone();
-    let mono = |c: Color| Attrs::new().family(Family::Name(theme::MONO_FAMILY)).color(c);
+    let mono = |c: Color| Attrs::new().family(Family::Name(theme::MONO_FAMILY())).color(c);
     let mut out: Vec<(String, Attrs<'static>)> = Vec::new();
     for line in text.split_inclusive('\n') {
         let has_nl = line.ends_with('\n');

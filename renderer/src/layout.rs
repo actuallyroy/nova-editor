@@ -35,10 +35,12 @@ impl Layout {
         let tb = theme::TITLE_BAR_H;
         let title_bar = Rect { x: 0.0, y: 0.0, w, h: tb };
         let panel_h = h - theme::STATUS_BAR_HEIGHT - tb;
+        // workbench.activityBar.visible — collapse to 0 width when hidden.
+        let activity_w = if crate::settings::activitybar_visible() { theme::ACTIVITY_BAR_WIDTH } else { 0.0 };
         let activity_bar = Rect {
             x: 0.0,
             y: tb,
-            w: theme::ACTIVITY_BAR_WIDTH,
+            w: activity_w,
             h: panel_h,
         };
         let sidebar = Rect {
@@ -66,10 +68,12 @@ impl Layout {
         };
         let editor_y = tb + tab_strip.h + if find_active { theme::FIND_BAR_HEIGHT } else { 0.0 };
         let editor_h = (h - editor_y - theme::STATUS_BAR_HEIGHT).max(0.0);
+        // editor.lineNumbers — collapse the gutter to 0 width when off.
+        let gutter_w = if crate::settings::line_numbers() { theme::GUTTER_WIDTH } else { 0.0 };
         let gutter = Rect {
             x: editor_left,
             y: editor_y,
-            w: theme::GUTTER_WIDTH,
+            w: gutter_w,
             h: editor_h,
         };
         let editor_text = Rect {

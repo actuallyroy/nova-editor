@@ -396,16 +396,23 @@ pub fn file_icon_color(name: &str) -> Color {
 pub const SCROLLBAR_WIDTH: f32 = 14.0;
 pub const DIALOG_BTN_H: f32 = 30.0;
 
-pub const FONT_SIZE: f32 = 14.0;
-pub const LINE_HEIGHT: f32 = 20.0;
+// Editor font metrics are runtime (driven by `editor.fontSize` / `editor.lineHeight`).
+#[allow(non_snake_case)]
+pub fn FONT_SIZE() -> f32 { crate::settings::font_size() }
+#[allow(non_snake_case)]
+pub fn LINE_HEIGHT() -> f32 { crate::settings::line_height() }
 pub const UI_FONT_SIZE: f32 = 13.0;
 pub const UI_LINE_HEIGHT: f32 = 22.0;
 pub const ICON_SIZE: f32 = 16.0;
 pub const ACTIVITY_ICON_SIZE: f32 = 22.0;
 pub const ACTIVITY_CELL: f32 = 48.0;
 
-pub const MONO_FAMILY: &str = "Consolas";
-pub const UI_FAMILY: &str = "Segoe UI";
+// Editor mono family is runtime (driven by `editor.fontFamily`).
+#[allow(non_snake_case)]
+pub fn MONO_FAMILY() -> &'static str { crate::settings::mono_family() }
+// UI (chrome) family is runtime (driven by `workbench.fontFamily`).
+#[allow(non_snake_case)]
+pub fn UI_FAMILY() -> &'static str { crate::settings::ui_family() }
 // VSCode's own icon font (Codicon, MIT). Bundled at renderer/assets/codicon.ttf
 // and loaded into the FontSystem at startup; its internal family name is "codicon".
 pub const ICON_FAMILY: &str = "codicon";

@@ -39,18 +39,18 @@ impl Style {
         if self.heading.is_some() {
             // Heading size comes from the block's base metrics (uniform line
             // advance); here we only set the heading color.
-            return attrs(theme::UI_FAMILY, theme::MD_HEADING());
+            return attrs(theme::UI_FAMILY(), theme::MD_HEADING());
         }
         if self.code {
-            return attrs(theme::MONO_FAMILY, theme::MD_CODE());
+            return attrs(theme::MONO_FAMILY(), theme::MD_CODE());
         }
         if self.link {
-            return attrs(theme::UI_FAMILY, theme::FG_ACTIVE());
+            return attrs(theme::UI_FAMILY(), theme::FG_ACTIVE());
         }
         if self.quote {
-            return attrs(theme::UI_FAMILY, theme::MD_QUOTE());
+            return attrs(theme::UI_FAMILY(), theme::MD_QUOTE());
         }
-        attrs(theme::UI_FAMILY, theme::FG_TEXT())
+        attrs(theme::UI_FAMILY(), theme::FG_TEXT())
     }
 }
 
@@ -94,7 +94,7 @@ impl Markdown {
         opts.insert(Options::ENABLE_TASKLISTS);
         let parser = Parser::new_ext(src, opts);
 
-        let base = attrs(theme::UI_FAMILY, theme::FG_TEXT());
+        let base = attrs(theme::UI_FAMILY(), theme::FG_TEXT());
         let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
         let mut st = Style::new();
         let mut list_stack: Vec<Option<u64>> = Vec::new();
@@ -170,7 +170,7 @@ impl Markdown {
                             Some(Some(n)) => { let s = format!("{n}. "); *n += 1; s }
                             _ => "•  ".to_string(),
                         };
-                        spans.push((format!("{indent}{marker}"), attrs(theme::UI_FAMILY, theme::MD_LIST())));
+                        spans.push((format!("{indent}{marker}"), attrs(theme::UI_FAMILY(), theme::MD_LIST())));
                     }
                     Tag::BlockQuote(_) => st.quote = true,
                     // Tables: render each row on its own line with separated cells
@@ -179,7 +179,7 @@ impl Markdown {
                     Tag::TableHead | Tag::TableRow => cell_idx = 0,
                     Tag::TableCell => {
                         if cell_idx > 0 {
-                            spans.push((" │ ".into(), attrs(theme::UI_FAMILY, theme::FG_DIM())));
+                            spans.push((" │ ".into(), attrs(theme::UI_FAMILY(), theme::FG_DIM())));
                         }
                         cell_idx += 1;
                     }
@@ -215,10 +215,10 @@ impl Markdown {
                         spans.push((t.to_string(), st.text_attrs()));
                     }
                 }
-                Event::Code(t) => spans.push((t.to_string(), attrs(theme::MONO_FAMILY, theme::MD_CODE()))),
+                Event::Code(t) => spans.push((t.to_string(), attrs(theme::MONO_FAMILY(), theme::MD_CODE()))),
                 Event::SoftBreak => spans.push((" ".into(), base)),
                 Event::HardBreak => spans.push(("\n".into(), base)),
-                Event::Rule => spans.push(("\n────────────────\n\n".into(), attrs(theme::UI_FAMILY, theme::MD_RULE()))),
+                Event::Rule => spans.push(("\n────────────────\n\n".into(), attrs(theme::UI_FAMILY(), theme::MD_RULE()))),
                 Event::TaskListMarker(done) => spans.push(((if done { "[x] " } else { "[ ] " }).into(), st.text_attrs())),
                 _ => {}
             }

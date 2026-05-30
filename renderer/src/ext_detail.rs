@@ -75,13 +75,13 @@ impl ExtensionDetail {
             l
         };
         let mut install = TextLabel::new(fs, 140.0, Self::BTN_H);
-        install.set(fs, "Install", theme::UI_FAMILY);
+        install.set(fs, "Install", theme::UI_FAMILY());
         let mut installed_lbl = TextLabel::new(fs, 140.0, Self::BTN_H);
-        installed_lbl.set(fs, "Installed", theme::UI_FAMILY);
+        installed_lbl.set(fs, "Installed", theme::UI_FAMILY());
         let tabs = [
-            { let mut l = TextLabel::new(fs, 140.0, Self::TABBAR_H); l.set(fs, "DETAILS", theme::UI_FAMILY); l },
-            { let mut l = TextLabel::new(fs, 140.0, Self::TABBAR_H); l.set(fs, "FEATURES", theme::UI_FAMILY); l },
-            { let mut l = TextLabel::new(fs, 140.0, Self::TABBAR_H); l.set(fs, "CHANGELOG", theme::UI_FAMILY); l },
+            { let mut l = TextLabel::new(fs, 140.0, Self::TABBAR_H); l.set(fs, "DETAILS", theme::UI_FAMILY()); l },
+            { let mut l = TextLabel::new(fs, 140.0, Self::TABBAR_H); l.set(fs, "FEATURES", theme::UI_FAMILY()); l },
+            { let mut l = TextLabel::new(fs, 140.0, Self::TABBAR_H); l.set(fs, "CHANGELOG", theme::UI_FAMILY()); l },
         ];
         Self {
             name: mk(fs, 1000.0, 36.0),
@@ -129,7 +129,7 @@ impl ExtensionDetail {
         changelog: Option<&str>,
         features_md: &str,
     ) {
-        let ui = |c: Color| Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(c);
+        let ui = |c: Color| Attrs::new().family(Family::Name(theme::UI_FAMILY())).color(c);
 
         // Name (large).
         let name_span = [(name.to_string(), ui(theme::FG_ACTIVE()).metrics(Metrics::new(24.0, 32.0)))];
@@ -151,7 +151,7 @@ impl ExtensionDetail {
 
         // Description.
         let d = if description.is_empty() { "" } else { description };
-        self.desc.set(fs, d, theme::UI_FAMILY);
+        self.desc.set(fs, d, theme::UI_FAMILY());
 
         // Tab bodies.
         let bw = Self::body_rect(region).w;

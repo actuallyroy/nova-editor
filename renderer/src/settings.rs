@@ -7,6 +7,265 @@
 // settings to the running editor is a separate concern (not all are wired yet).
 
 use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
+
+use serde_json::Value;
+
+/// The resolved settings (user values merged over defaults). Cheap to clone.
+#[derive(Clone)]
+pub struct Settings {
+    pub editor_font_size: f32,
+    pub editor_line_height: f32,
+    pub editor_font_family: String,
+    pub editor_tab_size: usize,
+    pub editor_insert_spaces: bool,
+    pub editor_word_wrap: bool,
+    pub editor_cursor_blink: bool,
+    pub editor_line_numbers: bool,
+    pub editor_rulers: usize,
+    pub editor_render_line_highlight: bool,
+    pub files_auto_save: bool, // true = afterDelay
+    pub files_eol: String,     // "\n" or "\r\n"
+    pub files_trim_trailing: bool,
+    pub workbench_color_theme: String,
+    pub workbench_font_family: String,
+    pub workbench_activitybar_visible: bool,
+    pub workbench_sidebar_visible: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            editor_font_size: 14.0,
+            editor_line_height: 20.0,
+            editor_font_family: "Consolas".into(),
+            editor_tab_size: 4,
+            editor_insert_spaces: true,
+            editor_word_wrap: false,
+            editor_cursor_blink: true,
+            editor_line_numbers: true,
+            editor_rulers: 0,
+            editor_render_line_highlight: true,
+            files_auto_save: false,
+            files_eol: "\n".into(),
+            files_trim_trailing: false,
+            workbench_color_theme: "Nova Dark".into(),
+            workbench_font_family: "Segoe UI".into(),
+            workbench_activitybar_visible: true,
+            workbench_sidebar_visible: true,
+        }
+    }
+}
+
+impl Settings {
+    /// Overlay any present keys from a parsed settings JSON object onto self.
+    fn overlay(&mut self, v: &Value) {
+        if let Some(n) = v["editor.fontSize"].as_f64() {
+            self.editor_font_size = (n as f32).clamp(8.0, 48.0);
+        }
+        if let Some(n) = v["editor.lineHeight"].as_f64() {
+            if n > 0.0 {
+                self.editor_line_height = n as f32;
+            }
+        }
+        if let Some(s) = v["editor.fontFamily"].as_str() {
+            self.editor_font_family = s.to_string();
+        }
+        if let Some(n) = v["editor.tabSize"].as_u64() {
+            self.editor_tab_size = (n as usize).clamp(1, 16);
+        }
+        if let Some(b) = v["editor.insertSpaces"].as_bool() {
+            self.editor_insert_spaces = b;
+        }
+        if let Some(s) = v["editor.wordWrap"].as_str() {
+            self.editor_word_wrap = s == "on";
+        }
+        if let Some(s) = v["editor.cursorBlinking"].as_str() {
+            self.editor_cursor_blink = s != "solid";
+        }
+        if let Some(b) = v["editor.lineNumbers"].as_bool() {
+            self.editor_line_numbers = b;
+        }
+        if let Some(n) = v["editor.rulers"].as_u64() {
+            self.editor_rulers = n as usize;
+        }
+        if let Some(b) = v["editor.renderLineHighlight"].as_bool() {
+            self.editor_render_line_highlight = b;
+        }
+        if let Some(s) = v["files.autoSave"].as_str() {
+            self.files_auto_save = s == "afterDelay";
+        }
+        if let Some(s) = v["files.eol"].as_str() {
+            if s == "\r\n" || s == "\n" {
+                self.files_eol = s.to_string();
+            }
+        }
+        if let Some(b) = v["files.trimTrailingWhitespace"].as_bool() {
+            self.files_trim_trailing = b;
+        }
+        if let Some(s) = v["workbench.colorTheme"].as_str() {
+            self.workbench_color_theme = s.to_string();
+        }
+        if let Some(s) = v["workbench.fontFamily"].as_str() {
+            self.workbench_font_family = s.to_string();
+        }
+        if let Some(b) = v["workbench.activityBar.visible"].as_bool() {
+            self.workbench_activitybar_visible = b;
+        }
+        if let Some(b) = v["workbench.sideBar.visible"].as_bool() {
+            self.workbench_sidebar_visible = b;
+        }
+    }
+}
+
+fn store() -> &'static RwLock<Settings> {
+    static S: OnceLock<RwLock<Settings>> = OnceLock::new();
+    S.get_or_init(|| RwLock::new(Settings::default()))
+}
+
+/// The current resolved settings (a clone).
+pub fn current() -> Settings {
+    store().read().unwrap().clone()
+}
+
+// Cheap field accessors for hot paths (avoid cloning the whole struct).
+pub fn font_size() -> f32 {
+    store().read().unwrap().editor_font_size
+}
+pub fn line_height() -> f32 {
+    let s = store().read().unwrap();
+    // Auto-scale: if the configured line height is smaller than the font, derive a
+    // proportional one (so a larger font isn't cramped). Set both explicitly to override.
+    if s.editor_line_height >= s.editor_font_size {
+        s.editor_line_height
+    } else {
+        (s.editor_font_size * 1.4).round()
+    }
+}
+
+/// The editor mono font family as a `&'static str` (glyphon needs a stable
+/// lifetime). The family string is leaked once per reload — bounded, since
+/// settings reload only on startup / save.
+fn mono_family_cell() -> &'static RwLock<&'static str> {
+    static M: OnceLock<RwLock<&'static str>> = OnceLock::new();
+    M.get_or_init(|| RwLock::new("Consolas"))
+}
+pub fn mono_family() -> &'static str {
+    *mono_family_cell().read().unwrap()
+}
+fn set_mono_family(name: &str) {
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    *mono_family_cell().write().unwrap() = leaked;
+}
+
+/// The UI (chrome) font family as a `&'static str` (driven by `workbench.fontFamily`).
+fn ui_family_cell() -> &'static RwLock<&'static str> {
+    static M: OnceLock<RwLock<&'static str>> = OnceLock::new();
+    M.get_or_init(|| RwLock::new("Segoe UI"))
+}
+pub fn ui_family() -> &'static str {
+    *ui_family_cell().read().unwrap()
+}
+fn set_ui_family(name: &str) {
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    *ui_family_cell().write().unwrap() = leaked;
+}
+
+// Cheap accessors for behavior settings (read on demand).
+pub fn word_wrap() -> bool {
+    store().read().unwrap().editor_word_wrap
+}
+pub fn line_numbers() -> bool {
+    store().read().unwrap().editor_line_numbers
+}
+pub fn render_line_highlight() -> bool {
+    store().read().unwrap().editor_render_line_highlight
+}
+pub fn rulers() -> usize {
+    store().read().unwrap().editor_rulers
+}
+pub fn activitybar_visible() -> bool {
+    store().read().unwrap().workbench_activitybar_visible
+}
+pub fn auto_save() -> bool {
+    store().read().unwrap().files_auto_save
+}
+pub fn eol() -> String {
+    store().read().unwrap().files_eol.clone()
+}
+pub fn trim_trailing() -> bool {
+    store().read().unwrap().files_trim_trailing
+}
+
+/// Re-read the user settings file, merge over defaults, and store. Call at startup
+/// and whenever settings.json is saved. Returns the resolved settings.
+pub fn reload() -> Settings {
+    let mut s = Settings::default();
+    if let Some(path) = config_dir().map(|d| d.join("settings.json")) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<Value>(&strip_jsonc(&text)) {
+                s.overlay(&v);
+            }
+        }
+    }
+    set_mono_family(&s.editor_font_family);
+    set_ui_family(&s.workbench_font_family);
+    *store().write().unwrap() = s.clone();
+    s
+}
+
+/// True if `path` is the user settings file (so a save can trigger a reload).
+/// Tolerant of path-form differences: matches `…/.nova/settings.json` by name.
+pub fn is_user_settings(path: &std::path::Path) -> bool {
+    let is_name = path.file_name().map(|n| n == "settings.json").unwrap_or(false);
+    let in_nova = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n == ".nova")
+        .unwrap_or(false);
+    is_name && in_nova
+}
+
+/// Strip `//` line and `/* */` block comments from JSONC (string-aware).
+fn strip_jsonc(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            out.push(c as char);
+            if c == b'\\' && i + 1 < b.len() {
+                out.push(b[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+        } else if c == b'"' {
+            in_str = true;
+            out.push('"');
+            i += 1;
+        } else if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+        } else {
+            out.push(c as char);
+            i += 1;
+        }
+    }
+    out
+}
 
 /// `~/.nova`, created if missing. None if no home dir.
 pub fn config_dir() -> Option<PathBuf> {
@@ -62,11 +321,9 @@ pub fn default_settings_jsonc() -> &'static str {
     // Controls auto save of editors: "off" or "afterDelay".
     "files.autoSave": "off",
 
-    // The default end-of-line character: "\n" (LF) or "\r\n" (CRLF).
+    // Default end-of-line for NEW files: "\n" (LF) or "\r\n" (CRLF). Existing files
+    // keep their own line ending (shown in the status bar) when saved.
     "files.eol": "\n",
-
-    // The default character encoding.
-    "files.encoding": "utf8",
 
     // Trim trailing whitespace on save.
     "files.trimTrailingWhitespace": false,

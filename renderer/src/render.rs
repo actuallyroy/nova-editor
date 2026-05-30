@@ -17,8 +17,8 @@ use crate::quad::Quad;
 use crate::widgets::{Rect, VAlign};
 use crate::{icon, marketplace, theme};
 use crate::{
-    active_activity_idx, create_row_geometry, cursor_pos_in_buffer, ext_filter_rect,
-    ext_list_region, x_range_in_run, App, SidebarView, MENU_ACTIONS,
+    active_activity_idx, create_row_geometry, ext_filter_rect, ext_list_region, x_range_in_run,
+    App, SidebarView, MENU_ACTIONS,
 };
 
 /// The full editor area (gutter + text columns) — where the document or the
@@ -45,6 +45,18 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         app.palette.active,
     );
 
+    // editor.wordWrap — wrap the active document to the editor width (or disable).
+    {
+        let wrap = if crate::settings::word_wrap() {
+            Some((layout.editor_text.w - theme::EDITOR_PAD * 2.0).max(50.0))
+        } else {
+            None
+        };
+        if let Some(d) = app.workspace.active_doc_mut() {
+            d.set_wrap(&mut gpu.font_system, wrap);
+        }
+    }
+
     // ---- Update UI buffer texts (only on cache miss) ----
     {
         let fs = &mut gpu.font_system;
@@ -69,7 +81,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         } else {
             "EXPLORER"
         };
-        gpu.ui.sidebar_header.set(fs, header, theme::UI_FAMILY);
+        gpu.ui.sidebar_header.set(fs, header, theme::UI_FAMILY());
 
         // Extension detail page text (works for local + marketplace extensions).
         if let Some(v) = open_ext_view(app.open_extension, &app.extensions, &app.ext_remote) {
@@ -93,12 +105,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             ),
             (
                 ws_name.clone(),
-                Attrs::new().family(Family::Name(theme::UI_FAMILY)).color(theme::FG_TEXT()),
+                Attrs::new().family(Family::Name(theme::UI_FAMILY())).color(theme::FG_TEXT()),
             ),
         ];
         gpu.ui
             .root_label
-            .set_rich(fs, &ws_name, &root_spans, Attrs::new().family(Family::Name(theme::UI_FAMILY)));
+            .set_rich(fs, &ws_name, &root_spans, Attrs::new().family(Family::Name(theme::UI_FAMILY())));
 
         // Sidebar — file tree with monochrome MDL2 folder/file icons (rich text:
         // icon glyphs in the icon font, names in the UI font).
@@ -119,7 +131,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
         {
             let ui_attrs = Attrs::new()
-                .family(Family::Name(theme::UI_FAMILY))
+                .family(Family::Name(theme::UI_FAMILY()))
                 .color(theme::FG_TEXT());
             let folder_attrs = Attrs::new()
                 .family(Family::Name(theme::ICON_FAMILY))
@@ -169,7 +181,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             gpu.ui.tabs.set_text(
                 fs,
                 &tab_text,
-                Attrs::new().family(Family::Name(theme::UI_FAMILY)),
+                Attrs::new().family(Family::Name(theme::UI_FAMILY())),
                 Shaping::Advanced,
             );
             gpu.ui.tabs.shape_until_scroll(fs, false);
@@ -199,24 +211,38 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     other => other.to_uppercase(),
                 })
                 .unwrap_or_else(|| "Plain Text".to_string());
+            // Reflect the live settings so the status bar updates when they change.
+            let s = crate::settings::current();
+            let indent = if s.editor_insert_spaces {
+                format!("Spaces: {}", s.editor_tab_size)
+            } else {
+                format!("Tab Size: {}", s.editor_tab_size)
+            };
+            // EOL reflects the FILE's actual line ending, not the global setting.
+            let eol = if d.eol() == "\r\n" { "CRLF" } else { "LF" };
+            let autosave = if s.files_auto_save { "    Auto Save" } else { "" };
             (
                 format!(" {}{}", path, dirty),
-                format!("Ln {}, Col {}    Spaces: 4    UTF-8    LF    {}    ", line + 1, col + 1, lang),
+                format!(
+                    "Ln {}, Col {}    {}    UTF-8    {}    {}{}    ",
+                    line + 1,
+                    col + 1,
+                    indent,
+                    eol,
+                    lang,
+                    autosave,
+                ),
             )
         } else {
             ("Nova".to_string(), String::new())
         };
-        gpu.ui.status.set(fs, &status_text, theme::UI_FAMILY);
-        gpu.ui.status_right.set(fs, &status_right_text, theme::UI_FAMILY);
+        gpu.ui.status.set(fs, &status_text, theme::UI_FAMILY());
+        gpu.ui.status_right.set(fs, &status_right_text, theme::UI_FAMILY());
 
-        // Line numbers.
-        let line_count = app
-            .workspace
-            .active
-            .and_then(|i| app.workspace.documents.get(i))
-            .map(|d| d.rope.len_lines().max(1))
-            .unwrap_or(0);
-        gpu.ui.line_numbers.set(fs, line_count);
+        // Line numbers — aligned to the active document's visual rows (wrap-aware).
+        if let Some(d) = app.workspace.active.and_then(|i| app.workspace.documents.get(i)) {
+            gpu.ui.line_numbers.set_from_buffer(fs, &d.buffer);
+        }
 
         // Palette list (the input owns its own text now).
         if let Some(pal) = layout.palette.as_ref() {
@@ -406,18 +432,24 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         };
 
         let (cur_line, _) = d.head_line_col();
-        // Current line highlight across full editor width.
-        let line_y = layout.editor_text.y + theme::EDITOR_PAD
-            + cur_line as f32 * theme::LINE_HEIGHT
-            - d.scroll_y;
-        if let Some((qy, qh)) = clip_v(line_y, theme::LINE_HEIGHT) {
-            bg_quads.push(Quad::new(
-                editor_full.x,
-                qy,
-                editor_full.w,
-                qh,
-                theme::LINE_HIGHLIGHT(),
-            ));
+        // Current line highlight across full editor width (editor.renderLineHighlight).
+        // Wrap-aware via the document's visual bounds (covers all wrapped rows).
+        if crate::settings::render_line_highlight() {
+            let (ltop, lh) = d.line_visual_bounds(cur_line);
+            let line_y = layout.editor_text.y + theme::EDITOR_PAD + ltop - d.scroll_y;
+            if let Some((qy, qh)) = clip_v(line_y, lh) {
+                bg_quads.push(Quad::new(editor_full.x, qy, editor_full.w, qh, theme::LINE_HIGHLIGHT()));
+            }
+        }
+
+        // editor.rulers — vertical guide line(s) at N monospace columns.
+        let rulers = crate::settings::rulers();
+        if rulers > 0 {
+            let char_w = theme::FONT_SIZE() * 0.6; // monospace advance approximation
+            let rx = layout.editor_text.x + theme::EDITOR_PAD + rulers as f32 * char_w - d.scroll_x;
+            if rx > layout.editor_text.x && rx < layout.editor_text.x + layout.editor_text.w {
+                bg_quads.push(Quad::new(rx, layout.editor_text.y, 1.0, layout.editor_text.h, theme::BORDER()));
+            }
         }
 
         // Selection quads.
@@ -458,8 +490,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
         // Cursor (foreground so it sits over glyphs) — gated by blink.
         if app.cursor_blink_on {
-            let (cur_line2, cur_col_byte) = d.head_line_col();
-            let (cx, cy, ch) = cursor_pos_in_buffer(&d.buffer, cur_line2, cur_col_byte);
+            let (cx, cy, ch) = d.caret_visual();
             let cursor_y = layout.editor_text.y + theme::EDITOR_PAD + cy - d.scroll_y;
             if let Some((qy, qh)) = clip_v(cursor_y, ch) {
                 fg_quads.push(Quad::new(
@@ -474,7 +505,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
         // Editor scrollbar thumb (over text).
         let view = layout.editor_text.h;
-        let content = d.rope.len_lines() as f32 * theme::LINE_HEIGHT + theme::EDITOR_PAD * 2.0;
+        let content = d.rope.len_lines() as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD * 2.0;
         let track = Rect {
             x: layout.editor_text.x + layout.editor_text.w - theme::SCROLLBAR_WIDTH,
             y: layout.editor_text.y,
