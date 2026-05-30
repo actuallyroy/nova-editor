@@ -192,6 +192,10 @@ pub(crate) struct App {
     // The cursor and grid sizing use this instead of an estimate so the block
     // cursor lands exactly on the glyph cell (no per-column drift).
     pub(crate) terminal_cell_w: f32,
+    // Set when shell output arrives or the panel resizes; render reshapes the
+    // terminal text only when this is set, then clears it. Avoids re-shaping a
+    // full screen of rich text on every unrelated redraw.
+    pub(crate) terminal_dirty: bool,
     pub(crate) cursor_blink_on: bool,
     pub(crate) last_blink: Instant,
     pub(crate) last_edit: Instant,  // for files.autoSave (afterDelay)
@@ -277,6 +281,7 @@ impl App {
                 widgets::Axis::Vertical,
             ),
             terminal_cell_w: theme::FONT_SIZE() * 0.6, // refined after first shape
+            terminal_dirty: true,
             cursor_blink_on: true,
             last_blink: Instant::now(),
             last_edit: Instant::now(),
@@ -1333,6 +1338,7 @@ impl App {
     fn toggle_terminal(&mut self) {
         self.terminal_visible = !self.terminal_visible;
         self.terminal_focused = self.terminal_visible;
+        self.terminal_dirty = true;
         if self.terminal_visible && self.terminal.is_none() {
             let layout = self.layout();
             if let Some(panel) = layout.terminal_panel {
@@ -2628,6 +2634,7 @@ impl ApplicationHandler for App {
         if self.terminal_visible {
             let changed = self.terminal.as_mut().map(|t| t.poll()).unwrap_or(false);
             if changed {
+                self.terminal_dirty = true;
                 self.redraw();
             }
             self.cursor_blink_on = true;

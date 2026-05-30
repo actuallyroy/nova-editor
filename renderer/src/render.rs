@@ -66,6 +66,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let (dc, dr) = t.dims();
             if dc != cols || dr != rows {
                 t.resize(rows, cols);
+                app.terminal_dirty = true;
             }
         }
     }
@@ -264,8 +265,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             gpu.ui.line_numbers.set_from_buffer(fs, &d.buffer);
         }
 
-        // Integrated terminal grid text (rich, monospace, per-cell colors).
-        if app.terminal_visible {
+        // Integrated terminal grid text (rich, monospace, per-cell colors). Only
+        // re-shape when the grid actually changed (terminal_dirty) — reshaping a
+        // full screen of rich text every frame is what made TUIs feel laggy.
+        // Keep Advanced shaping: Basic mis-advances glyphs and drops fallback
+        // (box-drawing/powerline chars), which broke the monospace grid.
+        if app.terminal_visible && app.terminal_dirty {
             if let (Some(t), Some(panel)) = (app.terminal.as_ref(), layout.terminal_panel) {
                 let to_attr = |c: [f32; 4]| {
                     Attrs::new().family(Family::Name(theme::MONO_FAMILY())).color(glyphon::Color::rgba(
@@ -297,6 +302,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 {
                     app.terminal_cell_w = adv;
                 }
+                app.terminal_dirty = false;
             }
         }
 
