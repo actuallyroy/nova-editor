@@ -74,7 +74,6 @@ pub struct Grid {
     cur_fg: [f32; 4],
     cur_bg: Option<[f32; 4]>, // active background (None = default)
     reverse: bool,            // SGR 7: swap fg/bg when writing cells
-    scroll_offset: usize, // viewport offset into scrollback (0 = live/bottom)
     scroll_top: usize,    // scroll region top row (inclusive)
     scroll_bottom: usize, // scroll region bottom row (inclusive)
     saved_cursor: (usize, usize),
@@ -96,7 +95,6 @@ impl Grid {
             cur_fg: DEFAULT_FG,
             cur_bg: None,
             reverse: false,
-            scroll_offset: 0,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             saved_cursor: (0, 0),
@@ -117,24 +115,22 @@ impl Grid {
         self.cols = cols;
         self.scroll_top = 0;
         self.scroll_bottom = rows.saturating_sub(1);
-        self.scroll_offset = 0;
         self.cur_row = self.cur_row.min(rows.saturating_sub(1));
         self.cur_col = self.cur_col.min(cols.saturating_sub(1));
     }
 
-    /// The `rows` visible lines for the current scroll position: scrollback
-    /// followed by the live cells, windowed so offset 0 shows the live screen
-    /// (bottom) and a positive offset reveals that many history lines above it.
-    /// The alternate screen has no scrollback, so it always shows the live cells.
-    fn visible_window(&self) -> Vec<&[Cell]> {
+    /// The `rows` visible lines starting at `top_line` in the combined
+    /// `[scrollback ++ live cells]` sequence. `top_line` is clamped so the window
+    /// never runs past the bottom. The alternate screen has no scrollback, so it
+    /// always shows the live cells.
+    fn window_from(&self, top_line: usize) -> Vec<&[Cell]> {
         if self.alt.is_some() {
             return self.cells.iter().map(|r| r.as_slice()).collect();
         }
         let back = self.scrollback.len();
-        let off = self.scroll_offset.min(back);
-        let end = (back + self.rows) - off; // exclusive index in [scrollback ++ cells]
-        let start = end - self.rows;
-        (start..end)
+        let total = back + self.rows;
+        let start = top_line.min(total - self.rows);
+        (start..start + self.rows)
             .map(|i| {
                 if i < back {
                     self.scrollback[i].as_slice()
@@ -149,7 +145,6 @@ impl Grid {
         if self.alt.is_some() {
             return;
         }
-        self.scroll_offset = 0;
         self.alt = Some(AltScreen {
             cells: std::mem::replace(&mut self.cells, vec![vec![Cell::blank(); self.cols]; self.rows]),
             cur_row: self.cur_row,
@@ -164,7 +159,6 @@ impl Grid {
     }
 
     fn leave_alt(&mut self) {
-        self.scroll_offset = 0;
         if let Some(a) = self.alt.take() {
             self.cells = a.cells;
             for row in &mut self.cells {
@@ -547,53 +541,29 @@ impl Terminal {
     /// Drain any pending shell output into the grid. Returns true if anything changed.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
-        let before = self.grid.scrollback.len();
         while let Ok(chunk) = self.rx.try_recv() {
             for b in chunk {
                 self.parser.advance(&mut self.grid, b);
             }
             changed = true;
         }
-        // If the user is reading history, advance the offset by however many lines
-        // were pushed so the viewed region stays put instead of scrolling away.
-        if self.grid.scroll_offset > 0 {
-            let after = self.grid.scrollback.len();
-            let added = after.saturating_sub(before);
-            if added > 0 {
-                self.grid.scroll_offset = (self.grid.scroll_offset + added).min(after);
-            }
-        }
         changed
     }
 
-    /// Send raw bytes (translated key input) to the shell. Typing snaps the view
-    /// back to the live screen (bottom).
+    /// Send raw bytes (translated key input) to the shell.
     pub fn write(&mut self, bytes: &[u8]) {
-        self.grid.scroll_offset = 0;
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
     }
 
-    /// Scroll the viewport by `lines` (positive = back into history). Returns true
-    /// if the offset moved. Disabled on the alternate screen (TUIs own the view).
-    pub fn scroll_by_lines(&mut self, lines: i64) -> bool {
+    /// Total scrollable lines (history + live rows). The alternate screen has no
+    /// history, so it's just the live rows. Used to size the scroll viewport.
+    pub fn total_lines(&self) -> usize {
         if self.grid.alt.is_some() {
-            return false;
-        }
-        let max = self.grid.scrollback.len() as i64;
-        let cur = self.grid.scroll_offset as i64;
-        let next = (cur + lines).clamp(0, max);
-        if next != cur {
-            self.grid.scroll_offset = next as usize;
-            true
+            self.grid.rows
         } else {
-            false
+            self.grid.scrollback.len() + self.grid.rows
         }
-    }
-
-    /// True when scrolled up into history (so the live cursor shouldn't be drawn).
-    pub fn scrolled(&self) -> bool {
-        self.grid.alt.is_none() && self.grid.scroll_offset > 0
     }
 
     /// (cols, rows) of the current grid.
@@ -614,9 +584,9 @@ impl Terminal {
 
     /// Rich spans for the visible grid: per row, runs of same-colored cells, rows
     /// joined by '\n'. Trailing blanks per row are dropped to keep it compact.
-    pub fn visual_spans(&self) -> Vec<(String, [f32; 4])> {
+    pub fn visual_spans(&self, top_line: usize) -> Vec<(String, [f32; 4])> {
         let mut out: Vec<(String, [f32; 4])> = Vec::new();
-        let window = self.grid.visible_window();
+        let window = self.grid.window_from(top_line);
         let n = window.len();
         for (ri, row) in window.iter().enumerate() {
             // Find last non-blank cell so we don't emit trailing spaces.
@@ -642,9 +612,9 @@ impl Terminal {
     /// runs of same-colored cells. Cells with the default background are skipped.
     /// The renderer turns these into quads behind the text (reverse-video cursors,
     /// colored TUI panels, selections, etc.).
-    pub fn bg_cells(&self) -> Vec<(usize, usize, usize, [f32; 4])> {
+    pub fn bg_cells(&self, top_line: usize) -> Vec<(usize, usize, usize, [f32; 4])> {
         let mut out = Vec::new();
-        for (ri, row) in self.grid.visible_window().iter().enumerate() {
+        for (ri, row) in self.grid.window_from(top_line).iter().enumerate() {
             let mut col = 0;
             while col < row.len() {
                 if let Some(bg) = row[col].bg {

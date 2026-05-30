@@ -2,6 +2,8 @@
 // by the layout, so geometry has a single source of truth shared by hit-testing,
 // hover backgrounds, and drawing.
 
+use std::time::{Duration, Instant};
+
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, TextArea, TextBounds};
 use winit::window::CursorIcon;
 
@@ -1096,6 +1098,33 @@ impl Scrollbar {
         false
     }
 
+    /// Press anywhere in the `track`. If on the thumb, drag from where it was
+    /// grabbed; otherwise jump the thumb to center on the click (scroll-to-here),
+    /// then drag. Returns the resulting scroll offset, or None if not in the track
+    /// (or nothing overflows). Either way a drag begins so the user can keep moving.
+    pub fn press_track(&mut self, p: (f32, f32), track: Rect, content: f32, view: f32, scroll: f32) -> Option<f32> {
+        if content <= view || !track.contains(p) {
+            return None;
+        }
+        let max_scroll = (content - view).max(1.0);
+        let (len, cursor, origin) = match self.axis {
+            Axis::Vertical => (track.h, p.1, track.y),
+            Axis::Horizontal => (track.w, p.0, track.x),
+        };
+        let thumb = (view / content * len).max(24.0).min(len);
+        let cur_start = origin + (scroll / max_scroll).clamp(0.0, 1.0) * (len - thumb);
+        self.dragging = true;
+        if cursor >= cur_start && cursor <= cur_start + thumb {
+            self.grab = cursor - cur_start; // grabbed the thumb where it sits
+            Some(scroll)
+        } else {
+            self.grab = thumb * 0.5; // center the thumb under the cursor, then drag
+            let usable = (len - thumb).max(1.0);
+            let t = ((cursor - self.grab - origin) / usable).clamp(0.0, 1.0);
+            Some(t * max_scroll)
+        }
+    }
+
     /// While dragging, map the cursor to a new scroll offset.
     pub fn drag(&self, p: (f32, f32), track: Rect, content: f32, view: f32) -> Option<f32> {
         if !self.dragging || content <= view {
@@ -1214,6 +1243,292 @@ impl Splitter {
 
     pub fn release(&mut self) {
         self.dragging = false;
+    }
+}
+
+/// Which axes a `ScrollView` scrolls, plus terminal-style bottom pinning.
+#[derive(Clone, Copy)]
+pub struct ScrollOpts {
+    pub vertical: bool,
+    pub horizontal: bool,
+    pub stick_to_end: bool,
+}
+
+impl ScrollOpts {
+    pub fn vertical() -> Self {
+        Self { vertical: true, horizontal: false, stick_to_end: false }
+    }
+    pub fn both() -> Self {
+        Self { vertical: true, horizontal: true, stick_to_end: false }
+    }
+}
+
+/// A reusable scroll container. It owns the scroll offset, optional vertical/
+/// horizontal scrollbars (built on `Scrollbar`), clamping, wheel + thumb-drag input,
+/// hover state, and a VSCode-style auto-hide overlay fade. Callers report `viewport`
+/// + `content` each frame via `set_metrics`, draw their content shifted by `-offset()`,
+/// and forward mouse events — no scroll math leaks out, and the thumb reserves no width.
+///
+/// This is the single place overflow/scrollbar behavior lives, so every region
+/// (editor, terminal, lists, README) gets identical, debuggable scrolling.
+pub struct ScrollView {
+    offset: (f32, f32),   // scroll position, px from the top-left of the content
+    content: (f32, f32),  // content extent (set each frame)
+    viewport: Rect,       // visible region (set each frame)
+    vbar: Option<Scrollbar>,
+    hbar: Option<Scrollbar>,
+    stick_to_end: bool,
+    at_end: bool,         // currently pinned to the bottom (for stick_to_end)
+    last_active: Instant, // last scroll/hover, drives the auto-hide fade
+    hovered: bool,
+}
+
+impl ScrollView {
+    pub fn new(opts: ScrollOpts) -> Self {
+        Self {
+            offset: (0.0, 0.0),
+            content: (0.0, 0.0),
+            viewport: Rect::default(),
+            vbar: opts.vertical.then(|| Scrollbar::new(Axis::Vertical)),
+            hbar: opts.horizontal.then(|| Scrollbar::new(Axis::Horizontal)),
+            stick_to_end: opts.stick_to_end,
+            at_end: opts.stick_to_end, // start pinned to the bottom
+            last_active: Instant::now(),
+            hovered: false,
+        }
+    }
+
+    fn max_x(&self) -> f32 {
+        (self.content.0 - self.viewport.w).max(0.0)
+    }
+    fn max_y(&self) -> f32 {
+        (self.content.1 - self.viewport.h).max(0.0)
+    }
+
+    pub fn offset(&self) -> (f32, f32) {
+        self.offset
+    }
+
+    /// True when scrolled to the bottom (live view for the terminal).
+    pub fn at_end(&self) -> bool {
+        self.offset.1 >= self.max_y() - 0.5
+    }
+
+    /// Store this frame's geometry and clamp the offset. With `stick_to_end`, the
+    /// view stays pinned to the bottom until the user scrolls away from it.
+    pub fn set_metrics(&mut self, viewport: Rect, content: (f32, f32)) {
+        self.viewport = viewport;
+        self.content = content;
+        if self.stick_to_end && self.at_end {
+            self.offset.1 = self.max_y();
+        }
+        self.clamp();
+    }
+
+    fn clamp(&mut self) {
+        self.offset.0 = if self.hbar.is_some() { self.offset.0.clamp(0.0, self.max_x()) } else { 0.0 };
+        self.offset.1 = if self.vbar.is_some() { self.offset.1.clamp(0.0, self.max_y()) } else { 0.0 };
+        self.at_end = self.offset.1 >= self.max_y() - 0.5;
+    }
+
+    /// Wheel: `dy > 0` (wheel up) scrolls toward the top. Returns true if it moved.
+    pub fn on_wheel(&mut self, dx: f32, dy: f32) -> bool {
+        let before = self.offset;
+        if self.vbar.is_some() {
+            self.offset.1 = (self.offset.1 - dy).clamp(0.0, self.max_y());
+        }
+        if self.hbar.is_some() {
+            self.offset.0 = (self.offset.0 - dx).clamp(0.0, self.max_x());
+        }
+        self.at_end = self.offset.1 >= self.max_y() - 0.5;
+        if self.offset != before {
+            self.last_active = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the vertical offset so `y` (content px) is the top of the view.
+    pub fn scroll_to_y(&mut self, y: f32) {
+        self.offset.1 = y.clamp(0.0, self.max_y());
+        self.at_end = self.offset.1 >= self.max_y() - 0.5;
+        self.last_active = Instant::now();
+    }
+
+    /// Pin to the bottom (used by the terminal when the user types).
+    pub fn scroll_to_end(&mut self) {
+        self.offset.1 = self.max_y();
+        self.at_end = true;
+        self.last_active = Instant::now();
+    }
+
+    fn vtrack(&self) -> Rect {
+        Rect {
+            x: self.viewport.x + self.viewport.w - theme::SCROLLBAR_WIDTH,
+            y: self.viewport.y,
+            w: theme::SCROLLBAR_WIDTH,
+            h: self.viewport.h,
+        }
+    }
+    fn htrack(&self) -> Rect {
+        Rect {
+            x: self.viewport.x,
+            y: self.viewport.y + self.viewport.h - theme::SCROLLBAR_WIDTH,
+            w: self.viewport.w - theme::SCROLLBAR_WIDTH,
+            h: theme::SCROLLBAR_WIDTH,
+        }
+    }
+
+    /// Press on a scrollbar track: drags the thumb, or jumps to the click point if
+    /// the track was clicked outside the thumb. Returns true if it claimed the press.
+    pub fn press(&mut self, p: (f32, f32)) -> bool {
+        let (vt, ht) = (self.vtrack(), self.htrack());
+        let ((cw, ch), (vw, vh), (ox, oy)) =
+            (self.content, (self.viewport.w, self.viewport.h), self.offset);
+        let mut hit = false;
+        if let Some(b) = self.vbar.as_mut() {
+            if let Some(s) = b.press_track(p, vt, ch, vh, oy) {
+                self.offset.1 = s;
+                hit = true;
+            }
+        }
+        if !hit {
+            if let Some(b) = self.hbar.as_mut() {
+                if let Some(s) = b.press_track(p, ht, cw, vw, ox) {
+                    self.offset.0 = s;
+                    hit = true;
+                }
+            }
+        }
+        if hit {
+            self.at_end = self.offset.1 >= self.max_y() - 0.5;
+            self.last_active = Instant::now();
+        }
+        hit
+    }
+
+    /// While a thumb is held, map the cursor to a new offset. Returns true if moved.
+    pub fn drag(&mut self, p: (f32, f32)) -> bool {
+        let (vt, ht) = (self.vtrack(), self.htrack());
+        let ((cw, ch), (vw, vh)) = (self.content, (self.viewport.w, self.viewport.h));
+        let mut moved = false;
+        if let Some(b) = self.vbar.as_ref() {
+            if b.is_dragging() {
+                if let Some(y) = b.drag(p, vt, ch, vh) {
+                    self.offset.1 = y;
+                    moved = true;
+                }
+            }
+        }
+        if let Some(b) = self.hbar.as_ref() {
+            if b.is_dragging() {
+                if let Some(x) = b.drag(p, ht, cw, vw) {
+                    self.offset.0 = x;
+                    moved = true;
+                }
+            }
+        }
+        if moved {
+            self.at_end = self.offset.1 >= self.max_y() - 0.5;
+            self.last_active = Instant::now();
+        }
+        moved
+    }
+
+    pub fn release(&mut self) {
+        if let Some(b) = self.vbar.as_mut() {
+            b.release();
+        }
+        if let Some(b) = self.hbar.as_mut() {
+            b.release();
+        }
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.vbar.as_ref().map_or(false, |b| b.is_dragging())
+            || self.hbar.as_ref().map_or(false, |b| b.is_dragging())
+    }
+
+    /// Update hover state (pointer inside the viewport); the rising edge wakes the
+    /// fade. Returns true if the hover state changed (caller should redraw).
+    pub fn hover(&mut self, inside: bool) -> bool {
+        let changed = inside != self.hovered;
+        if inside && !self.hovered {
+            self.last_active = Instant::now();
+        }
+        self.hovered = inside;
+        changed
+    }
+
+    /// The cursor to show over a thumb (`Default`, matching the editor), else None.
+    pub fn cursor(&self, p: (f32, f32)) -> Option<CursorIcon> {
+        if let Some(b) = self.vbar.as_ref() {
+            if let Some(th) = b.thumb(self.vtrack(), self.content.1, self.viewport.h, self.offset.1) {
+                if th.contains(p) {
+                    return Some(CursorIcon::Default);
+                }
+            }
+        }
+        if let Some(b) = self.hbar.as_ref() {
+            if let Some(th) = b.thumb(self.htrack(), self.content.0, self.viewport.w, self.offset.0) {
+                if th.contains(p) {
+                    return Some(CursorIcon::Default);
+                }
+            }
+        }
+        None
+    }
+
+    fn alpha(&self, now: Instant) -> f32 {
+        if self.hovered || self.is_dragging() {
+            return 1.0;
+        }
+        let ms = now.saturating_duration_since(self.last_active).as_millis() as f32;
+        if ms <= theme::SCROLLBAR_FADE_HOLD_MS {
+            1.0
+        } else {
+            (1.0 - (ms - theme::SCROLLBAR_FADE_HOLD_MS) / theme::SCROLLBAR_FADE_MS).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Push the thumb quad(s) as an auto-hiding overlay (fades out when idle).
+    pub fn draw(&self, now: Instant, fg_quads: &mut Vec<Quad>) {
+        let a = self.alpha(now);
+        if a <= 0.0 {
+            return;
+        }
+        let hot = self.hovered || self.is_dragging();
+        let base = if hot { theme::SCROLLBAR_THUMB_HOVER() } else { theme::SCROLLBAR_THUMB() };
+        let color = [base[0], base[1], base[2], base[3] * a];
+        if let Some(b) = self.vbar.as_ref() {
+            if let Some(th) = b.thumb(self.vtrack(), self.content.1, self.viewport.h, self.offset.1) {
+                fg_quads.push(th.quad(color));
+            }
+        }
+        if let Some(b) = self.hbar.as_ref() {
+            if let Some(th) = b.thumb(self.htrack(), self.content.0, self.viewport.w, self.offset.0) {
+                fg_quads.push(th.quad(color));
+            }
+        }
+    }
+
+    /// While a fade is still in progress (and content overflows), the next frame time
+    /// to animate it; None when nothing is changing. Drives an event-loop WaitUntil.
+    pub fn next_wake(&self, now: Instant) -> Option<Instant> {
+        if self.hovered || self.is_dragging() {
+            return None;
+        }
+        if self.max_x() <= 0.0 && self.max_y() <= 0.0 {
+            return None; // nothing scrollable, no thumb to fade
+        }
+        let total = (theme::SCROLLBAR_FADE_HOLD_MS + theme::SCROLLBAR_FADE_MS) as u64;
+        let end = self.last_active + Duration::from_millis(total);
+        if now < end {
+            Some(now + Duration::from_millis(16))
+        } else {
+            None
+        }
     }
 }
 

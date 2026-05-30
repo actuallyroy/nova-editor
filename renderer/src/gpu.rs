@@ -65,6 +65,8 @@ pub struct GpuState {
     pub menubar: MenuBar,
     pub layout_btns: Vec<IconButton>,
     pub explorer_btns: Vec<IconButton>,
+    pub terminal_tabs: Vec<TextLabel>,   // panel header tab labels (stub)
+    pub terminal_btns: Vec<IconButton>,  // panel header right-side icons (stub)
     pub create_icons: [IconButton; 2],
     pub create_input: TextInput,
 }
@@ -163,6 +165,23 @@ impl GpuState {
             IconButton::new(&mut font_system, theme::ICON_REFRESH, ic, 16.0),
             IconButton::new(&mut font_system, theme::ICON_COLLAPSE_ALL, ic, 16.0),
         ];
+        // Panel-header stub widgets: tab labels + right-side icon buttons (VSCode).
+        let terminal_tabs = theme::PANEL_TABS
+            .iter()
+            .map(|label| {
+                let mut l = TextLabel::new(&mut font_system, 200.0, theme::TERMINAL_HEADER_H);
+                l.set(&mut font_system, label, theme::UI_FAMILY());
+                l
+            })
+            .collect();
+        let terminal_btns = vec![
+            IconButton::new(&mut font_system, theme::ICON_ADD, ic, 16.0),
+            IconButton::new(&mut font_system, theme::ICON_SPLIT_HORIZONTAL, ic, 16.0),
+            IconButton::new(&mut font_system, theme::ICON_TRASH, ic, 16.0),
+            IconButton::new(&mut font_system, theme::ICON_ELLIPSIS, ic, 16.0),
+            IconButton::new(&mut font_system, theme::ICON_CHEVRON_UP, ic, 16.0),
+            IconButton::new(&mut font_system, theme::ICON_CLOSE, ic, 16.0),
+        ];
         let create_icons = [
             IconButton::new(&mut font_system, theme::ICON_FILE, ic, 16.0),
             IconButton::new(&mut font_system, theme::ICON_FOLDER_CLOSED, ic, 16.0),
@@ -222,6 +241,8 @@ impl GpuState {
             menubar,
             layout_btns,
             explorer_btns,
+            terminal_tabs,
+            terminal_btns,
             create_icons,
             create_input,
         })

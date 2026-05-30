@@ -412,6 +412,10 @@ pub fn file_icon_color(name: &str) -> Color {
 // ---- Dimensions / fonts / glyphs (compile-time; themes never change these) ----
 
 pub const SCROLLBAR_WIDTH: f32 = 14.0;
+// Auto-hide overlay scrollbars: held fully visible for HOLD ms after the last
+// scroll/hover, then fade to invisible over FADE ms.
+pub const SCROLLBAR_FADE_HOLD_MS: f32 = 900.0;
+pub const SCROLLBAR_FADE_MS: f32 = 300.0;
 pub const DIALOG_BTN_H: f32 = 30.0;
 
 // Editor font metrics are runtime (driven by `editor.fontSize` / `editor.lineHeight`).
@@ -446,6 +450,11 @@ pub const ICON_ACCOUNT: char = '\u{eb99}';
 pub const ICON_SETTINGS: char = '\u{eb51}';
 pub const ICON_CHEVRON_DOWN: char = '\u{eab4}';
 pub const ICON_CHEVRON_RIGHT: char = '\u{eab6}';
+pub const ICON_CHEVRON_UP: char = '\u{eab7}';
+pub const ICON_ADD: char = '\u{ea60}';
+pub const ICON_SPLIT_HORIZONTAL: char = '\u{eb56}';
+pub const ICON_TRASH: char = '\u{ea81}';
+pub const ICON_ELLIPSIS: char = '\u{ea7c}';
 pub const ICON_NEW_FILE: char = '\u{ea7f}';
 pub const ICON_NEW_FOLDER: char = '\u{ea80}';
 pub const ICON_REFRESH: char = '\u{eb37}';
@@ -489,6 +498,11 @@ pub const FIND_BAR_HEIGHT: f32 = 36.0;
 pub const TERMINAL_HEIGHT: f32 = 240.0; // initial/default panel height
 pub const TERMINAL_MIN_HEIGHT: f32 = 80.0;
 pub const TERMINAL_MAX_HEIGHT: f32 = 700.0;
+pub const TERMINAL_HEADER_H: f32 = 32.0; // VSCode-style panel header (tabs + buttons)
+
+/// Bottom-panel tabs (VSCode layout). Index 3 (TERMINAL) is the active stub.
+pub const PANEL_TABS: &[&str] = &["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TERMINAL", "PORTS"];
+pub const PANEL_ACTIVE_TAB: usize = 3;
 pub const PALETTE_WIDTH: f32 = 560.0;
 pub const PALETTE_ROW_HEIGHT: f32 = 24.0;
 pub const PALETTE_INPUT_HEIGHT: f32 = 30.0;

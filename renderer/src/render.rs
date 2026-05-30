@@ -3,6 +3,8 @@
 // overlays). Extracted from main.rs so the entrypoint stays thin; reads App
 // fields directly (they're pub(crate)).
 
+use std::time::Instant;
+
 use anyhow::Result;
 use glyphon::{Attrs, Family, Resolution, Shaping, TextArea, TextBounds};
 use wgpu::{
@@ -20,6 +22,21 @@ use crate::{
     active_activity_idx, create_row_geometry, ext_filter_rect, ext_list_region, x_range_in_run,
     App, SidebarView, MENU_ACTIONS,
 };
+
+/// Left-to-right rects for the panel-header tab labels, sized to each label's
+/// measured width. Shared by the underline (quad phase) and the text (areas phase).
+fn panel_tab_rects(header: Rect, tabs: &[crate::widgets::TextLabel]) -> Vec<Rect> {
+    const PAD_L: f32 = 12.0;
+    const GAP: f32 = 18.0;
+    let mut x = header.x + PAD_L;
+    let mut out = Vec::with_capacity(tabs.len());
+    for t in tabs {
+        let w = t.width();
+        out.push(Rect { x, y: header.y, w, h: header.h });
+        x += w + GAP;
+    }
+    out
+}
 
 /// The full editor area (gutter + text columns) — where the document or the
 /// extension detail page is drawn.
@@ -58,17 +75,43 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
     }
 
-    // Keep the terminal grid sized to its panel.
+    let now = Instant::now();
+
+    // Keep the terminal grid sized to its content area (panel minus the header),
+    // and size the scroll viewport to that area + total content height.
     if let Some(panel) = layout.terminal_panel {
+        let content = crate::terminal_content(panel);
         let cell_w = app.terminal_cell_w;
         if let Some(t) = app.terminal.as_mut() {
-            let (rows, cols) = crate::terminal_grid_size(panel, cell_w);
+            let (rows, cols) = crate::terminal_grid_size(content, cell_w);
             let (dc, dr) = t.dims();
             if dc != cols || dr != rows {
                 t.resize(rows, cols);
                 app.terminal_dirty = true;
             }
         }
+        let total = app.terminal.as_ref().map(|t| t.total_lines()).unwrap_or(0);
+        let content_h = total as f32 * theme::LINE_HEIGHT();
+        app.terminal_scroll.set_metrics(content, (content.w, content_h));
+    }
+
+    // Size the scroll viewports for the extensions list + README detail page so
+    // their offsets are clamped and their thumbs are positioned this frame.
+    if app.sidebar_visible && app.sidebar_view == SidebarView::Extensions {
+        let region = ext_list_region(layout.tree_region());
+        let content_h = gpu.ui.ext_rows.content_height();
+        app.ext_scroll.set_metrics(region, (region.w, content_h));
+    }
+    if app.open_extension.is_some() {
+        let vp = crate::ext_detail::ExtensionDetail::body_viewport(editor_region(&layout));
+        let content_h = gpu.ui.ext_detail.body_content_height(&|k| gpu.media.size(k));
+        app.ext_detail_scroll.set_metrics(vp, (vp.w, content_h));
+    } else if let Some(d) = app.workspace.active_doc_mut() {
+        // Editor: size the document's scroll viewport (offset clamps here, thumbs
+        // position from these metrics). Content height uses logical lines + padding.
+        let content_h = d.rope.len_lines() as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD * 2.0;
+        let content_w = d.max_line_width() + theme::EDITOR_PAD * 2.0;
+        d.scroll.set_metrics(layout.editor_text, (content_w, content_h));
     }
 
     // ---- Update UI buffer texts (only on cache miss) ----
@@ -271,6 +314,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Keep Advanced shaping: Basic mis-advances glyphs and drops fallback
         // (box-drawing/powerline chars), which broke the monospace grid.
         if app.terminal_visible && app.terminal_dirty {
+            let top_line = (app.terminal_scroll.offset().1 / theme::LINE_HEIGHT()).round() as usize;
             if let (Some(t), Some(panel)) = (app.terminal.as_ref(), layout.terminal_panel) {
                 let to_attr = |c: [f32; 4]| {
                     Attrs::new().family(Family::Name(theme::MONO_FAMILY())).color(glyphon::Color::rgba(
@@ -281,7 +325,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     ))
                 };
                 let owned: Vec<(String, Attrs)> =
-                    t.visual_spans().into_iter().map(|(s, c)| (s, to_attr(c))).collect();
+                    t.visual_spans(top_line).into_iter().map(|(s, c)| (s, to_attr(c))).collect();
                 gpu.ui.terminal.set_size(fs, None, Some(panel.h + 200.0));
                 gpu.ui.terminal.set_rich_text(
                     fs,
@@ -505,7 +549,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Wrap-aware via the document's visual bounds (covers all wrapped rows).
         if crate::settings::render_line_highlight() {
             let (ltop, lh) = d.line_visual_bounds(cur_line);
-            let line_y = layout.editor_text.y + theme::EDITOR_PAD + ltop - d.scroll_y;
+            let line_y = layout.editor_text.y + theme::EDITOR_PAD + ltop - d.scroll_y();
             if let Some((qy, qh)) = clip_v(line_y, lh) {
                 bg_quads.push(Quad::new(editor_full.x, qy, editor_full.w, qh, theme::LINE_HIGHLIGHT()));
             }
@@ -515,7 +559,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let rulers = crate::settings::rulers();
         if rulers > 0 {
             let char_w = theme::FONT_SIZE() * 0.6; // monospace advance approximation
-            let rx = layout.editor_text.x + theme::EDITOR_PAD + rulers as f32 * char_w - d.scroll_x;
+            let rx = layout.editor_text.x + theme::EDITOR_PAD + rulers as f32 * char_w - d.scroll_x();
             if rx > layout.editor_text.x && rx < layout.editor_text.x + layout.editor_text.w {
                 bg_quads.push(Quad::new(rx, layout.editor_text.y, 1.0, layout.editor_text.h, theme::BORDER()));
             }
@@ -544,10 +588,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 };
                 let (xs, xe) = x_range_in_run(&run, col_start, col_end);
                 let w = (xe - xs).max(2.0);
-                let sel_y = layout.editor_text.y + theme::EDITOR_PAD + run.line_top - d.scroll_y;
+                let sel_y = layout.editor_text.y + theme::EDITOR_PAD + run.line_top - d.scroll_y();
                 if let Some((qy, qh)) = clip_v(sel_y, run.line_height) {
                     bg_quads.push(Quad::new(
-                        layout.editor_text.x + theme::EDITOR_PAD + xs - d.scroll_x,
+                        layout.editor_text.x + theme::EDITOR_PAD + xs - d.scroll_x(),
                         qy,
                         w,
                         qh,
@@ -560,10 +604,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Cursor (foreground so it sits over glyphs) — gated by blink.
         if app.cursor_blink_on {
             let (cx, cy, ch) = d.caret_visual();
-            let cursor_y = layout.editor_text.y + theme::EDITOR_PAD + cy - d.scroll_y;
+            let cursor_y = layout.editor_text.y + theme::EDITOR_PAD + cy - d.scroll_y();
             if let Some((qy, qh)) = clip_v(cursor_y, ch) {
                 fg_quads.push(Quad::new(
-                    layout.editor_text.x + theme::EDITOR_PAD + cx - d.scroll_x,
+                    layout.editor_text.x + theme::EDITOR_PAD + cx - d.scroll_x(),
                     qy,
                     theme::CURSOR_WIDTH,
                     qh,
@@ -572,73 +616,54 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
-        // Editor scrollbar thumb (over text).
-        let view = layout.editor_text.h;
-        let content = d.rope.len_lines() as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD * 2.0;
-        let track = Rect {
-            x: layout.editor_text.x + layout.editor_text.w - theme::SCROLLBAR_WIDTH,
-            y: layout.editor_text.y,
-            w: theme::SCROLLBAR_WIDTH,
-            h: layout.editor_text.h,
-        };
-        if let Some(th) = app.editor_scroll.thumb(track, content, view, d.scroll_y) {
-            let color = if app.hovered_scrollbar || app.editor_scroll.is_dragging() {
-                theme::SCROLLBAR_THUMB_HOVER()
-            } else {
-                theme::SCROLLBAR_THUMB()
-            };
-            fg_quads.push(th.quad(color));
-        }
-
-        // Horizontal scrollbar thumb.
-        let hview = layout.editor_text.w;
-        let hcontent = d.max_line_width() + theme::EDITOR_PAD * 2.0;
-        if hcontent > hview {
-            let htrack = Rect {
-                x: layout.editor_text.x,
-                y: layout.editor_text.y + layout.editor_text.h - theme::SCROLLBAR_WIDTH,
-                w: layout.editor_text.w - theme::SCROLLBAR_WIDTH,
-                h: theme::SCROLLBAR_WIDTH,
-            };
-            if let Some(th) = app.editor_hscroll.thumb(htrack, hcontent, hview, d.scroll_x) {
-                let color = if app.editor_hscroll.is_dragging() {
-                    theme::SCROLLBAR_THUMB_HOVER()
-                } else {
-                    theme::SCROLLBAR_THUMB()
-                };
-                fg_quads.push(th.quad(color));
-            }
-        }
+        // Editor scrollbars (auto-hide overlay; vertical + horizontal).
+        d.scroll.draw(now, &mut fg_quads);
     }
 
     // Terminal panel — background, top divider, and the block cursor (when focused).
     if let Some(panel) = layout.terminal_panel {
+        let content = crate::terminal_content(panel);
         bg_quads.push(panel.quad(theme::PANEL_BG()));
-        // Low-contrast divider on the editor/panel seam.
+        // Editor/panel seam divider (panel top) + header/content divider.
         bg_quads.push(Quad::new(panel.x, panel.y, panel.w, 1.0, theme::PANEL_BORDER()));
+        bg_quads.push(Quad::new(content.x, content.y - 1.0, content.w, 1.0, theme::PANEL_BORDER()));
+        // Active panel tab underline (text + buttons are drawn in the areas phase).
+        let header = Rect { x: panel.x, y: panel.y, w: panel.w, h: theme::TERMINAL_HEADER_H };
+        if let Some(r) = panel_tab_rects(header, &gpu.terminal_tabs).get(theme::PANEL_ACTIVE_TAB) {
+            bg_quads.push(Quad::new(r.x, header.y + header.h - 2.0, r.w, 2.0, [0.9, 0.9, 0.9, 1.0]));
+        }
         let char_w = app.terminal_cell_w;
         let line_h = theme::LINE_HEIGHT();
+        let top_line = (app.terminal_scroll.offset().1 / line_h).round() as usize;
+        let at_bottom = app.terminal_scroll.at_end();
         if let Some(t) = app.terminal.as_ref() {
             // Per-cell background fills (reverse-video cursor, colored TUIs) behind text.
-            for (row, c0, c1, bg) in t.bg_cells() {
-                let x = panel.x + 8.0 + c0 as f32 * char_w;
-                let y = panel.y + 4.0 + row as f32 * line_h;
-                if y + line_h <= panel.y + panel.h {
+            for (row, c0, c1, bg) in t.bg_cells(top_line) {
+                let x = content.x + 8.0 + c0 as f32 * char_w;
+                let y = content.y + 4.0 + row as f32 * line_h;
+                if y + line_h <= content.y + content.h {
                     bg_quads.push(Quad::new(x, y, (c1 - c0) as f32 * char_w, line_h, bg));
                 }
             }
             // Our own block cursor only when the shell shows the hardware cursor
-            // (DECTCEM), and not while scrolled up into history. TUIs hide it and
-            // draw their own via reverse video above.
-            if app.terminal_focused && t.cursor_visible() && !t.scrolled() {
+            // (DECTCEM), and only at the live bottom (not scrolled into history).
+            // TUIs hide it and draw their own via reverse video above.
+            if app.terminal_focused && t.cursor_visible() && at_bottom {
                 let (cc, cr) = t.cursor();
-                let cx = panel.x + 8.0 + cc as f32 * char_w;
-                let cy = panel.y + 4.0 + cr as f32 * line_h;
-                if cy + line_h <= panel.y + panel.h {
+                let cx = content.x + 8.0 + cc as f32 * char_w;
+                let cy = content.y + 4.0 + cr as f32 * line_h;
+                if cy + line_h <= content.y + content.h {
                     bg_quads.push(Quad::new(cx, cy, char_w.max(2.0), line_h, [0.6, 0.6, 0.6, 0.6]));
                 }
             }
         }
+        // Auto-hiding scrollback scrollbar (overlay).
+        app.terminal_scroll.draw(now, &mut fg_quads);
+    }
+
+    // README / extension detail page scrollbar (overlay over the editor area).
+    if app.open_extension.is_some() {
+        app.ext_detail_scroll.draw(now, &mut fg_quads);
     }
 
     // Status bar
@@ -870,7 +895,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let size_of = |k: &str| gpu.media.size(k);
         ui.ext_detail.draw_text(
             editor_region(&layout),
-            app.ext_detail_scroll,
+            app.ext_detail_scroll.offset().1,
             &size_of,
             &mut areas,
             &mut detail_img_rects,
@@ -881,13 +906,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Line numbers — clipped to the gutter region so they never bleed over
         // the tab strip when scrolled.
         ui.line_numbers
-            .draw(layout.gutter, d.scroll_y, theme::FG_GUTTER(), &mut areas);
+            .draw(layout.gutter, d.scroll_y(), theme::FG_GUTTER(), &mut areas);
 
         // Document text
         areas.push(TextArea {
             buffer: &d.buffer,
-            left: layout.editor_text.x + theme::EDITOR_PAD - d.scroll_x,
-            top: layout.editor_text.y + theme::EDITOR_PAD - d.scroll_y,
+            left: layout.editor_text.x + theme::EDITOR_PAD - d.scroll_x(),
+            top: layout.editor_text.y + theme::EDITOR_PAD - d.scroll_y(),
             scale: 1.0,
             bounds: TextBounds {
                 left: layout.editor_text.x as i32,
@@ -912,19 +937,37 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         ui.find_input.draw(*fb, 8.0, theme::FG_TEXT(), &mut areas);
     }
 
-    // Terminal grid text, clipped to its panel.
+    // Panel header (VSCode-style tabs + stub icon buttons) and terminal grid text.
     if app.terminal_visible {
         if let Some(panel) = layout.terminal_panel {
+            let content = crate::terminal_content(panel);
+            let header = Rect { x: panel.x, y: panel.y, w: panel.w, h: theme::TERMINAL_HEADER_H };
+            // Tab labels (active = bright, others dimmed).
+            for (i, r) in panel_tab_rects(header, &gpu.terminal_tabs).into_iter().enumerate() {
+                let color = if i == theme::PANEL_ACTIVE_TAB {
+                    theme::FG_ACTIVE()
+                } else {
+                    theme::FG_DIM()
+                };
+                gpu.terminal_tabs[i].push(r.x, r, color, &mut areas);
+            }
+            // Right-side icon buttons (visual stubs).
+            for (i, r) in crate::terminal_header_button_rects(panel).into_iter().enumerate() {
+                if let Some(b) = gpu.terminal_btns.get(i) {
+                    b.draw(r, theme::FG_DIM(), &mut areas);
+                }
+            }
+            // Terminal grid text, clipped to the content area below the header.
             areas.push(TextArea {
                 buffer: &ui.terminal,
-                left: panel.x + 8.0,
-                top: panel.y + 4.0,
+                left: content.x + 8.0,
+                top: content.y + 4.0,
                 scale: 1.0,
                 bounds: TextBounds {
-                    left: panel.x as i32,
-                    top: panel.y as i32,
-                    right: (panel.x + panel.w) as i32,
-                    bottom: (panel.y + panel.h) as i32,
+                    left: content.x as i32,
+                    top: content.y as i32,
+                    right: (content.x + content.w) as i32,
+                    bottom: (content.y + content.h) as i32,
                 },
                 default_color: theme::FG_TEXT(),
                 custom_glyphs: &[],
@@ -1012,7 +1055,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     if app.open_extension.is_some() {
         let region = editor_region(&layout);
         let clip = crate::ext_detail::ExtensionDetail::body_viewport(region);
-        let scroll = app.ext_detail_scroll;
+        let scroll = app.ext_detail_scroll.offset().1;
         // Link underlines (thin lines under each link fragment, in the link color).
         let lc = theme::FG_ACTIVE();
         let ul_color = [lc.r() as f32 / 255.0, lc.g() as f32 / 255.0, lc.b() as f32 / 255.0, 1.0];
@@ -1059,12 +1102,16 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         && app.sidebar_view == SidebarView::Extensions
     {
         let region = ext_list_region(layout.tree_region());
-        let scroll = app.ext_scroll;
+        let scroll = app.ext_scroll.offset().1;
         let mut eq: Vec<Quad> = Vec::new();
         gpu.ui.ext_rows.draw_quads(region, scroll, app.hovered_ext, &mut eq);
         let mut einst: Vec<icon::IconInstance> = Vec::new();
         gpu.ui.ext_rows.icon_instances(region, scroll, &mut einst);
-        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &eq, &[], (cfg_w, cfg_h));
+        // Scrollbar thumb as a foreground quad so it sits above the rows (clipped
+        // to the region by the pass scissor below).
+        let mut efg: Vec<Quad> = Vec::new();
+        app.ext_scroll.draw(now, &mut efg);
+        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &eq, &efg, (cfg_w, cfg_h));
         gpu.icon_atlas.prepare(&gpu.device, &gpu.queue, &einst, (cfg_w, cfg_h));
         let mut eareas: Vec<TextArea> = Vec::new();
         gpu.ui.ext_rows.draw_text(region, scroll, &mut eareas);
@@ -1103,6 +1150,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 gpu.quad_renderer.render_bg(&mut pass);
                 gpu.icon_atlas.render(&mut pass);
                 gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+                gpu.quad_renderer.render_fg(&mut pass); // scrollbar thumb on top
             }
         }
         gpu.queue.submit(Some(enc.finish()));

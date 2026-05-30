@@ -51,7 +51,7 @@ use extensions::{ExtKind, Extension, OpenExt};
 use marketplace::WorkerMsg;
 use gpu::GpuState;
 use layout::Layout;
-use widgets::{Axis, Rect, Scrollbar, Splitter};
+use widgets::{Rect, ScrollView, Splitter};
 use workspace::Workspace;
 
 
@@ -154,9 +154,6 @@ pub(crate) struct App {
     pub(crate) hovered_menu_item: Option<usize>,
     pub(crate) dialog: Option<DialogState>,
     pub(crate) skip_delete_confirm: bool,
-    pub(crate) editor_scroll: Scrollbar,
-    pub(crate) editor_hscroll: Scrollbar,
-    pub(crate) hovered_scrollbar: bool,
     pub(crate) last_click: Instant,
     pub(crate) last_click_pos: (f32, f32),
     pub(crate) click_count: u32,
@@ -166,7 +163,7 @@ pub(crate) struct App {
     pub(crate) text_drag: Option<InputId>, // active mouse drag-selection in a text input
     pub(crate) ext_filter_active: bool,
     pub(crate) ext_visible: Vec<usize>, // displayed row index -> index into the active source
-    pub(crate) ext_scroll: f32,
+    pub(crate) ext_scroll: ScrollView,
     pub(crate) ext_remote: Vec<marketplace::RemoteExt>, // current marketplace search results
     pub(crate) ext_showing_remote: bool,                // true while a search query is active
     pub(crate) search_gen: u64,                         // discards stale background search results
@@ -180,7 +177,7 @@ pub(crate) struct App {
     pub(crate) ext_img_dir: Option<PathBuf>,    // base dir for relative README images (local)
     pub(crate) ext_img_base: Option<String>,    // base URL for relative README images (remote)
     pub(crate) requested_images: HashSet<String>, // README image keys already fetched/loading
-    pub(crate) ext_detail_scroll: f32,          // detail-page body scroll offset
+    pub(crate) ext_detail_scroll: ScrollView,   // detail-page body scroll
     pub(crate) hovered_detail_tab: Option<ext_detail::DetailTab>,
     pub(crate) hovered_page_install: bool,
     pub(crate) pending_close: bool,
@@ -188,6 +185,7 @@ pub(crate) struct App {
     pub(crate) terminal_visible: bool,
     pub(crate) terminal_focused: bool,
     pub(crate) terminal_split: Splitter, // draggable panel height
+    pub(crate) terminal_scroll: ScrollView, // scrollback viewport (pinned to bottom)
     // Real monospace cell advance (px), measured from the shaped terminal buffer.
     // The cursor and grid sizing use this instead of an estimate so the block
     // cursor lands exactly on the glyph cell (no per-column drift).
@@ -241,9 +239,6 @@ impl App {
             hovered_menu_item: None,
             dialog: None,
             skip_delete_confirm: false,
-            editor_scroll: Scrollbar::new(Axis::Vertical),
-            editor_hscroll: Scrollbar::new(Axis::Horizontal),
-            hovered_scrollbar: false,
             last_click: Instant::now(),
             last_click_pos: (0.0, 0.0),
             click_count: 0,
@@ -253,7 +248,7 @@ impl App {
             text_drag: None,
             ext_filter_active: false,
             ext_visible: Vec::new(),
-            ext_scroll: 0.0,
+            ext_scroll: ScrollView::new(widgets::ScrollOpts::vertical()),
             ext_remote: Vec::new(),
             ext_showing_remote: false,
             search_gen: 0,
@@ -267,7 +262,7 @@ impl App {
             ext_img_dir: None,
             ext_img_base: None,
             requested_images: HashSet::new(),
-            ext_detail_scroll: 0.0,
+            ext_detail_scroll: ScrollView::new(widgets::ScrollOpts::vertical()),
             hovered_detail_tab: None,
             hovered_page_install: false,
             pending_close: false,
@@ -282,6 +277,11 @@ impl App {
             ),
             terminal_cell_w: theme::FONT_SIZE() * 0.6, // refined after first shape
             terminal_dirty: true,
+            terminal_scroll: ScrollView::new(widgets::ScrollOpts {
+                vertical: true,
+                horizontal: false,
+                stick_to_end: true,
+            }),
             cursor_blink_on: true,
             last_blink: Instant::now(),
             last_edit: Instant::now(),
@@ -433,7 +433,7 @@ impl App {
             && self.sidebar_view == SidebarView::Extensions
         {
             let region = ext_list_region(layout.tree_region());
-            let scroll = self.ext_scroll;
+            let scroll = self.ext_scroll.offset().1;
             self.gpu.as_ref().and_then(|g| g.ui.ext_rows.hit(region, scroll, p))
         } else {
             None
@@ -468,7 +468,7 @@ impl App {
         // Hovering a README link → pointer cursor.
         let over_detail_link = if self.open_extension.is_some() {
             let region = render::editor_region(&layout);
-            let scroll = self.ext_detail_scroll;
+            let scroll = self.ext_detail_scroll.offset().1;
             self.gpu
                 .as_ref()
                 .map(|g| {
@@ -482,14 +482,43 @@ impl App {
             false
         };
 
-        let over_scrollbar = self
-            .editor_scroll_metrics(&layout)
-            .and_then(|(t, c, v, s)| self.editor_scroll.thumb(t, c, v, s))
-            .map(|th| th.contains(p))
-            .unwrap_or(false);
-        if over_scrollbar != self.hovered_scrollbar {
-            self.hovered_scrollbar = over_scrollbar;
+        // Drive each scroll region's hover (for the auto-hide fade) and detect
+        // whether the pointer is over a scrollbar thumb (so the cursor stays the
+        // default arrow rather than the editor I-beam).
+        let mut over_scroll_thumb = false;
+        let editing = self.open_extension.is_none();
+        let ed_inside = editing && layout.editor_text.contains(p);
+        if let Some(d) = self.workspace.active_doc_mut() {
+            if d.scroll.hover(ed_inside) {
+                changed = true;
+            }
+            if ed_inside && d.scroll.cursor(p).is_some() {
+                over_scroll_thumb = true;
+            }
+        }
+        let term_inside = self.terminal_visible
+            && layout.terminal_panel.map_or(false, |pn| terminal_content(pn).contains(p));
+        if self.terminal_scroll.hover(term_inside) {
             changed = true;
+        }
+        if term_inside && self.terminal_scroll.cursor(p).is_some() {
+            over_scroll_thumb = true;
+        }
+        let ext_inside = self.sidebar_visible
+            && self.sidebar_view == SidebarView::Extensions
+            && ext_list_region(layout.tree_region()).contains(p);
+        if self.ext_scroll.hover(ext_inside) {
+            changed = true;
+        }
+        if ext_inside && self.ext_scroll.cursor(p).is_some() {
+            over_scroll_thumb = true;
+        }
+        let det_inside = self.open_extension.is_some() && layout.editor_text.contains(p);
+        if self.ext_detail_scroll.hover(det_inside) {
+            changed = true;
+        }
+        if det_inside && self.ext_detail_scroll.cursor(p).is_some() {
+            over_scroll_thumb = true;
         }
 
         // Resolve the cursor by asking whichever widget is under the pointer for
@@ -555,7 +584,7 @@ impl App {
                 CursorIcon::Pointer
             } else if new_tree.is_some() {
                 g.ui.sidebar.cursor()
-            } else if over_scrollbar {
+            } else if over_scroll_thumb {
                 CursorIcon::Default
             } else if layout.editor_text.contains(p) {
                 // Editor text area: I-beam (not a component).
@@ -624,42 +653,6 @@ impl App {
         )
     }
 
-    /// (track rect, content height, viewport height, scroll) for the editor
-    /// scrollbar, or None when the active doc fits (no scrollbar needed).
-    fn editor_scroll_metrics(&self, layout: &Layout) -> Option<(Rect, f32, f32, f32)> {
-        let d = self.workspace.active_doc()?;
-        let view = layout.editor_text.h;
-        let content = d.rope.len_lines() as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD * 2.0;
-        if content <= view {
-            return None;
-        }
-        let track = Rect {
-            x: layout.editor_text.x + layout.editor_text.w - theme::SCROLLBAR_WIDTH,
-            y: layout.editor_text.y,
-            w: theme::SCROLLBAR_WIDTH,
-            h: layout.editor_text.h,
-        };
-        Some((track, content, view, d.scroll_y))
-    }
-
-    /// (track, content width, viewport width, scroll_x) for the horizontal
-    /// scrollbar, or None when the widest line fits.
-    fn editor_hscroll_metrics(&self, layout: &Layout) -> Option<(Rect, f32, f32, f32)> {
-        let d = self.workspace.active_doc()?;
-        let view = layout.editor_text.w;
-        let content = d.max_line_width() + theme::EDITOR_PAD * 2.0;
-        if content <= view {
-            return None;
-        }
-        let track = Rect {
-            x: layout.editor_text.x,
-            y: layout.editor_text.y + layout.editor_text.h - theme::SCROLLBAR_WIDTH,
-            w: layout.editor_text.w - theme::SCROLLBAR_WIDTH,
-            h: theme::SCROLLBAR_WIDTH,
-        };
-        Some((track, content, view, d.scroll_x))
-    }
-
     fn ensure_cursor_visible(&mut self) {
         let layout = self.layout();
         let editor_inner_h = layout.editor_text.h - theme::EDITOR_PAD * 2.0;
@@ -672,10 +665,11 @@ impl App {
         let (line, _) = doc.head_line_col();
         let cursor_top = line as f32 * theme::LINE_HEIGHT();
         let cursor_bottom = cursor_top + theme::LINE_HEIGHT();
-        if cursor_top < doc.scroll_y {
-            doc.scroll_y = cursor_top.max(0.0);
-        } else if cursor_bottom > doc.scroll_y + editor_inner_h {
-            doc.scroll_y = cursor_bottom - editor_inner_h;
+        let scroll_y = doc.scroll_y();
+        if cursor_top < scroll_y {
+            doc.scroll.scroll_to_y(cursor_top.max(0.0));
+        } else if cursor_bottom > scroll_y + editor_inner_h {
+            doc.scroll.scroll_to_y(cursor_bottom - editor_inner_h);
         }
     }
 
@@ -683,6 +677,23 @@ impl App {
         if let Some(g) = self.gpu.as_ref() {
             g.window.request_redraw();
         }
+    }
+
+    /// Soonest time any auto-hide scrollbar needs a redraw to advance its fade,
+    /// across every region. None when nothing is fading.
+    fn scroll_next_wake(&self, now: Instant) -> Option<Instant> {
+        let mut earliest: Option<Instant> = None;
+        for w in [
+            self.workspace.active_doc().and_then(|d| d.scroll.next_wake(now)),
+            self.terminal_scroll.next_wake(now),
+            self.ext_scroll.next_wake(now),
+            self.ext_detail_scroll.next_wake(now),
+        ] {
+            if let Some(t) = w {
+                earliest = Some(earliest.map_or(t, |x| x.min(t)));
+            }
+        }
+        earliest
     }
 
     /// Total tabs in the strip: documents plus the open extension page (if any),
@@ -953,7 +964,7 @@ impl App {
         }
         gpu.ui.ext_rows.rebuild(&mut gpu.font_system, &specs);
         self.ext_visible = visible;
-        self.clamp_ext_scroll();
+        // Offset is re-clamped each frame by the ScrollView in render.
     }
 
     /// Kick off a background OpenVSX search for the current filter text.
@@ -981,7 +992,7 @@ impl App {
     /// remote fetch), resetting the page scroll.
     fn open_ext_detail(&mut self, which: OpenExt) {
         self.open_extension = Some(which);
-        self.ext_detail_scroll = 0.0;
+        self.ext_detail_scroll.scroll_to_y(0.0);
         self.ext_readme = None;
         self.ext_changelog = None;
         self.ext_img_dir = None;
@@ -1120,17 +1131,6 @@ impl App {
         None
     }
 
-    fn clamp_ext_scroll(&mut self) {
-        let layout = self.layout();
-        let region = ext_list_region(layout.tree_region());
-        let content = self
-            .gpu
-            .as_ref()
-            .map(|g| g.ui.ext_rows.content_height())
-            .unwrap_or(0.0);
-        let max = (content - region.h).max(0.0);
-        self.ext_scroll = self.ext_scroll.clamp(0.0, max);
-    }
 
     // ---- Modal dialogs ----
 
@@ -1342,7 +1342,7 @@ impl App {
         if self.terminal_visible && self.terminal.is_none() {
             let layout = self.layout();
             if let Some(panel) = layout.terminal_panel {
-                let (rows, cols) = terminal_grid_size(panel, self.terminal_cell_w);
+                let (rows, cols) = terminal_grid_size(terminal_content(panel), self.terminal_cell_w);
                 self.terminal = terminal::Terminal::spawn(rows, cols);
             }
         }
@@ -1516,6 +1516,34 @@ impl App {
             return;
         }
 
+        // Scrollbar thumb/track press — the scrollbar is an overlay, so it gets the
+        // click before any region handler (terminal focus, extension rows, editor).
+        // Guarded by visibility so a stale off-screen thumb can't grab the click.
+        if layout.palette.is_none() {
+            if self.terminal_visible && self.terminal_scroll.press((x, y)) {
+                self.terminal_dirty = true;
+                return;
+            }
+            if self.sidebar_visible
+                && self.sidebar_view == SidebarView::Extensions
+                && self.ext_scroll.press((x, y))
+            {
+                self.redraw();
+                return;
+            }
+            if self.open_extension.is_some() {
+                if self.ext_detail_scroll.press((x, y)) {
+                    self.redraw();
+                    return;
+                }
+            } else if let Some(d) = self.workspace.active_doc_mut() {
+                if d.scroll.press((x, y)) {
+                    self.redraw();
+                    return;
+                }
+            }
+        }
+
         // Terminal panel resize handle (top edge) — let its Splitter claim the
         // press before the focus/scroll handlers. The handle straddles the panel
         // edge, so check it ahead of the in-panel focus test below.
@@ -1527,14 +1555,27 @@ impl App {
             }
         }
 
-        // Terminal panel takes keyboard focus on click; clicking elsewhere releases it.
+        // Terminal panel: clicking the header runs a stubbed button hit-test; clicking
+        // the content area below takes keyboard focus. Clicking elsewhere releases it.
         if self.terminal_visible {
-            let in_term = layout.terminal_panel.map(|p| p.contains((x, y))).unwrap_or(false);
-            self.terminal_focused = in_term;
-            if in_term {
-                self.redraw();
-                return;
+            if let Some(panel) = layout.terminal_panel {
+                let content = terminal_content(panel);
+                if content.contains((x, y)) {
+                    self.terminal_focused = true;
+                    self.redraw();
+                    return;
+                }
+                // Header strip (above content): the close button hides the panel;
+                // the rest are visual stubs that just consume the click.
+                if panel.contains((x, y)) {
+                    let btns = terminal_header_button_rects(panel);
+                    if btns.last().map_or(false, |r| r.contains((x, y))) {
+                        self.toggle_terminal();
+                    }
+                    return;
+                }
             }
+            self.terminal_focused = false;
         }
 
         // Click inside a focused text input: position the caret and begin a
@@ -1681,7 +1722,7 @@ impl App {
             && layout.sidebar.contains((x, y))
         {
             let region = ext_list_region(layout.tree_region());
-            let scroll = self.ext_scroll;
+            let scroll = self.ext_scroll.offset().1;
             let hit = self.gpu.as_ref().and_then(|g| g.ui.ext_rows.hit(region, scroll, (x, y)));
             if let Some(i) = hit {
                 if let Some(&src) = self.ext_visible.get(i) {
@@ -1767,7 +1808,7 @@ impl App {
             let region = render::editor_region(&layout);
             if region.contains((x, y)) {
                 // A click on a README link opens it in the browser.
-                let scroll = self.ext_detail_scroll;
+                let scroll = self.ext_detail_scroll.offset().1;
                 let link = self.gpu.as_ref().and_then(|g| {
                     g.ui.ext_detail
                         .link_rects(region, scroll, &|k| g.media.size(k))
@@ -1784,7 +1825,7 @@ impl App {
                     if let Some(g) = self.gpu.as_mut() {
                         g.ui.ext_detail.set_tab(tab);
                     }
-                    self.ext_detail_scroll = 0.0; // each tab scrolls from the top
+                    self.ext_detail_scroll.scroll_to_y(0.0); // each tab scrolls from the top
                     self.redraw();
                     return;
                 }
@@ -1798,18 +1839,6 @@ impl App {
 
         if let Some(fb) = layout.find_bar.as_ref() {
             if fb.contains((x, y)) {
-                return;
-            }
-        }
-
-        // Editor scrollbar thumb drag (vertical then horizontal).
-        if let Some((track, content, view, scroll)) = self.editor_scroll_metrics(&layout) {
-            if self.editor_scroll.press((x, y), track, content, view, scroll) {
-                return;
-            }
-        }
-        if let Some((track, content, view, scroll)) = self.editor_hscroll_metrics(&layout) {
-            if self.editor_hscroll.press((x, y), track, content, view, scroll) {
                 return;
             }
         }
@@ -1862,29 +1891,35 @@ impl App {
                 return;
             }
         }
-        if self.editor_scroll.is_dragging() && self.mouse_pressed {
-            let layout = self.layout();
-            if let Some((track, content, view, _)) = self.editor_scroll_metrics(&layout) {
-                if let Some(s) = self.editor_scroll.drag((x, y), track, content, view) {
-                    if let Some(d) = self.workspace.active_doc_mut() {
-                        d.scroll_y = s;
-                    }
-                    self.redraw();
-                }
+        // Scrollbar thumb drags — one ScrollView is dragging at a time.
+        if self.terminal_scroll.is_dragging() && self.mouse_pressed {
+            if self.terminal_scroll.drag((x, y)) {
+                self.terminal_dirty = true;
+                self.redraw();
             }
             return;
         }
-        if self.editor_hscroll.is_dragging() && self.mouse_pressed {
-            let layout = self.layout();
-            if let Some((track, content, view, _)) = self.editor_hscroll_metrics(&layout) {
-                if let Some(s) = self.editor_hscroll.drag((x, y), track, content, view) {
-                    if let Some(d) = self.workspace.active_doc_mut() {
-                        d.scroll_x = s;
-                    }
-                    self.redraw();
-                }
+        if self.ext_scroll.is_dragging() && self.mouse_pressed {
+            if self.ext_scroll.drag((x, y)) {
+                self.redraw();
             }
             return;
+        }
+        if self.ext_detail_scroll.is_dragging() && self.mouse_pressed {
+            if self.ext_detail_scroll.drag((x, y)) {
+                self.redraw();
+            }
+            return;
+        }
+        if self.mouse_pressed {
+            if let Some(d) = self.workspace.active_doc_mut() {
+                if d.scroll.is_dragging() {
+                    if d.scroll.drag((x, y)) {
+                        self.redraw();
+                    }
+                    return;
+                }
+            }
         }
         if self.sidebar_split.is_dragging() && self.mouse_pressed {
             if self.sidebar_split.drag(x, theme::ACTIVITY_BAR_WIDTH) {
@@ -1911,8 +1946,12 @@ impl App {
         self.text_drag = None;
         self.sidebar_split.release();
         self.terminal_split.release();
-        self.editor_scroll.release();
-        self.editor_hscroll.release();
+        self.terminal_scroll.release();
+        self.ext_scroll.release();
+        self.ext_detail_scroll.release();
+        if let Some(d) = self.workspace.active_doc_mut() {
+            d.scroll.release();
+        }
     }
 
     fn editor_click(&mut self, x: f32, y: f32, extend: bool, layout: Layout) {
@@ -1922,8 +1961,8 @@ impl App {
         let Some(d) = self.workspace.active_doc_mut() else {
             return;
         };
-        let buf_x = x - (layout.editor_text.x + theme::EDITOR_PAD) + d.scroll_x;
-        let buf_y = y - (layout.editor_text.y + theme::EDITOR_PAD) + d.scroll_y;
+        let buf_x = x - (layout.editor_text.x + theme::EDITOR_PAD) + d.scroll_x();
+        let buf_y = y - (layout.editor_text.y + theme::EDITOR_PAD) + d.scroll_y();
         if let Some(hit) = d.buffer.hit(buf_x, buf_y) {
             let line = hit.line;
             if line < d.rope.len_lines() {
@@ -1940,72 +1979,56 @@ impl App {
     fn on_scroll(&mut self, dy: f32) {
         let layout = self.layout();
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
-        // Terminal scrollback: wheel up goes back in history. dy is in pixels;
-        // convert to whole lines. Consumes the event so the editor doesn't scroll.
+        // Terminal scrollback: the ScrollView owns the offset/clamp. Consumes the
+        // event so the editor doesn't scroll underneath.
         if self.terminal_visible {
             if let Some(panel) = layout.terminal_panel {
-                if panel.contains(p) {
-                    let lines = (dy / theme::LINE_HEIGHT()).round() as i64;
-                    if lines != 0 {
-                        if let Some(t) = self.terminal.as_mut() {
-                            if t.scroll_by_lines(lines) {
-                                self.terminal_dirty = true;
-                                self.redraw();
-                            }
-                        }
+                if terminal_content(panel).contains(p) {
+                    if self.terminal_scroll.on_wheel(0.0, dy) {
+                        self.terminal_dirty = true;
+                        self.redraw();
                     }
                     return;
                 }
             }
         }
-        // Extensions list scrolls when the cursor is over its region.
+        // Extensions list scrolls when the cursor is over its region. The
+        // ScrollView owns the offset/clamp (metrics are set each frame in render).
         if self.sidebar_visible && self.sidebar_view == SidebarView::Extensions {
             let region = ext_list_region(layout.tree_region());
             if region.contains(p) {
-                self.ext_scroll -= dy;
-                self.clamp_ext_scroll();
-                self.redraw();
+                if self.ext_scroll.on_wheel(0.0, dy) {
+                    self.redraw();
+                }
                 return;
             }
         }
         // The extension detail page (README) scrolls when it's open and the cursor
         // is over the editor area.
         if self.open_extension.is_some() && layout.editor_text.contains(p) {
-            let region = render::editor_region(&layout);
-            let max = self
-                .gpu
-                .as_ref()
-                .map(|g| {
-                    let ch = g.ui.ext_detail.body_content_height(&|k| g.media.size(k));
-                    (ch - ext_detail::ExtensionDetail::body_viewport_height(region)).max(0.0)
-                })
-                .unwrap_or(0.0);
-            self.ext_detail_scroll = (self.ext_detail_scroll - dy).clamp(0.0, max);
-            self.redraw();
+            if self.ext_detail_scroll.on_wheel(0.0, dy) {
+                self.redraw();
+            }
             return;
         }
         if !layout.editor_text.contains(p) {
             // Could route to sidebar tree, but flat list fits fine for now.
             return;
         }
-        let Some(d) = self.workspace.active_doc_mut() else {
-            return;
-        };
-        let total_lines = d.rope.len_lines() as f32;
-        let max = (total_lines * theme::LINE_HEIGHT() - (layout.editor_text.h - theme::EDITOR_PAD * 2.0)).max(0.0);
-        d.scroll_y = (d.scroll_y - dy).clamp(0.0, max);
-        self.redraw();
+        // Editor: the active document's ScrollView owns the offset/clamp (metrics
+        // are set each frame in render).
+        if let Some(d) = self.workspace.active_doc_mut() {
+            if d.scroll.on_wheel(0.0, dy) {
+                self.redraw();
+            }
+        }
     }
 
     fn on_scroll_h(&mut self, dx: f32) {
-        let layout = self.layout();
-        let Some((_, content, view, _)) = self.editor_hscroll_metrics(&layout) else {
-            return;
-        };
-        let max = (content - view).max(0.0);
         if let Some(d) = self.workspace.active_doc_mut() {
-            d.scroll_x = (d.scroll_x - dx).clamp(0.0, max);
-            self.redraw();
+            if d.scroll.on_wheel(dx, 0.0) {
+                self.redraw();
+            }
         }
     }
 
@@ -2050,6 +2073,9 @@ impl App {
                     if let Some(t) = self.terminal.as_mut() {
                         t.write(&bytes);
                     }
+                    // Typing snaps the view back to the live screen (bottom).
+                    self.terminal_scroll.scroll_to_end();
+                    self.terminal_dirty = true;
                     self.redraw();
                 }
                 return;
@@ -2161,7 +2187,7 @@ impl App {
                     if let Some(g) = self.gpu.as_mut() {
                         g.ui.ext_filter.clear(&mut g.font_system);
                     }
-                    self.ext_scroll = 0.0;
+                    self.ext_scroll.scroll_to_y(0.0);
                     self.rebuild_ext_rows();
                     self.redraw();
                     return;
@@ -2172,7 +2198,7 @@ impl App {
                 match consumed {
                     Some(changed) => {
                         if changed {
-                            self.ext_scroll = 0.0;
+                            self.ext_scroll.scroll_to_y(0.0);
                             self.trigger_search();
                             self.rebuild_ext_rows();
                         }
@@ -2551,9 +2577,41 @@ pub(crate) fn ext_filter_rect(tree: Rect) -> Rect {
 }
 
 /// Grid (rows, cols) that fits the terminal panel at the editor font metrics.
+/// Right-aligned icon-button rects in the terminal panel header, drawn left→right
+/// as: +, split, trash, …, maximize, close (6 buttons — matches `GpuState::terminal_btns`).
+pub(crate) const TERMINAL_HEADER_BTNS: usize = 6;
+pub(crate) fn terminal_header_button_rects(panel: Rect) -> Vec<Rect> {
+    let bw = 28.0;
+    let right = panel.x + panel.w - 8.0;
+    let start_x = right - TERMINAL_HEADER_BTNS as f32 * bw;
+    (0..TERMINAL_HEADER_BTNS)
+        .map(|i| Rect { x: start_x + i as f32 * bw, y: panel.y, w: bw, h: theme::TERMINAL_HEADER_H })
+        .collect()
+}
+
+/// The terminal text/grid area: the panel minus the header strip at its top.
+pub(crate) fn terminal_content(panel: Rect) -> Rect {
+    let h = theme::TERMINAL_HEADER_H;
+    Rect {
+        x: panel.x,
+        y: panel.y + h,
+        w: panel.w,
+        h: (panel.h - h).max(0.0),
+    }
+}
+
 /// Rows/cols that fit `panel` for a monospace cell of `char_w` px wide. Using the
 /// real measured advance keeps the PTY's column count matched to what's actually
 /// rendered, so TUIs (e.g. Claude Code) fill the panel and the cursor lands right.
+/// The earlier of two optional wake times (whichever is present).
+fn min_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
 pub(crate) fn terminal_grid_size(panel: Rect, char_w: f32) -> (usize, usize) {
     let char_w = char_w.max(1.0);
     let cols = (((panel.w - 16.0) / char_w) as usize).clamp(8, 400);
@@ -2673,6 +2731,12 @@ impl ApplicationHandler for App {
             return;
         }
 
+        // Auto-hide scrollbar fades: while any is fading, keep redrawing until done.
+        let scroll_wake = self.scroll_next_wake(now);
+        if scroll_wake.is_some() {
+            self.redraw();
+        }
+
         // Solid cursor (editor.cursorBlinking: "solid") stays on without blinking.
         if !settings::current().editor_cursor_blink {
             if !self.cursor_blink_on {
@@ -2682,10 +2746,11 @@ impl ApplicationHandler for App {
             // Without blink wakeups, still wake to run the auto-save idle timer.
             let autosave_pending = settings::auto_save()
                 && self.workspace.documents.iter().any(|d| d.dirty && d.path.is_some());
-            el.set_control_flow(if autosave_pending {
-                ControlFlow::WaitUntil(self.last_edit + Duration::from_millis(1100))
-            } else {
-                ControlFlow::Wait
+            let autosave_wake =
+                autosave_pending.then(|| self.last_edit + Duration::from_millis(1100));
+            el.set_control_flow(match min_instant(scroll_wake, autosave_wake) {
+                Some(w) => ControlFlow::WaitUntil(w),
+                None => ControlFlow::Wait,
             });
             return;
         }
@@ -2696,7 +2761,9 @@ impl ApplicationHandler for App {
             self.last_blink = now;
             self.redraw();
         }
-        el.set_control_flow(ControlFlow::WaitUntil(self.last_blink + interval));
+        let blink_wake = self.last_blink + interval;
+        let wake = scroll_wake.map_or(blink_wake, |s| s.min(blink_wake));
+        el.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 
     fn resumed(&mut self, el: &ActiveEventLoop) {

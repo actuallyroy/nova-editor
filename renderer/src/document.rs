@@ -8,6 +8,7 @@ use ropey::Rope;
 
 use crate::syntax::{self, Lang};
 use crate::theme;
+use crate::widgets::{ScrollOpts, ScrollView};
 
 #[derive(Clone, Copy)]
 pub struct Selection {
@@ -55,8 +56,7 @@ pub struct Document {
     pub name: String,
     pub rope: Rope,
     pub sel: Selection,
-    pub scroll_y: f32,
-    pub scroll_x: f32,
+    pub scroll: ScrollView, // owns the editor scroll offset + scrollbars (per tab)
     pub dirty: bool,
     history: Vec<Edit>,
     future: Vec<Edit>,
@@ -166,8 +166,7 @@ impl Document {
             name,
             rope: Rope::from_str(&contents),
             sel: Selection::caret(0),
-            scroll_y: 0.0,
-            scroll_x: 0.0,
+            scroll: ScrollView::new(ScrollOpts::both()),
             dirty: false,
             history: Vec::new(),
             future: Vec::new(),
@@ -204,6 +203,14 @@ impl Document {
             .layout_runs()
             .map(|r| r.line_w)
             .fold(0.0_f32, f32::max)
+    }
+
+    /// Current scroll offset (px). Backed by the document's `ScrollView`.
+    pub fn scroll_x(&self) -> f32 {
+        self.scroll.offset().0
+    }
+    pub fn scroll_y(&self) -> f32 {
+        self.scroll.offset().1
     }
 
     // ---- Visual geometry (single source of truth for wrap-aware positions). ----
