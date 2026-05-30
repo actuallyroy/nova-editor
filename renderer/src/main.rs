@@ -22,6 +22,7 @@ mod quad;
 mod render;
 mod settings;
 mod syntax;
+mod terminal;
 mod textmate;
 mod theme;
 mod widgets;
@@ -183,6 +184,10 @@ pub(crate) struct App {
     pub(crate) hovered_detail_tab: Option<ext_detail::DetailTab>,
     pub(crate) hovered_page_install: bool,
     pub(crate) pending_close: bool,
+    pub(crate) terminal: Option<terminal::Terminal>,
+    pub(crate) terminal_visible: bool,
+    pub(crate) terminal_focused: bool,
+    pub(crate) terminal_split: Splitter, // draggable panel height
     pub(crate) cursor_blink_on: bool,
     pub(crate) last_blink: Instant,
     pub(crate) last_edit: Instant,  // for files.autoSave (afterDelay)
@@ -208,6 +213,7 @@ impl App {
                 theme::SIDEBAR_WIDTH,
                 theme::SIDEBAR_MIN_WIDTH,
                 theme::SIDEBAR_MAX_WIDTH,
+                widgets::Axis::Horizontal,
             ),
             palette: PaletteState::new(),
             find: FindBarState::new(),
@@ -257,6 +263,15 @@ impl App {
             hovered_detail_tab: None,
             hovered_page_install: false,
             pending_close: false,
+            terminal: None,
+            terminal_visible: false,
+            terminal_focused: false,
+            terminal_split: Splitter::new(
+                theme::TERMINAL_HEIGHT,
+                theme::TERMINAL_MIN_HEIGHT,
+                theme::TERMINAL_MAX_HEIGHT,
+                widgets::Axis::Vertical,
+            ),
             cursor_blink_on: true,
             last_blink: Instant::now(),
             last_edit: Instant::now(),
@@ -349,7 +364,7 @@ impl App {
             changed = true;
         }
 
-        let tab_rects = layout.tab_rects(self.workspace.documents.len());
+        let tab_rects = layout.tab_rects(self.tab_count());
         let new_tab = tab_rects.iter().position(|r| r.contains(p));
         let new_close =
             new_tab.filter(|&i| Layout::tab_close_rect(tab_rects[i]).contains(p));
@@ -473,8 +488,14 @@ impl App {
         let over_handle = self.sidebar_visible
             && layout.palette.is_none()
             && self.sidebar_split.handle_rect(layout.sidebar).contains(p);
+        let over_term_handle = layout.palette.is_none()
+            && layout
+                .terminal_panel
+                .map_or(false, |panel| self.terminal_split.handle_rect(panel).contains(p));
         let new_cursor = if self.sidebar_split.is_dragging() || over_handle {
             self.sidebar_split.cursor()
+        } else if self.terminal_split.is_dragging() || over_term_handle {
+            self.terminal_split.cursor()
         } else if new_search {
             self.gpu
                 .as_ref()
@@ -589,6 +610,7 @@ impl App {
             self.sidebar_split.size(),
             self.find.active,
             self.palette.active,
+            if self.terminal_visible { Some(self.terminal_split.size()) } else { None },
         )
     }
 
@@ -651,6 +673,26 @@ impl App {
         if let Some(g) = self.gpu.as_ref() {
             g.window.request_redraw();
         }
+    }
+
+    /// Total tabs in the strip: documents plus the open extension page (if any),
+    /// which lives in its own tab after the documents (VSCode-style).
+    pub(crate) fn tab_count(&self) -> usize {
+        self.workspace.documents.len() + self.open_extension.is_some() as usize
+    }
+
+    /// The active tab index — the extension page when open, else the active document.
+    pub(crate) fn active_tab(&self) -> Option<usize> {
+        if self.open_extension.is_some() {
+            Some(self.workspace.documents.len())
+        } else {
+            self.workspace.active
+        }
+    }
+
+    /// The tab index of the open extension page, if any.
+    pub(crate) fn ext_tab_index(&self) -> Option<usize> {
+        self.open_extension.map(|_| self.workspace.documents.len())
     }
 
     /// Begin an inline New File / New Folder, scoped to the selected folder (or
@@ -1013,6 +1055,8 @@ impl App {
             Focus::Palette
         } else if self.find.active {
             Focus::Find
+        } else if self.terminal_visible && self.terminal_focused {
+            Focus::Terminal
         } else if self.ext_filter_active {
             Focus::ExtFilter
         } else {
@@ -1274,6 +1318,22 @@ impl App {
             }
             Command::OpenSettings => self.open_settings_file(settings::user_settings_path()),
             Command::OpenDefaultSettings => self.open_settings_file(settings::default_settings_path()),
+            Command::ToggleTerminal => self.toggle_terminal(),
+        }
+        self.redraw();
+    }
+
+    /// Show/hide the integrated terminal, spawning the shell on first open and
+    /// focusing it so keystrokes go to the shell.
+    fn toggle_terminal(&mut self) {
+        self.terminal_visible = !self.terminal_visible;
+        self.terminal_focused = self.terminal_visible;
+        if self.terminal_visible && self.terminal.is_none() {
+            let layout = self.layout();
+            if let Some(panel) = layout.terminal_panel {
+                let (rows, cols) = terminal_grid_size(panel);
+                self.terminal = terminal::Terminal::spawn(rows, cols);
+            }
         }
         self.redraw();
     }
@@ -1445,6 +1505,27 @@ impl App {
             return;
         }
 
+        // Terminal panel resize handle (top edge) — let its Splitter claim the
+        // press before the focus/scroll handlers. The handle straddles the panel
+        // edge, so check it ahead of the in-panel focus test below.
+        if layout.palette.is_none() {
+            if let Some(panel) = layout.terminal_panel {
+                if self.terminal_split.press((x, y), panel) {
+                    return;
+                }
+            }
+        }
+
+        // Terminal panel takes keyboard focus on click; clicking elsewhere releases it.
+        if self.terminal_visible {
+            let in_term = layout.terminal_panel.map(|p| p.contains((x, y))).unwrap_or(false);
+            self.terminal_focused = in_term;
+            if in_term {
+                self.redraw();
+                return;
+            }
+        }
+
         // Click inside a focused text input: position the caret and begin a
         // drag-selection. (Handled before other regions so it wins the click.)
         if let Some((id, rect, pad)) = self.focused_input_at(&layout, (x, y)) {
@@ -1484,12 +1565,16 @@ impl App {
                 self.open_palette();
                 return;
             }
-            // Layout toggles: primary sidebar is wired; panel/secondary are
-            // placeholders until those regions exist.
+            // Layout toggles: [0] primary (left) sidebar, [1] bottom panel
+            // (integrated terminal), [2] secondary sidebar is still a placeholder.
             if let Some(i) = layout.layout_btn_rects().iter().position(|r| r.contains((x, y))) {
-                if i == 0 {
-                    self.sidebar_visible = !self.sidebar_visible;
-                    self.redraw();
+                match i {
+                    0 => {
+                        self.sidebar_visible = !self.sidebar_visible;
+                        self.redraw();
+                    }
+                    1 => self.toggle_terminal(),
+                    _ => {}
                 }
                 return;
             }
@@ -1645,9 +1730,16 @@ impl App {
         }
 
         if layout.tab_strip.contains((x, y)) {
-            let tab_rects = layout.tab_rects(self.workspace.documents.len());
+            let tab_rects = layout.tab_rects(self.tab_count());
+            let ext_idx = self.ext_tab_index();
             if let Some(idx) = tab_rects.iter().position(|r| r.contains((x, y))) {
-                if Layout::tab_close_rect(tab_rects[idx]).contains((x, y)) {
+                let closing = Layout::tab_close_rect(tab_rects[idx]).contains((x, y));
+                if Some(idx) == ext_idx {
+                    // The extension page's own tab: close it, or it's already shown.
+                    if closing {
+                        self.open_extension = None;
+                    }
+                } else if closing {
                     self.request_close(idx);
                 } else {
                     self.workspace.switch_to(idx);
@@ -1789,6 +1881,14 @@ impl App {
             }
             return;
         }
+        if self.terminal_split.is_dragging() && self.mouse_pressed {
+            // Height is measured up from the panel's bottom edge (status bar top).
+            let origin = self.layout().status_bar.y;
+            if self.terminal_split.drag(y, origin) {
+                self.redraw();
+            }
+            return;
+        }
         if self.dragging_editor && self.mouse_pressed {
             let layout = self.layout();
             self.editor_click(x, y, true, layout);
@@ -1799,6 +1899,7 @@ impl App {
         self.dragging_editor = false;
         self.text_drag = None;
         self.sidebar_split.release();
+        self.terminal_split.release();
         self.editor_scroll.release();
         self.editor_hscroll.release();
     }
@@ -1900,11 +2001,30 @@ impl App {
             return;
         }
 
+        // Ctrl+` toggles the terminal from anywhere (incl. while it's focused).
+        if ctrl {
+            if let winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Backquote) =
+                event.physical_key
+            {
+                self.toggle_terminal();
+                return;
+            }
+        }
+
         // Single-authority keyboard dispatch: route to whatever element has focus.
         // Each non-editor arm fully handles its keys and returns, so nothing leaks.
         // The ExtFilter arm lets Ctrl-combos fall through to global shortcuts; the
         // Editor arm falls through to the shortcut + editor-key handling below.
         match self.focus() {
+            Focus::Terminal => {
+                if let Some(bytes) = translate_terminal_key(&event, ctrl, extend) {
+                    if let Some(t) = self.terminal.as_mut() {
+                        t.write(&bytes);
+                    }
+                    self.redraw();
+                }
+                return;
+            }
             Focus::Rename => {
                 match event.logical_key.as_ref() {
                     Key::Named(NamedKey::Escape) => {
@@ -2231,6 +2351,7 @@ enum Focus {
     Palette,   // command palette
     Find,      // find bar
     ExtFilter, // extensions search box
+    Terminal,  // integrated terminal
 }
 
 /// Open a URL in the OS default browser. Best-effort, http(s) only (so README
@@ -2244,6 +2365,57 @@ fn open_url(url: &str) {
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
     }
+}
+
+/// Translate a key event into the bytes a shell expects on its PTY input. Returns
+/// None for keys we don't forward.
+fn translate_terminal_key(event: &winit::event::KeyEvent, ctrl: bool, _shift: bool) -> Option<Vec<u8>> {
+    use winit::keyboard::{Key, NamedKey};
+    match event.logical_key.as_ref() {
+        Key::Named(NamedKey::Enter) => return Some(b"\r".to_vec()),
+        Key::Named(NamedKey::Backspace) => return Some(vec![0x7f]),
+        Key::Named(NamedKey::Tab) => return Some(b"\t".to_vec()),
+        Key::Named(NamedKey::Escape) => return Some(vec![0x1b]),
+        Key::Named(NamedKey::ArrowUp) => return Some(b"\x1b[A".to_vec()),
+        Key::Named(NamedKey::ArrowDown) => return Some(b"\x1b[B".to_vec()),
+        Key::Named(NamedKey::ArrowRight) => return Some(b"\x1b[C".to_vec()),
+        Key::Named(NamedKey::ArrowLeft) => return Some(b"\x1b[D".to_vec()),
+        Key::Named(NamedKey::Home) => return Some(b"\x1b[H".to_vec()),
+        Key::Named(NamedKey::End) => return Some(b"\x1b[F".to_vec()),
+        Key::Named(NamedKey::Delete) => return Some(b"\x1b[3~".to_vec()),
+        Key::Named(NamedKey::Space) => return Some(b" ".to_vec()),
+        _ => {}
+    }
+    // Ctrl+<letter> → control byte (Ctrl+C = 0x03, etc.).
+    if ctrl {
+        if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+            use winit::keyboard::KeyCode;
+            let letter = match code {
+                KeyCode::KeyA => Some(b'a'),
+                KeyCode::KeyB => Some(b'b'),
+                KeyCode::KeyC => Some(b'c'),
+                KeyCode::KeyD => Some(b'd'),
+                KeyCode::KeyE => Some(b'e'),
+                KeyCode::KeyK => Some(b'k'),
+                KeyCode::KeyL => Some(b'l'),
+                KeyCode::KeyU => Some(b'u'),
+                KeyCode::KeyZ => Some(b'z'),
+                _ => None,
+            };
+            if let Some(l) = letter {
+                return Some(vec![l & 0x1f]);
+            }
+        }
+        return None;
+    }
+    // Printable text.
+    if let Some(t) = event.text.as_ref() {
+        let s: &str = t;
+        if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
+            return Some(s.as_bytes().to_vec());
+        }
+    }
+    None
 }
 
 /// Identifies the text input under the cursor for click/drag selection.
@@ -2349,6 +2521,14 @@ pub(crate) fn ext_filter_rect(tree: Rect) -> Rect {
     Rect { x: tree.x + 10.0, y: tree.y + 8.0, w: tree.w - 20.0, h: 30.0 }
 }
 
+/// Grid (rows, cols) that fits the terminal panel at the editor font metrics.
+pub(crate) fn terminal_grid_size(panel: Rect) -> (usize, usize) {
+    let char_w = (theme::FONT_SIZE() * 0.6).max(1.0); // monospace advance approximation
+    let cols = (((panel.w - 16.0) / char_w) as usize).clamp(8, 400);
+    let rows = (((panel.h - 8.0) / theme::LINE_HEIGHT()) as usize).clamp(2, 200);
+    (rows, cols)
+}
+
 /// The scrollable extension-row list region (below the filter box).
 pub(crate) fn ext_list_region(tree: Rect) -> Rect {
     const STRIP: f32 = 46.0; // filter box + padding
@@ -2433,6 +2613,18 @@ impl ApplicationHandler for App {
             if saved {
                 self.redraw();
             }
+        }
+
+        // Integrated terminal: drain shell output, and keep ticking while it's open
+        // so new output appears promptly.
+        if self.terminal_visible {
+            let changed = self.terminal.as_mut().map(|t| t.poll()).unwrap_or(false);
+            if changed {
+                self.redraw();
+            }
+            self.cursor_blink_on = true;
+            el.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(30)));
+            return;
         }
 
         // If an animated GIF is visible on the detail page, tick ~20fps to play it.

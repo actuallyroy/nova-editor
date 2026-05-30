@@ -20,8 +20,8 @@ use crate::quad::QuadRenderer;
 use crate::theme;
 use crate::ext_detail::ExtensionDetail;
 use crate::widgets::{
-    make_ui_buffer, Dialog, ExtensionList, Gutter, IconButton, ListView, Menu, MenuBar,
-    SearchField, TextInput, TextLabel,
+    make_ui_buffer, make_ui_buffer_mono, Dialog, ExtensionList, Gutter, IconButton, ListView, Menu,
+    MenuBar, SearchField, TextInput, TextLabel,
 };
 
 pub struct UiBuffers {
@@ -40,6 +40,7 @@ pub struct UiBuffers {
     pub ext_rows: ExtensionList,
     pub ext_filter: TextInput, // extensions panel search/filter box
     pub ext_detail: ExtensionDetail,
+    pub terminal: Buffer, // integrated terminal grid text (monospace, rich)
 }
 
 pub struct GpuState {
@@ -196,6 +197,7 @@ impl GpuState {
             ext_rows: ExtensionList::new(),
             ext_filter: TextInput::new(&mut font_system, theme::SIDEBAR_WIDTH, 30.0),
             ext_detail: ExtensionDetail::new(&mut font_system),
+            terminal: make_ui_buffer_mono(&mut font_system, 4000.0, 4000.0),
         };
 
         Ok(Self {

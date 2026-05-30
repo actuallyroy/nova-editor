@@ -44,6 +44,8 @@ pub struct Theme {
     pub activity_bar_bg: [f32; 4],
     pub activity_bar_active: [f32; 4],
     pub sidebar_bg: [f32; 4],
+    pub panel_bg: [f32; 4],     // integrated terminal / bottom panel background
+    pub panel_border: [f32; 4], // low-contrast divider between editor and panel
     pub tab_bar_bg: [f32; 4],
     pub tab_inactive: [f32; 4],
     pub tab_active: [f32; 4],
@@ -116,6 +118,10 @@ impl Theme {
             activity_bar_bg: [0.129, 0.137, 0.141, 1.0],
             activity_bar_active: [1.0, 1.0, 1.0, 0.08],
             sidebar_bg: [0.102, 0.110, 0.114, 1.0],
+            // Slightly raised vs the editor (0.076) so the terminal reads as its
+            // own surface, and a soft translucent-white divider on top.
+            panel_bg: [0.094, 0.098, 0.102, 1.0],
+            panel_border: [1.0, 1.0, 1.0, 0.10],
             tab_bar_bg: [0.098, 0.102, 0.106, 1.0],
             tab_inactive: [0.098, 0.102, 0.106, 1.0],
             tab_active: [0.076, 0.078, 0.078, 1.0],
@@ -212,7 +218,17 @@ pub fn load_vscode(path: &std::path::Path) -> Option<Theme> {
                 a: 1.0,
             };
             t.tab_active = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0];
+            // Default the panel to a faintly-raised editor bg so it stays distinct
+            // on light themes too; panel.background overrides below if present.
+            t.panel_bg = [
+                (r as f32 / 255.0 + 0.02).min(1.0),
+                (g as f32 / 255.0 + 0.02).min(1.0),
+                (b as f32 / 255.0 + 0.02).min(1.0),
+                1.0,
+            ];
         }
+        quad("panel.background", &mut t.panel_bg);
+        quad("panel.border", &mut t.panel_border);
         quad("activityBar.background", &mut t.activity_bar_bg);
         quad("sideBar.background", &mut t.sidebar_bg);
         quad("editorGroupHeader.tabsBackground", &mut t.tab_bar_bg);
@@ -339,6 +355,8 @@ pub fn FIND_MATCH() -> [f32; 4] { current().read().unwrap().find_match }
 pub fn ACTIVITY_BAR_BG() -> [f32; 4] { current().read().unwrap().activity_bar_bg }
 pub fn ACTIVITY_BAR_ACTIVE() -> [f32; 4] { current().read().unwrap().activity_bar_active }
 pub fn SIDEBAR_BG() -> [f32; 4] { current().read().unwrap().sidebar_bg }
+pub fn PANEL_BG() -> [f32; 4] { current().read().unwrap().panel_bg }
+pub fn PANEL_BORDER() -> [f32; 4] { current().read().unwrap().panel_border }
 pub fn TAB_BAR_BG() -> [f32; 4] { current().read().unwrap().tab_bar_bg }
 pub fn TAB_INACTIVE() -> [f32; 4] { current().read().unwrap().tab_inactive }
 pub fn TAB_ACTIVE() -> [f32; 4] { current().read().unwrap().tab_active }
@@ -468,6 +486,9 @@ pub const SIDEBAR_HEADER_H: f32 = 30.0;
 pub const TAB_MIN_WIDTH: f32 = 120.0;
 pub const TAB_MAX_WIDTH: f32 = 220.0;
 pub const FIND_BAR_HEIGHT: f32 = 36.0;
+pub const TERMINAL_HEIGHT: f32 = 240.0; // initial/default panel height
+pub const TERMINAL_MIN_HEIGHT: f32 = 80.0;
+pub const TERMINAL_MAX_HEIGHT: f32 = 700.0;
 pub const PALETTE_WIDTH: f32 = 560.0;
 pub const PALETTE_ROW_HEIGHT: f32 = 24.0;
 pub const PALETTE_INPUT_HEIGHT: f32 = 30.0;

@@ -43,6 +43,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         app.sidebar_split.size(),
         app.find.active,
         app.palette.active,
+        if app.terminal_visible { Some(app.terminal_split.size()) } else { None },
     );
 
     // editor.wordWrap — wrap the active document to the editor width (or disable).
@@ -54,6 +55,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         };
         if let Some(d) = app.workspace.active_doc_mut() {
             d.set_wrap(&mut gpu.font_system, wrap);
+        }
+    }
+
+    // Keep the terminal grid sized to its panel.
+    if let Some(panel) = layout.terminal_panel {
+        if let Some(t) = app.terminal.as_mut() {
+            let (rows, cols) = crate::terminal_grid_size(panel);
+            let (dc, dr) = t.dims();
+            if dc != cols || dr != rows {
+                t.resize(rows, cols);
+            }
         }
     }
 
@@ -163,7 +175,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             );
         }
 
-        // Tab strip.
+        // Tab strip — one label per document, plus the open extension page as its
+        // own trailing tab ("Extension: <name>").
         let mut tab_text = String::new();
         for (i, d) in app.workspace.documents.iter().enumerate() {
             if i > 0 {
@@ -173,6 +186,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             if d.dirty {
                 tab_text.push_str(" •");
             }
+        }
+        if let Some(v) = open_ext_view(app.open_extension, &app.extensions, &app.ext_remote) {
+            if !app.workspace.documents.is_empty() {
+                tab_text.push('\n');
+            }
+            tab_text.push_str(&format!("Extension: {}", v.name));
         }
         if cache.tabs != tab_text {
             // Wide (no wrap) + tall so every tab's label line is shaped on its own
@@ -242,6 +261,30 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Line numbers — aligned to the active document's visual rows (wrap-aware).
         if let Some(d) = app.workspace.active.and_then(|i| app.workspace.documents.get(i)) {
             gpu.ui.line_numbers.set_from_buffer(fs, &d.buffer);
+        }
+
+        // Integrated terminal grid text (rich, monospace, per-cell colors).
+        if app.terminal_visible {
+            if let (Some(t), Some(panel)) = (app.terminal.as_ref(), layout.terminal_panel) {
+                let to_attr = |c: [f32; 4]| {
+                    Attrs::new().family(Family::Name(theme::MONO_FAMILY())).color(glyphon::Color::rgba(
+                        (c[0] * 255.0) as u8,
+                        (c[1] * 255.0) as u8,
+                        (c[2] * 255.0) as u8,
+                        255,
+                    ))
+                };
+                let owned: Vec<(String, Attrs)> =
+                    t.visual_spans().into_iter().map(|(s, c)| (s, to_attr(c))).collect();
+                gpu.ui.terminal.set_size(fs, None, Some(panel.h + 200.0));
+                gpu.ui.terminal.set_rich_text(
+                    fs,
+                    owned.iter().map(|(s, a)| (s.as_str(), *a)),
+                    to_attr([0.83, 0.83, 0.83, 1.0]),
+                    Shaping::Advanced,
+                );
+                gpu.ui.terminal.shape_until_scroll(fs, false);
+            }
         }
 
         // Palette list (the input owns its own text now).
@@ -356,11 +399,18 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
     // Tab strip bg
     bg_quads.push(layout.tab_strip.quad(theme::TAB_BAR_BG()));
-    // Per-tab styling — geometry from the single-source tab rects.
-    let n_tabs = app.workspace.documents.len();
+    // Per-tab styling — geometry from the single-source tab rects. (Inline rather
+    // than App::tab_count/active_tab so we don't borrow all of `app` while `gpu` is
+    // mutably held; the fields here are disjoint from `app.gpu`.)
+    let n_tabs = app.workspace.documents.len() + app.open_extension.is_some() as usize;
+    let active_tab = if app.open_extension.is_some() {
+        Some(app.workspace.documents.len())
+    } else {
+        app.workspace.active
+    };
     let tab_rects = layout.tab_rects(n_tabs);
     for (i, tab) in tab_rects.iter().enumerate() {
-        let active = app.workspace.active == Some(i);
+        let active = active_tab == Some(i);
         let hover = app.hovered_tab == Some(i);
         let fill = if active {
             theme::TAB_ACTIVE()
@@ -538,6 +588,24 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     theme::SCROLLBAR_THUMB()
                 };
                 fg_quads.push(th.quad(color));
+            }
+        }
+    }
+
+    // Terminal panel — background, top divider, and the block cursor (when focused).
+    if let Some(panel) = layout.terminal_panel {
+        bg_quads.push(panel.quad(theme::PANEL_BG()));
+        // Low-contrast divider on the editor/panel seam.
+        bg_quads.push(Quad::new(panel.x, panel.y, panel.w, 1.0, theme::PANEL_BORDER()));
+        if app.terminal_focused {
+            if let Some(t) = app.terminal.as_ref() {
+                let (cc, cr) = t.cursor();
+                let char_w = theme::FONT_SIZE() * 0.6;
+                let cx = panel.x + 8.0 + cc as f32 * char_w;
+                let cy = panel.y + 4.0 + cr as f32 * theme::LINE_HEIGHT();
+                if cy + theme::LINE_HEIGHT() <= panel.y + panel.h {
+                    bg_quads.push(Quad::new(cx, cy, char_w.max(2.0), theme::LINE_HEIGHT(), [0.6, 0.6, 0.6, 0.6]));
+                }
             }
         }
     }
@@ -728,7 +796,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // so each tab shows only its own label. Geometry comes from `tab_rects`.
     let tab_rects = layout.tab_rects(n_tabs);
     for (i, tab) in tab_rects.iter().enumerate() {
-        let active = app.workspace.active == Some(i);
+        let active = active_tab == Some(i);
         let line_top = i as f32 * theme::UI_LINE_HEIGHT;
         let color = if active {
             theme::TAB_FG_ACTIVE()
@@ -811,6 +879,26 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Find bar
     if let Some(fb) = layout.find_bar.as_ref() {
         ui.find_input.draw(*fb, 8.0, theme::FG_TEXT(), &mut areas);
+    }
+
+    // Terminal grid text, clipped to its panel.
+    if app.terminal_visible {
+        if let Some(panel) = layout.terminal_panel {
+            areas.push(TextArea {
+                buffer: &ui.terminal,
+                left: panel.x + 8.0,
+                top: panel.y + 4.0,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: panel.x as i32,
+                    top: panel.y as i32,
+                    right: (panel.x + panel.w) as i32,
+                    bottom: (panel.y + panel.h) as i32,
+                },
+                default_color: theme::FG_TEXT(),
+                custom_glyphs: &[],
+            });
+        }
     }
     } // end: palette closed
 

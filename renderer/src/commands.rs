@@ -12,6 +12,7 @@ pub enum Command {
     NewFile,
     OpenSettings,
     OpenDefaultSettings,
+    ToggleTerminal,
 }
 
 pub const COMMANDS: &[(Command, &str, &str)] = &[
@@ -25,6 +26,7 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::ToggleSidebar, "View: Toggle Sidebar", ""),
     (Command::OpenSettings, "Preferences: Open Settings (JSON)", ""),
     (Command::OpenDefaultSettings, "Preferences: Open Default Settings (JSON)", ""),
+    (Command::ToggleTerminal, "View: Toggle Terminal", "Ctrl+`"),
 ];
 
 pub struct PaletteState {

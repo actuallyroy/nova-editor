@@ -1117,26 +1117,32 @@ impl Scrollbar {
     }
 }
 
-/// A draggable divider that owns a resizable dimension (the sidebar width) plus
-/// its clamp range and drag state. Self-contained: the rest of the app just asks
-/// for `size()` and forwards mouse events; the handle geometry, hit-test, and
-/// clamping all live here.
+/// A draggable divider that owns a resizable dimension (e.g. the sidebar width
+/// or the terminal-panel height) plus its clamp range and drag state.
+/// Self-contained: the rest of the app just asks for `size()` and forwards mouse
+/// events; the handle geometry, hit-test, and clamping all live here.
+///
+/// Axis-aware so it's reused for both orientations:
+/// - `Axis::Horizontal` resizes a *width* — handle straddles the region's right
+///   edge, ColResize cursor, size grows as the cursor moves right (`cursor - origin`).
+/// - `Axis::Vertical` resizes a *height* — handle straddles the region's top
+///   edge, RowResize cursor, size grows as the cursor moves up (`origin - cursor`).
 pub struct Splitter {
     size: f32,
     min: f32,
     max: f32,
     dragging: bool,
-    cursor: CursorIcon,
+    axis: Axis,
 }
 
 impl Splitter {
-    pub fn new(size: f32, min: f32, max: f32) -> Self {
+    pub fn new(size: f32, min: f32, max: f32, axis: Axis) -> Self {
         Self {
             size,
             min,
             max,
             dragging: false,
-            cursor: CursorIcon::ColResize,
+            axis,
         }
     }
 
@@ -1145,21 +1151,33 @@ impl Splitter {
     }
 
     pub fn cursor(&self) -> CursorIcon {
-        self.cursor
+        match self.axis {
+            Axis::Horizontal => CursorIcon::ColResize,
+            Axis::Vertical => CursorIcon::RowResize,
+        }
     }
 
     pub fn is_dragging(&self) -> bool {
         self.dragging
     }
 
-    /// Thin hit strip straddling the right edge of `region`.
+    /// Thin hit strip straddling the active edge of `region`: the right edge for
+    /// a horizontal (width) splitter, the top edge for a vertical (height) one.
     pub fn handle_rect(&self, region: Rect) -> Rect {
         let half = theme::SIDEBAR_RESIZE_HANDLE * 0.5;
-        Rect {
-            x: region.x + region.w - half,
-            y: region.y,
-            w: theme::SIDEBAR_RESIZE_HANDLE,
-            h: region.h,
+        match self.axis {
+            Axis::Horizontal => Rect {
+                x: region.x + region.w - half,
+                y: region.y,
+                w: theme::SIDEBAR_RESIZE_HANDLE,
+                h: region.h,
+            },
+            Axis::Vertical => Rect {
+                x: region.x,
+                y: region.y - half,
+                w: region.w,
+                h: theme::SIDEBAR_RESIZE_HANDLE,
+            },
         }
     }
 
@@ -1173,13 +1191,19 @@ impl Splitter {
         }
     }
 
-    /// While dragging, set the size from the cursor; `origin` is the edge the
-    /// size is measured from. Returns true if the size changed.
+    /// While dragging, set the size from the cursor along this splitter's axis;
+    /// `origin` is the fixed edge the size is measured from (left edge for a
+    /// width splitter, bottom edge for a height splitter). Returns true if the
+    /// size changed.
     pub fn drag(&mut self, cursor: f32, origin: f32) -> bool {
         if !self.dragging {
             return false;
         }
-        let new = (cursor - origin).clamp(self.min, self.max);
+        let raw = match self.axis {
+            Axis::Horizontal => cursor - origin,
+            Axis::Vertical => origin - cursor,
+        };
+        let new = raw.clamp(self.min, self.max);
         if (new - self.size).abs() > 0.5 {
             self.size = new;
             true

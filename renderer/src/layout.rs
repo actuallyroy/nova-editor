@@ -14,6 +14,7 @@ pub struct Layout {
     pub editor_text: Rect,
     pub status_bar: Rect,
     pub find_bar: Option<Rect>,
+    pub terminal_panel: Option<Rect>,
     pub palette: Option<PaletteLayout>,
 }
 
@@ -31,6 +32,9 @@ impl Layout {
         sidebar_width: f32,
         find_active: bool,
         palette_active: bool,
+        // The terminal panel's requested height when open, or None when hidden.
+        // The actual height is clamped to leave room for the editor.
+        terminal_height: Option<f32>,
     ) -> Self {
         let tb = theme::TITLE_BAR_H;
         let title_bar = Rect { x: 0.0, y: 0.0, w, h: tb };
@@ -67,7 +71,22 @@ impl Layout {
             None
         };
         let editor_y = tb + tab_strip.h + if find_active { theme::FIND_BAR_HEIGHT } else { 0.0 };
-        let editor_h = (h - editor_y - theme::STATUS_BAR_HEIGHT).max(0.0);
+        // Terminal panel sits above the status bar; the editor shrinks to fit.
+        let term_h = match terminal_height {
+            Some(req) => req.min((h - editor_y - theme::STATUS_BAR_HEIGHT - 60.0).max(0.0)),
+            None => 0.0,
+        };
+        let editor_h = (h - editor_y - theme::STATUS_BAR_HEIGHT - term_h).max(0.0);
+        let terminal_panel = if term_h > 0.0 {
+            Some(Rect {
+                x: editor_left,
+                y: editor_y + editor_h,
+                w: (w - editor_left).max(0.0),
+                h: term_h,
+            })
+        } else {
+            None
+        };
         // editor.lineNumbers — collapse the gutter to 0 width when off.
         let gutter_w = if crate::settings::line_numbers() { theme::GUTTER_WIDTH } else { 0.0 };
         let gutter = Rect {
@@ -127,6 +146,7 @@ impl Layout {
             editor_text,
             status_bar,
             find_bar,
+            terminal_panel,
             palette,
         }
     }

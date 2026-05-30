@@ -18,7 +18,9 @@ fancy-regex = "0.18.0"
 glyphon = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 pollster = "0.4"
+portable-pty = "0.8"
 pulldown-cmark = { version = "0.13", default-features = false }
+vte = "0.13"
 ropey = "1.6"
 rquickjs = "0.8"
 serde_json = "1.0.150"
