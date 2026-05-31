@@ -382,6 +382,12 @@ pub fn ACTIVITY_ICON_FG() -> Color { current().read().unwrap().activity_icon_fg 
 pub fn ACTIVITY_ICON_ACTIVE() -> Color { current().read().unwrap().activity_icon_active }
 pub fn ICON_FOLDER_COLOR() -> Color { current().read().unwrap().icon_folder_color }
 pub fn ICON_FILE_COLOR() -> Color { current().read().unwrap().icon_file_color }
+// Diff view line backgrounds + hunk header (fixed; VSCode-like, not yet themeable).
+pub fn DIFF_ADD_BG() -> [f32; 4] { [0.18, 0.43, 0.24, 0.30] }
+pub fn DIFF_DEL_BG() -> [f32; 4] { [0.50, 0.18, 0.18, 0.30] }
+pub fn DIFF_HUNK_BG() -> [f32; 4] { [0.20, 0.30, 0.42, 0.28] }
+pub fn DIFF_FILLER_BG() -> [f32; 4] { [0.0, 0.0, 0.0, 0.22] } // "no line here" on a side
+pub fn DIFF_HUNK_FG() -> Color { Color::rgb(0x56, 0x9C, 0xD6) }
 pub fn TITLE_BAR_BG() -> [f32; 4] { current().read().unwrap().title_bar_bg }
 pub fn TITLE_FG() -> Color { current().read().unwrap().title_fg }
 pub fn SEARCH_BG() -> [f32; 4] { current().read().unwrap().search_bg }
@@ -453,6 +459,8 @@ pub const ICON_CHEVRON_DOWN: char = '\u{eab4}';
 pub const ICON_CHEVRON_RIGHT: char = '\u{eab6}';
 pub const ICON_CHEVRON_UP: char = '\u{eab7}';
 pub const ICON_ADD: char = '\u{ea60}';
+pub const ICON_REMOVE: char = '\u{eb3b}'; // codicon "remove" (−), used to unstage
+pub const ICON_DISCARD: char = '\u{eae2}'; // codicon "discard" (revert/undo arrow)
 pub const ICON_SPLIT_HORIZONTAL: char = '\u{eb56}';
 pub const ICON_TRASH: char = '\u{ea81}';
 pub const ICON_ELLIPSIS: char = '\u{ea7c}';

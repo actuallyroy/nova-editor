@@ -750,6 +750,32 @@ impl Gutter {
         self.last_rows = rows;
     }
 
+    /// Gutter numbers for one side of a side-by-side diff: the old number per row
+    /// when `left`, else the new number; blank on filler/hunk rows. Aligns 1:1 with
+    /// that side's diff buffer.
+    pub fn set_from_diff_side(&mut self, fs: &mut FontSystem, rows: &[crate::diff::DiffRow], left: bool) {
+        let mut s = String::with_capacity(rows.len() * 6);
+        for r in rows {
+            match if left { r.left } else { r.right } {
+                Some(v) => s.push_str(&format!("{:>4} \n", v)),
+                None => s.push_str("     \n"),
+            }
+        }
+        self.buffer.set_metrics(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+        self.buffer
+            .set_size(fs, None, Some(rows.len() as f32 * theme::LINE_HEIGHT() + 200.0));
+        self.buffer.set_text(
+            fs,
+            &s,
+            Attrs::new().family(Family::Name(theme::MONO_FAMILY())),
+            Shaping::Advanced,
+        );
+        self.buffer.shape_until_scroll(fs, false);
+        // Force the next set_from_buffer (for a normal doc) to rebuild.
+        self.last_rows = usize::MAX;
+        self.last_lines = usize::MAX;
+    }
+
     pub fn draw<'a>(&'a self, region: Rect, scroll_y: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
         areas.push(TextArea {
             buffer: &self.buffer,

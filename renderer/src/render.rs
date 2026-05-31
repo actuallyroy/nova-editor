@@ -67,6 +67,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         } else {
             None
         },
+        app.workspace.active_doc().map_or(false, |d| d.diff.is_some()),
     );
 
     // editor.wordWrap — wrap the active document to the editor width (or disable).
@@ -110,6 +111,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             ep.update(layout.tree_region());
         }
     }
+    if app.sidebar_visible && app.sidebar_view == SidebarView::SourceControl {
+        if let Some(scp) = app.source_control.as_mut() {
+            scp.update(&mut gpu.font_system, layout.tree_region());
+        }
+    }
     if app.detail.open_extension.is_some() {
         let vp = crate::ext_detail::ExtensionDetail::body_viewport(editor_region(&layout));
         let content_h = gpu.ui.ext_detail.body_content_height(&|k| gpu.media.size(k));
@@ -144,6 +150,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let header = match app.sidebar_view {
             SidebarView::Extensions => "EXTENSIONS",
             SidebarView::Search => "SEARCH",
+            SidebarView::SourceControl => "SOURCE CONTROL",
             SidebarView::Explorer => "EXPLORER",
         };
         gpu.ui.sidebar_header.set(fs, header, theme::UI_FAMILY());
@@ -313,7 +320,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
         // Line numbers — aligned to the active document's visual rows (wrap-aware).
         if let Some(d) = app.workspace.active.and_then(|i| app.workspace.documents.get(i)) {
-            gpu.ui.line_numbers.set_from_buffer(fs, &d.buffer);
+            match d.diff.as_ref() {
+                Some(diff) => {
+                    gpu.ui.line_numbers.set_from_diff_side(fs, &diff.rows, true);
+                    gpu.ui.line_numbers2.set_from_diff_side(fs, &diff.rows, false);
+                }
+                None => gpu.ui.line_numbers.set_from_buffer(fs, &d.buffer),
+            }
         }
 
         // Integrated terminal: one buffer per split pane, reshaped only when that
@@ -488,16 +501,22 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             if let Some(ep) = app.extensions_panel.as_ref() {
                 ep.draw_quads(layout.tree_region(), app.cursor_blink_on, &mut bg_quads, &mut fg_quads);
             }
-        } else if let Some(sp) = app.search.as_ref() {
+        } else if app.sidebar_view == SidebarView::Search {
             // Search (find-in-files) panel paints its own chrome, selection, caret,
             // match highlights, and scrollbar overlay.
-            sp.draw_quads(
-                layout.tree_region(),
-                app.cursor_blink_on,
-                std::time::Instant::now(),
-                &mut bg_quads,
-                &mut fg_quads,
-            );
+            if let Some(sp) = app.search.as_ref() {
+                sp.draw_quads(
+                    layout.tree_region(),
+                    app.cursor_blink_on,
+                    std::time::Instant::now(),
+                    &mut bg_quads,
+                    &mut fg_quads,
+                );
+            }
+        } else if app.sidebar_view == SidebarView::SourceControl {
+            if let Some(scp) = app.source_control.as_ref() {
+                scp.draw_quads(layout.tree_region(), app.cursor_blink_on, &mut bg_quads, &mut fg_quads);
+            }
         }
         // Subtle right border.
         bg_quads.push(Quad::new(
@@ -595,12 +614,43 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let (cur_line, _) = d.head_line_col();
         // Current line highlight across full editor width (editor.renderLineHighlight).
         // Wrap-aware via the document's visual bounds (covers all wrapped rows).
-        if crate::settings::render_line_highlight() {
+        // Skipped in diff views (the per-line add/del backgrounds carry the meaning).
+        if crate::settings::render_line_highlight() && d.diff.is_none() {
             let (ltop, lh) = d.line_visual_bounds(cur_line);
             let line_y = layout.editor_text.y + theme::EDITOR_PAD + ltop - d.scroll_y();
             if let Some((qy, qh)) = clip_v(line_y, lh) {
                 bg_quads.push(Quad::new(editor_full.x, qy, editor_full.w, qh, theme::LINE_HIGHLIGHT()));
             }
+        }
+
+        // Side-by-side diff: two panes over the full editor region — old (left) /
+        // new (right). Per-row backgrounds: del=red on left, add=green on right, the
+        // opposite side filled "no line" grey; hunk headers span both. Colours go on
+        // the text sub-rects only so the per-pane gutter numbers stay readable.
+        if let Some(diff) = d.diff.as_ref() {
+            use crate::diff::RowKind;
+            let half = (editor_full.w * 0.5).floor();
+            let (lt_x, lt_w) = (editor_full.x + theme::GUTTER_WIDTH, (half - theme::GUTTER_WIDTH).max(0.0));
+            let (rt_x, rt_w) = (editor_full.x + half + theme::GUTTER_WIDTH, (editor_full.w - half - theme::GUTTER_WIDTH).max(0.0));
+            for run in d.buffer.layout_runs() {
+                let Some(row) = diff.rows.get(run.line_i) else { continue };
+                let y = editor_full.y + theme::EDITOR_PAD + run.line_top - d.scroll_y();
+                let Some((qy, qh)) = clip_v(y, run.line_height) else { continue };
+                match row.kind {
+                    RowKind::Hunk => bg_quads.push(Quad::new(editor_full.x, qy, editor_full.w, qh, theme::DIFF_HUNK_BG())),
+                    RowKind::Del => {
+                        bg_quads.push(Quad::new(lt_x, qy, lt_w, qh, theme::DIFF_DEL_BG()));
+                        bg_quads.push(Quad::new(rt_x, qy, rt_w, qh, theme::DIFF_FILLER_BG()));
+                    }
+                    RowKind::Add => {
+                        bg_quads.push(Quad::new(lt_x, qy, lt_w, qh, theme::DIFF_FILLER_BG()));
+                        bg_quads.push(Quad::new(rt_x, qy, rt_w, qh, theme::DIFF_ADD_BG()));
+                    }
+                    RowKind::Context => {}
+                }
+            }
+            // Vertical divider between the two panes.
+            bg_quads.push(Quad::new(editor_full.x + half, editor_full.y, 1.0, editor_full.h, theme::BORDER()));
         }
 
         // editor.rulers — vertical guide line(s) at N monospace columns.
@@ -905,10 +955,16 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // Extensions filter box text (fixed). The scrollable row text is drawn
             // in the dedicated clipped pass after the main pass.
             ep.draw_text(tr, &mut areas);
-        } else if let Some(sp) = app.search.as_ref() {
+        } else if app.sidebar_view == SidebarView::Search {
             // Search panel renders its own text (inputs, toggle captions, results
             // list with bright file headers + chevrons).
-            sp.draw_text(tr, &mut areas);
+            if let Some(sp) = app.search.as_ref() {
+                sp.draw_text(tr, &mut areas);
+            }
+        } else if app.sidebar_view == SidebarView::SourceControl {
+            if let Some(scp) = app.source_control.as_ref() {
+                scp.draw_text(tr, &mut areas);
+            }
         }
     }
 
@@ -968,26 +1024,50 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     } else if let Some(i) = active_idx {
         let d = &app.workspace.documents[i];
 
-        // Line numbers — clipped to the gutter region so they never bleed over
-        // the tab strip when scrolled.
-        ui.line_numbers
-            .draw(layout.gutter, d.scroll_y(), theme::FG_GUTTER(), &mut areas);
+        if let Some(right) = d.diff_right.as_ref() {
+            // Side-by-side diff: two gutters + two text panes over the full region.
+            let full = editor_region(&layout);
+            let half = (full.w * 0.5).floor();
+            let g = theme::GUTTER_WIDTH;
+            let lg = Rect { x: full.x, y: full.y, w: g, h: full.h };
+            let lt = Rect { x: full.x + g, y: full.y, w: (half - g).max(0.0), h: full.h };
+            let rg = Rect { x: full.x + half, y: full.y, w: g, h: full.h };
+            let rt = Rect { x: full.x + half + g, y: full.y, w: (full.w - half - g).max(0.0), h: full.h };
+            ui.line_numbers.draw(lg, d.scroll_y(), theme::FG_GUTTER(), &mut areas);
+            ui.line_numbers2.draw(rg, d.scroll_y(), theme::FG_GUTTER(), &mut areas);
+            for (buf, r) in [(&d.buffer, lt), (right, rt)] {
+                areas.push(TextArea {
+                    buffer: buf,
+                    left: r.x + theme::EDITOR_PAD - d.scroll_x(),
+                    top: r.y + theme::EDITOR_PAD - d.scroll_y(),
+                    scale: 1.0,
+                    bounds: TextBounds { left: r.x as i32, top: r.y as i32, right: (r.x + r.w) as i32, bottom: (r.y + r.h) as i32 },
+                    default_color: theme::FG_TEXT(),
+                    custom_glyphs: &[],
+                });
+            }
+        } else {
+            // Line numbers — clipped to the gutter region so they never bleed over
+            // the tab strip when scrolled.
+            ui.line_numbers
+                .draw(layout.gutter, d.scroll_y(), theme::FG_GUTTER(), &mut areas);
 
-        // Document text
-        areas.push(TextArea {
-            buffer: &d.buffer,
-            left: layout.editor_text.x + theme::EDITOR_PAD - d.scroll_x(),
-            top: layout.editor_text.y + theme::EDITOR_PAD - d.scroll_y(),
-            scale: 1.0,
-            bounds: TextBounds {
-                left: layout.editor_text.x as i32,
-                top: layout.editor_text.y as i32,
-                right: (layout.editor_text.x + layout.editor_text.w) as i32,
-                bottom: (layout.editor_text.y + layout.editor_text.h) as i32,
-            },
-            default_color: theme::FG_TEXT(),
-            custom_glyphs: &[],
-        });
+            // Document text
+            areas.push(TextArea {
+                buffer: &d.buffer,
+                left: layout.editor_text.x + theme::EDITOR_PAD - d.scroll_x(),
+                top: layout.editor_text.y + theme::EDITOR_PAD - d.scroll_y(),
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: layout.editor_text.x as i32,
+                    top: layout.editor_text.y as i32,
+                    right: (layout.editor_text.x + layout.editor_text.w) as i32,
+                    bottom: (layout.editor_text.y + layout.editor_text.h) as i32,
+                },
+                default_color: theme::FG_TEXT(),
+                custom_glyphs: &[],
+            });
+        }
     }
 
     // Status bar — left: path; right: position/encoding/etc. Both via the

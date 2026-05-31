@@ -65,6 +65,9 @@ pub struct Document {
     ext: String,
     wrap_width: Option<f32>, // Some(w) when word-wrap is on (wraps at w px)
     eol: String,             // this file's actual line ending ("\n" or "\r\n")
+    pub read_only: bool,     // diff views (and future previews) reject edits
+    pub diff: Option<crate::diff::Diff>, // Some => this tab is a git diff view
+    pub diff_right: Option<Buffer>,      // side-by-side: `buffer` = old/left, this = new/right
 }
 
 fn apply_buffer_text(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, lines: usize, lang: Lang, ext: &str, wrap_width: Option<f32>) {
@@ -175,6 +178,41 @@ impl Document {
             ext,
             wrap_width,
             eol,
+            read_only: false,
+            diff: None,
+            diff_right: None,
+        }
+    }
+
+    /// A read-only side-by-side git diff view, shown as its own tab. The main
+    /// `buffer` holds the old (left) side, `diff_right` the new (right) side — both
+    /// plain (no syntax); `diff.rows` drives the per-row backgrounds and gutters.
+    pub fn new_diff(diff: crate::diff::Diff, fs: &mut FontSystem) -> Self {
+        let mk = |fs: &mut FontSystem, text: &str| {
+            let mut b = Buffer::new(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+            let display = text.replace('\r', "");
+            apply_buffer_text(&mut b, fs, &display, display.matches('\n').count(), Lang::PlainText, "", None);
+            b
+        };
+        let buffer = mk(fs, &diff.left_text);
+        let diff_right = Some(mk(fs, &diff.right_text));
+        Self {
+            path: None,
+            name: diff.title.clone(),
+            rope: Rope::from_str(&diff.left_text),
+            sel: Selection::caret(0),
+            scroll: ScrollView::new(ScrollOpts::both()),
+            dirty: false,
+            history: Vec::new(),
+            future: Vec::new(),
+            buffer,
+            lang: Lang::PlainText,
+            ext: String::new(),
+            wrap_width: None,
+            eol: "\n".to_string(),
+            read_only: true,
+            diff: Some(diff),
+            diff_right,
         }
     }
 
@@ -310,6 +348,9 @@ impl Document {
     }
 
     pub fn insert_str(&mut self, s: &str, fs: &mut FontSystem) {
+        if self.read_only {
+            return;
+        }
         if !self.sel.is_empty() {
             self.delete_selection_no_reshape();
         }
@@ -335,7 +376,7 @@ impl Document {
     }
 
     pub fn delete_selection(&mut self, fs: &mut FontSystem) {
-        if self.sel.is_empty() {
+        if self.read_only || self.sel.is_empty() {
             return;
         }
         self.delete_selection_no_reshape();
@@ -343,6 +384,9 @@ impl Document {
     }
 
     pub fn backspace(&mut self, fs: &mut FontSystem) {
+        if self.read_only {
+            return;
+        }
         if !self.sel.is_empty() {
             self.delete_selection(fs);
             return;
@@ -359,6 +403,9 @@ impl Document {
     }
 
     pub fn delete_forward(&mut self, fs: &mut FontSystem) {
+        if self.read_only {
+            return;
+        }
         if !self.sel.is_empty() {
             self.delete_selection(fs);
             return;
@@ -374,6 +421,9 @@ impl Document {
     }
 
     pub fn undo(&mut self, fs: &mut FontSystem) -> bool {
+        if self.read_only {
+            return false;
+        }
         let Some(edit) = self.history.pop() else {
             return false;
         };
@@ -394,6 +444,9 @@ impl Document {
     }
 
     pub fn redo(&mut self, fs: &mut FontSystem) -> bool {
+        if self.read_only {
+            return false;
+        }
         let Some(edit) = self.future.pop() else {
             return false;
         };
@@ -612,6 +665,9 @@ impl Document {
     }
 
     pub fn delete_word_back(&mut self, fs: &mut FontSystem) {
+        if self.read_only {
+            return;
+        }
         if !self.sel.is_empty() {
             self.delete_selection(fs);
             return;

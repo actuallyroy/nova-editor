@@ -32,6 +32,7 @@ pub struct UiBuffers {
     pub status: TextLabel,
     pub status_right: TextLabel,
     pub line_numbers: Gutter,
+    pub line_numbers2: Gutter, // right pane's gutter in a side-by-side diff
     pub palette_input: TextInput,
     pub palette_list: ListView,
     pub find_input: TextInput,
@@ -202,6 +203,7 @@ impl GpuState {
             status: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT),
             status_right: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT),
             line_numbers: Gutter::new(&mut font_system, theme::GUTTER_WIDTH),
+            line_numbers2: Gutter::new(&mut font_system, theme::GUTTER_WIDTH),
             palette_input: TextInput::new(&mut font_system, 600.0, theme::PALETTE_INPUT_HEIGHT),
             palette_list: ListView::new(
                 &mut font_system,

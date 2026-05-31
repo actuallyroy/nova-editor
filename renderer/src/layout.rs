@@ -36,6 +36,9 @@ impl Layout {
         // The terminal panel's requested height when open, or None when hidden.
         // The actual height is clamped to leave room for the editor.
         terminal_height: Option<f32>,
+        // True when the active tab is a diff view — the gutter widens to fit the
+        // dual old │ new line-number columns.
+        diff_gutter: bool,
     ) -> Self {
         let tb = theme::TITLE_BAR_H;
         let title_bar = Rect { x: 0.0, y: 0.0, w, h: tb };
@@ -90,8 +93,14 @@ impl Layout {
         } else {
             None
         };
-        // editor.lineNumbers — collapse the gutter to 0 width when off.
-        let gutter_w = if crate::settings::line_numbers() { theme::GUTTER_WIDTH } else { 0.0 };
+        // editor.lineNumbers — collapse the gutter to 0 width when off. Diff views
+        // also collapse it: the side-by-side renderer draws its own per-pane gutters
+        // across the full editor region.
+        let gutter_w = if !crate::settings::line_numbers() || diff_gutter {
+            0.0
+        } else {
+            theme::GUTTER_WIDTH
+        };
         let gutter = Rect {
             x: editor_left,
             y: editor_y,
@@ -331,6 +340,7 @@ pub(crate) fn active_activity_idx(sidebar_visible: bool, view: SidebarView) -> O
     match view {
         SidebarView::Explorer => Some(0),
         SidebarView::Search => Some(1),
+        SidebarView::SourceControl => Some(2),
         SidebarView::Extensions => Some(4),
     }
 }

@@ -161,6 +161,20 @@ impl Workspace {
         Ok(())
     }
 
+    /// Open (or re-focus) a read-only git diff tab. Diff tabs have no path, so they
+    /// dedup by title (re-opening the same file's diff re-uses its tab + refreshes it).
+    pub fn open_diff(&mut self, diff: crate::diff::Diff, fs: &mut FontSystem) {
+        for (i, d) in self.documents.iter_mut().enumerate() {
+            if d.diff.is_some() && d.name == diff.title {
+                *d = Document::new_diff(diff, fs);
+                self.active = Some(i);
+                return;
+            }
+        }
+        self.documents.push(Document::new_diff(diff, fs));
+        self.active = Some(self.documents.len() - 1);
+    }
+
     pub fn close_active(&mut self) {
         let Some(i) = self.active else {
             return;

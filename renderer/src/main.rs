@@ -8,12 +8,14 @@
 // status bar, command palette (Ctrl+Shift+P), find bar (Ctrl+F).
 
 mod commands;
+mod diff;
 mod document;
 mod ext_detail;
 mod ext_runtime;
 mod extensions;
 mod gpu;
 mod icon;
+mod git;
 mod layout;
 mod markdown;
 mod marketplace;
@@ -118,6 +120,7 @@ pub(crate) struct ContextMenu {
 pub(crate) enum SidebarView {
     Explorer,
     Search,
+    SourceControl,
     Extensions,
 }
 
@@ -172,6 +175,7 @@ pub(crate) struct App {
     // Find-in-files (Search view): a self-contained panel (built once the GPU/font
     // system exists, in `resumed`). Owns all of its own state + buffers.
     pub(crate) search: Option<ui::search_panel::SearchPanel>,
+    pub(crate) source_control: Option<ui::source_control_panel::SourceControlPanel>,
     pub(crate) extensions_panel: Option<ui::extensions_panel::ExtensionsPanel>,
     pub(crate) extensions: Vec<Extension>,
     pub(crate) text_drag: Option<InputId>, // active mouse drag-selection in a text input
@@ -239,6 +243,7 @@ impl App {
             last_click_pos: (0.0, 0.0),
             sidebar_view: SidebarView::Explorer,
             search: None, // built in `resumed` once the font system exists
+            source_control: None, // built in `resumed`
             extensions_panel: None, // built in `resumed`
             extensions: Vec::new(),
             text_drag: None,
@@ -476,6 +481,13 @@ impl App {
                 }
             }
         }
+        if self.sidebar_visible && self.sidebar_view == SidebarView::SourceControl {
+            if let Some(scp) = self.source_control.as_mut() {
+                if scp.hover(p, layout.tree_region()) {
+                    changed = true;
+                }
+            }
+        }
         let det_inside = self.detail.open_extension.is_some() && layout.editor_text.contains(p);
         if self.detail.ext_detail_scroll.hover(det_inside) {
             changed = true;
@@ -641,6 +653,7 @@ impl App {
             self.find.active,
             self.palette.active,
             self.terminal.panel_height(),
+            self.workspace.active_doc().map_or(false, |d| d.diff.is_some()),
         )
     }
 
@@ -824,11 +837,72 @@ impl App {
     }
 
 
+    /// Re-read git status into the Source Control panel and redraw.
+    fn refresh_source_control(&mut self) {
+        if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
+            scp.refresh(&mut g.font_system);
+        }
+        self.redraw();
+    }
+
     /// Apply a side-effect requested by a panel (centralizes cross-cutting actions).
     pub(crate) fn apply_intent(&mut self, intent: ui::Intent) {
         match intent {
             ui::Intent::OpenFile { path, line, col } => self.open_file_at(path, line, col),
+            ui::Intent::OpenDiff { path, staged, untracked } => {
+                if let Some(g) = self.gpu.as_mut() {
+                    let d = diff::compute(&self.cwd, &path, staged, untracked);
+                    self.workspace.open_diff(d, &mut g.font_system);
+                    self.detail.open_extension = None;
+                }
+                self.ensure_cursor_visible();
+                self.redraw();
+            }
             ui::Intent::OpenExtDetail(which) => self.open_ext_detail(which),
+            ui::Intent::GitCommit { msg, stage_all } => {
+                if git::commit(&self.cwd, &msg, stage_all) {
+                    if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
+                        scp.clear_message(&mut g.font_system);
+                        scp.refresh(&mut g.font_system);
+                    }
+                }
+                self.redraw();
+            }
+            ui::Intent::GitStage(path) => {
+                git::stage(&self.cwd, &path);
+                self.refresh_source_control();
+            }
+            ui::Intent::GitUnstage(path) => {
+                git::unstage(&self.cwd, &path);
+                self.refresh_source_control();
+            }
+            ui::Intent::GitDiscard { path, untracked } => {
+                git::discard(&self.cwd, &path, untracked);
+                self.refresh_source_control();
+            }
+            ui::Intent::GitStageAll => {
+                git::stage_all(&self.cwd);
+                self.refresh_source_control();
+            }
+            ui::Intent::GitUnstageAll => {
+                git::unstage_all(&self.cwd);
+                self.refresh_source_control();
+            }
+            ui::Intent::GitDiscardAll => {
+                git::discard_all(&self.cwd);
+                self.refresh_source_control();
+            }
+            ui::Intent::GitRefresh => self.refresh_source_control(),
+            ui::Intent::GitCommitPush { msg, stage_all } => {
+                if git::commit(&self.cwd, &msg, stage_all) {
+                    git::push(&self.cwd);
+                    if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
+                        scp.clear_message(&mut g.font_system);
+                        scp.refresh(&mut g.font_system);
+                    }
+                }
+                self.redraw();
+            }
             ui::Intent::ReloadOpenDocs => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     for d in self.workspace.documents.iter_mut() {
@@ -903,6 +977,8 @@ impl App {
             Focus::ExtFilter
         } else if self.search.as_ref().map_or(false, |sp| sp.focused()) {
             Focus::Search
+        } else if self.source_control.as_ref().map_or(false, |s| s.focused()) {
+            Focus::SourceControl
         } else {
             Focus::Editor
         }
@@ -1157,6 +1233,9 @@ impl App {
     fn open_folder(&mut self, folder: PathBuf) {
         self.cwd = folder.clone();
         self.terminal.set_cwd(folder.clone()); // new shells start in the new root
+        if let Some(scp) = self.source_control.as_mut() {
+            scp.set_root(folder.clone());
+        }
         self.workspace.tree = crate::workspace::FileTree::new(folder);
         self.sidebar_view = SidebarView::Explorer;
         self.sidebar_visible = true;
@@ -1500,6 +1579,7 @@ impl App {
             let view = match idx {
                 0 => Some(SidebarView::Explorer),
                 1 => Some(SidebarView::Search),
+                2 => Some(SidebarView::SourceControl),
                 4 => Some(SidebarView::Extensions),
                 _ => None,
             };
@@ -1507,6 +1587,11 @@ impl App {
                 if v == SidebarView::Extensions && self.extensions.is_empty() {
                     self.extensions = extensions::scan();
                     self.rebuild_ext_rows();
+                }
+                if v == SidebarView::SourceControl {
+                    if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
+                        scp.refresh(&mut g.font_system);
+                    }
                 }
                 if self.sidebar_view == v && self.sidebar_visible {
                     self.sidebar_visible = false;
@@ -1518,6 +1603,9 @@ impl App {
                 self.set_ext_filter_focus(false);
                 if let Some(sp) = self.search.as_mut() {
                     sp.set_unfocused();
+                }
+                if let Some(scp) = self.source_control.as_mut() {
+                    scp.set_unfocused();
                 }
                 self.redraw();
             }
@@ -1570,6 +1658,26 @@ impl App {
                     &mut intents,
                 );
             }
+            for i in intents {
+                self.apply_intent(i);
+            }
+            if consumed {
+                self.redraw();
+                return;
+            }
+        }
+
+        // Source Control: click a changed-file row to open it.
+        if self.sidebar_visible
+            && self.sidebar_view == SidebarView::SourceControl
+            && layout.sidebar.contains((x, y))
+        {
+            let region = layout.tree_region();
+            let mut intents = Vec::new();
+            let consumed = self
+                .source_control
+                .as_mut()
+                .map_or(false, |scp| scp.on_press((x, y), region, &mut intents));
             for i in intents {
                 self.apply_intent(i);
             }
@@ -1689,6 +1797,9 @@ impl App {
             self.set_ext_filter_focus(false); // editor takes keyboard focus
             if let Some(sp) = self.search.as_mut() {
                 sp.set_unfocused();
+            }
+            if let Some(scp) = self.source_control.as_mut() {
+                scp.set_unfocused();
             }
             let consecutive = self.register_click(x, y);
             let extend = self.mods.shift_key();
@@ -2046,6 +2157,21 @@ impl App {
                     return;
                 }
             }
+            Focus::SourceControl => {
+                // Route to the commit message box; Ctrl+Enter commits.
+                let mut intents = Vec::new();
+                let mut handled = false;
+                if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
+                    handled = scp.on_key(&event, ctrl, extend, &mut g.font_system, self.clipboard.as_mut(), &mut intents);
+                }
+                for i in intents {
+                    self.apply_intent(i);
+                }
+                if handled {
+                    self.redraw();
+                    return;
+                }
+            }
             Focus::Editor => {}
         }
 
@@ -2216,6 +2342,7 @@ enum Focus {
     Find,      // find bar
     ExtFilter, // extensions search box
     Search,    // find-in-files panel (owns its own query/replace boxes)
+    SourceControl, // git commit message box
     Terminal,  // integrated terminal
 }
 
@@ -2411,6 +2538,10 @@ impl ApplicationHandler for App {
                     self.search = Some(ui::search_panel::SearchPanel::new(&mut g.font_system));
                     self.extensions_panel =
                         Some(ui::extensions_panel::ExtensionsPanel::new(&mut g.font_system));
+                    self.source_control = Some(ui::source_control_panel::SourceControlPanel::new(
+                        &mut g.font_system,
+                        self.cwd.clone(),
+                    ));
                 }
                 self.open_initial();
             }
