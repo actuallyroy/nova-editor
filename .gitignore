@@ -7,3 +7,4 @@ Cargo.lock.bak
 *.stackdump
 windows-mcp-issues.txt
 Cargo.lock
+nova-perf.log

@@ -68,6 +68,9 @@ pub struct Document {
     pub read_only: bool,     // diff views (and future previews) reject edits
     pub diff: Option<crate::diff::Diff>, // Some => this tab is a git diff view
     pub diff_right: Option<Buffer>,      // side-by-side: `buffer` = old/left, this = new/right
+    pub image: Option<String>,           // Some(media key) => this tab renders an image
+    pub image_scale: Option<f32>,        // None = fit-to-window; Some(s) = absolute scale
+    pub image_pan: (f32, f32),           // pan offset (px) from centered position
 }
 
 fn apply_buffer_text(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, lines: usize, lang: Lang, ext: &str, wrap_width: Option<f32>) {
@@ -181,7 +184,70 @@ impl Document {
             read_only: false,
             diff: None,
             diff_right: None,
+            image: None,
+            image_scale: None,
+            image_pan: (0.0, 0.0),
         }
+    }
+
+    /// A read-only image tab. The picture itself is uploaded to `gpu.media` under
+    /// `key` and drawn in the editor region by the renderer; this Document just
+    /// carries the key + name so it behaves like a normal (read-only) tab.
+    pub fn new_image(path: PathBuf, key: String, fs: &mut FontSystem) -> Self {
+        let name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Image".into());
+        let buffer = Buffer::new(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+        Self {
+            path: Some(path),
+            name,
+            rope: Rope::new(),
+            sel: Selection::caret(0),
+            scroll: ScrollView::new(ScrollOpts::both()),
+            dirty: false,
+            history: Vec::new(),
+            future: Vec::new(),
+            buffer,
+            lang: Lang::PlainText,
+            ext: String::new(),
+            wrap_width: None,
+            eol: "\n".to_string(),
+            read_only: true,
+            diff: None,
+            diff_right: None,
+            image: Some(key),
+            image_scale: None,
+            image_pan: (0.0, 0.0),
+        }
+    }
+
+    /// Zoom the image so the pixel under `cursor` stays fixed (cursor-centred).
+    pub fn image_zoom_at(&mut self, cursor: (f32, f32), region: crate::widgets::Rect, iw: f32, ih: f32, factor: f32) {
+        let fit = crate::render::image_fit_scale(iw, ih, region);
+        let old = self.image_scale.unwrap_or(fit);
+        let new = (old * factor).clamp(0.02, 64.0);
+        let (cx, cy) = (region.x + region.w * 0.5, region.y + region.h * 0.5);
+        let t_old = (cx - iw * old * 0.5 + self.image_pan.0, cy - ih * old * 0.5 + self.image_pan.1);
+        let img = ((cursor.0 - t_old.0) / old, (cursor.1 - t_old.1) / old);
+        let t_new = (cursor.0 - img.0 * new, cursor.1 - img.1 * new);
+        self.image_pan = (t_new.0 - (cx - iw * new * 0.5), t_new.1 - (cy - ih * new * 0.5));
+        self.image_scale = Some(new);
+    }
+
+    pub fn image_fit(&mut self) {
+        self.image_scale = None;
+        self.image_pan = (0.0, 0.0);
+    }
+
+    pub fn image_actual(&mut self) {
+        self.image_scale = Some(1.0);
+        self.image_pan = (0.0, 0.0);
+    }
+
+    pub fn image_pan_by(&mut self, dx: f32, dy: f32) {
+        self.image_pan.0 += dx;
+        self.image_pan.1 += dy;
     }
 
     /// A read-only side-by-side git diff view, shown as its own tab. The main
@@ -213,6 +279,9 @@ impl Document {
             read_only: true,
             diff: Some(diff),
             diff_right,
+            image: None,
+            image_scale: None,
+            image_pan: (0.0, 0.0),
         }
     }
 
@@ -301,9 +370,13 @@ impl Document {
     }
 
     pub fn reshape(&mut self, fs: &mut FontSystem) {
+        let t0 = std::time::Instant::now();
         let text = self.rope.to_string().replace('\r', "");
         let lines = self.rope.len_lines();
+        let t_str = t0.elapsed();
+        let t1 = std::time::Instant::now();
         apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, &self.ext, self.wrap_width);
+        crate::perf::log(&format!("reshape({lines} lines): to_string {:?}, highlight+shape {:?}", t_str, t1.elapsed()));
     }
 
     /// Replace the entire document from an external on-disk change (e.g. Replace

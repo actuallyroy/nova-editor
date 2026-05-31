@@ -297,6 +297,30 @@ pub struct DecodedFrame {
     pub delay_ms: u32,
 }
 
+/// Decode a still image at (near-)native resolution for the image viewer, so
+/// zooming in stays sharp. Only clamps to the GPU's max texture dimension. GIFs
+/// fall back to the downscaled `decode` (animation matters more than crispness).
+pub fn decode_full(bytes: &[u8]) -> Vec<DecodedFrame> {
+    const MAX_TEX: u32 = 8192; // safe across GPUs
+    if bytes.starts_with(b"GIF8") {
+        return decode(bytes);
+    }
+    if let Ok(img) = image::load_from_memory(bytes) {
+        let mut rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        if w > MAX_TEX || h > MAX_TEX {
+            let scale = (MAX_TEX as f32 / w.max(h) as f32).min(1.0);
+            let (nw, nh) = ((w as f32 * scale) as u32, (h as f32 * scale) as u32);
+            rgba = image::imageops::resize(&rgba, nw.max(1), nh.max(1), image::imageops::FilterType::Triangle);
+        }
+        let (w, h) = rgba.dimensions();
+        if w > 0 && h > 0 {
+            return vec![DecodedFrame { rgba: rgba.into_raw(), w, h, delay_ms: 0 }];
+        }
+    }
+    Vec::new()
+}
+
 /// Decode image bytes into frames OFF the main thread. Animated GIFs yield all
 /// frames (capped) with delays; PNG/JPG yield one. Large frames are downscaled so
 /// a multi-frame GIF doesn't blow up GPU memory or upload time.

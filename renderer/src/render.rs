@@ -49,6 +49,39 @@ pub(crate) fn editor_region(layout: &Layout) -> Rect {
     }
 }
 
+/// Scale that fits a `iw`x`ih` image inside `region` (16px padding), never upscaling.
+pub(crate) fn image_fit_scale(iw: f32, ih: f32, region: Rect) -> f32 {
+    let pad = 16.0;
+    let aw = (region.w - pad * 2.0).max(1.0);
+    let ah = (region.h - pad * 2.0).max(1.0);
+    (aw / iw).min(ah / ih).min(1.0)
+}
+
+/// Displayed image rect for the given `scale` + `pan`, centred in `region`.
+pub(crate) fn image_rect(iw: f32, ih: f32, region: Rect, scale: f32, pan: (f32, f32)) -> Rect {
+    let (w, h) = (iw * scale, ih * scale);
+    let cx = region.x + region.w * 0.5;
+    let cy = region.y + region.h * 0.5;
+    Rect { x: cx - w * 0.5 + pan.0, y: cy - h * 0.5 + pan.1, w, h }
+}
+
+/// Zoom-control overlay cells [zoom_out, percent, zoom_in, fit], a pill at the
+/// bottom-centre of the image region.
+pub(crate) fn image_ctrl_cells(region: Rect) -> [Rect; 4] {
+    let h = 30.0;
+    let widths = [38.0, 64.0, 38.0, 50.0];
+    let total: f32 = widths.iter().sum();
+    let x0 = region.x + (region.w - total) * 0.5;
+    let y = region.y + region.h - h - 16.0;
+    let mut x = x0;
+    let mut out = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 4];
+    for (i, w) in widths.iter().enumerate() {
+        out[i] = Rect { x, y, w: *w, h };
+        x += *w;
+    }
+    out
+}
+
 pub(crate) fn render(app: &mut App) -> Result<()> {
     let Some(gpu) = app.gpu.as_mut() else {
         return Ok(());
@@ -318,6 +351,27 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.ui.status.set(fs, &status_text, theme::UI_FAMILY());
         gpu.ui.status_right.set(fs, &status_right_text, theme::UI_FAMILY());
 
+        // Source Control change-count badge text (capped at 99+).
+        let scm_count = app.source_control.as_ref().map_or(0, |s| s.change_count());
+        if scm_count > 0 {
+            let s = if scm_count > 99 { "99+".to_string() } else { scm_count.to_string() };
+            gpu.ui.scm_badge.set(fs, &s, theme::UI_FAMILY());
+        }
+
+        // Image zoom percentage label (for the zoom-control overlay).
+        if let Some((key, scale_opt)) = app
+            .workspace
+            .active
+            .and_then(|i| app.workspace.documents.get(i))
+            .and_then(|d| d.image.as_ref().map(|k| (k.clone(), d.image_scale)))
+        {
+            if let Some((iw, ih)) = gpu.media.size(&key) {
+                let region = editor_region(&layout);
+                let eff = scale_opt.unwrap_or_else(|| image_fit_scale(iw, ih, region));
+                gpu.ui.img_pct.set(fs, &format!("{}%", (eff * 100.0).round() as i32), theme::UI_FAMILY());
+            }
+        }
+
         // Line numbers — aligned to the active document's visual rows (wrap-aware).
         if let Some(d) = app.workspace.active.and_then(|i| app.workspace.documents.get(i)) {
             match d.diff.as_ref() {
@@ -459,6 +513,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     if let Some(ai) = active_activity_idx(app.sidebar_visible, app.sidebar_view) {
         let r = act_rects[ai];
         bg_quads.push(Quad::new(r.x, r.y, 2.0, r.h, [1.0, 1.0, 1.0, 0.85]));
+    }
+    // Source Control change-count badge (blue pill, bottom-right of the SCM icon).
+    let scm_count = app.source_control.as_ref().map_or(0, |s| s.change_count());
+    if scm_count > 0 {
+        if let Some(r) = act_rects.get(2) {
+            let bw = gpu.ui.scm_badge.width() + 8.0;
+            let bh = 16.0;
+            let bx = r.x + r.w - bw - 2.0;
+            let by = r.y + r.h - bh - 8.0;
+            bg_quads.push(Rect { x: bx, y: by, w: bw, h: bh }.rounded_quad(theme::BADGE_BG(), bh * 0.5));
+        }
     }
     // Sidebar bg
     if app.sidebar_visible {
@@ -699,8 +764,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
-        // Cursor (foreground so it sits over glyphs) — gated by blink.
-        if app.cursor_blink_on {
+        // Cursor (foreground so it sits over glyphs) — gated by blink. Read-only
+        // tabs (images, diffs) have nothing to edit, so they show no caret.
+        if app.cursor_blink_on && !d.read_only {
             let (cx, cy, ch) = d.caret_visual();
             let cursor_y = layout.editor_text.y + theme::EDITOR_PAD + cy - d.scroll_y();
             if let Some((qy, qh)) = clip_v(cursor_y, ch) {
@@ -914,6 +980,19 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         };
         btn.draw(act_rects[i], color, &mut areas);
     }
+    // Source Control badge number, centered in the pill drawn in the quad phase.
+    let scm_count = app.source_control.as_ref().map_or(0, |s| s.change_count());
+    if scm_count > 0 {
+        if let Some(r) = act_rects.get(2) {
+            let bw = ui.scm_badge.width() + 8.0;
+            let bh = 16.0;
+            let bx = r.x + r.w - bw - 2.0;
+            let by = r.y + r.h - bh - 8.0;
+            let badge = Rect { x: bx, y: by, w: bw, h: bh };
+            ui.scm_badge
+                .push(bx + (bw - ui.scm_badge.width()) * 0.5, badge, theme::BADGE_FG(), &mut areas);
+        }
+    }
 
     // Sidebar header + (Explorer tree | Extensions list)
     if app.sidebar_visible {
@@ -1024,7 +1103,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     } else if let Some(i) = active_idx {
         let d = &app.workspace.documents[i];
 
-        if let Some(right) = d.diff_right.as_ref() {
+        if d.image.is_some() {
+            // Image tab: the picture is drawn in the media pass below; no text/gutter.
+        } else if let Some(right) = d.diff_right.as_ref() {
             // Side-by-side diff: two gutters + two text panes over the full region.
             let full = editor_region(&layout);
             let half = (full.w * 0.5).floor();
@@ -1255,6 +1336,83 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 }
             }
             gpu.queue.submit(Some(enc.finish()));
+        }
+    }
+
+    // ---- Image tab: draw the active image (scaled/panned) + zoom controls ----
+    if let Some((key, scale_opt, pan)) = app
+        .workspace
+        .active_doc()
+        .and_then(|d| d.image.as_ref().map(|k| (k.clone(), d.image_scale, d.image_pan)))
+    {
+        if let Some((iw, ih)) = gpu.media.size(&key) {
+            let region = editor_region(&layout);
+            let scale = scale_opt.unwrap_or_else(|| image_fit_scale(iw, ih, region));
+            let rect = image_rect(iw, ih, region, scale, pan);
+            let now_ms = app.anim_start.elapsed().as_millis() as u64;
+            let items = vec![(key.clone(), rect)];
+            gpu.media.prepare(&gpu.device, &gpu.queue, &items, (cfg_w, cfg_h), now_ms);
+
+            // Zoom-control overlay (pill + − / % / + / Fit).
+            let cells = image_ctrl_cells(region);
+            let pill = Rect {
+                x: cells[0].x - 6.0,
+                y: cells[0].y,
+                w: (cells[3].x + cells[3].w) - cells[0].x + 12.0,
+                h: cells[0].h,
+            };
+            let ctrl_quads = vec![pill.rounded_quad([0.16, 0.16, 0.18, 0.95], pill.h * 0.5)];
+            gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &ctrl_quads, &[], (cfg_w, cfg_h));
+            let mut careas: Vec<TextArea> = Vec::new();
+            let fg = theme::FG_TEXT();
+            for (lbl, c) in [
+                (&gpu.ui.img_minus, cells[0]),
+                (&gpu.ui.img_pct, cells[1]),
+                (&gpu.ui.img_plus, cells[2]),
+                (&gpu.ui.img_fit, cells[3]),
+            ] {
+                lbl.push(c.x + (c.w - lbl.width()) * 0.5, c, fg, &mut careas);
+            }
+            gpu.text_renderer.prepare(
+                &gpu.device,
+                &gpu.queue,
+                &mut gpu.font_system,
+                &mut gpu.atlas,
+                &gpu.viewport,
+                careas,
+                &mut gpu.swash_cache,
+            )?;
+
+            let mut enc = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("nova-image-pass"),
+            });
+            {
+                let mut pass = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("nova-image"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                let sx = region.x.max(0.0) as u32;
+                let sy = region.y.max(0.0) as u32;
+                let sw = region.w.min(cfg_w as f32 - region.x).max(0.0) as u32;
+                let sh = region.h.min(cfg_h as f32 - region.y).max(0.0) as u32;
+                if sw > 0 && sh > 0 {
+                    pass.set_scissor_rect(sx, sy, sw, sh);
+                    gpu.media.render(&mut pass);
+                    gpu.quad_renderer.render_bg(&mut pass);
+                    gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+                }
+            }
+            gpu.queue.submit(Some(enc.finish()));
+            if gpu.media.is_animated(&key) {
+                gpu.window.request_redraw();
+            }
         }
     }
 

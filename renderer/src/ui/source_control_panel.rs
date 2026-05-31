@@ -87,6 +87,7 @@ pub struct SourceControlPanel {
     ic_chevron: TextLabel,
     hovered_header: Option<bool>, // Some(true)=Staged header, Some(false)=Changes header
     root: PathBuf,
+    change_count: usize, // unique changed files (for the activity-bar badge)
 }
 
 impl SourceControlPanel {
@@ -134,7 +135,13 @@ impl SourceControlPanel {
             ic_chevron: icon(fs, theme::ICON_CHEVRON_DOWN),
             hovered_header: None,
             root,
+            change_count: 0,
         }
+    }
+
+    /// Number of unique changed files (for the Source Control activity-bar badge).
+    pub fn change_count(&self) -> usize {
+        self.change_count
     }
 
     pub fn set_root(&mut self, root: PathBuf) {
@@ -160,6 +167,7 @@ impl SourceControlPanel {
     pub fn refresh(&mut self, fs: &mut FontSystem) {
         self.branch = git::branch(&self.root);
         let changes = git::status(&self.root);
+        self.change_count = changes.len();
         self.staged_rows.clear();
         self.unstaged_rows.clear();
         for c in &changes {

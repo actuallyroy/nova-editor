@@ -175,6 +175,19 @@ impl Workspace {
         self.active = Some(self.documents.len() - 1);
     }
 
+    /// Open (or re-focus) an image tab. The image must already be uploaded to
+    /// `gpu.media` under `key`. Dedups by path like `open_file`.
+    pub fn open_image(&mut self, path: &Path, key: String, fs: &mut FontSystem) {
+        for (i, d) in self.documents.iter().enumerate() {
+            if d.path.as_deref() == Some(path) {
+                self.active = Some(i);
+                return;
+            }
+        }
+        self.documents.push(Document::new_image(path.to_path_buf(), key, fs));
+        self.active = Some(self.documents.len() - 1);
+    }
+
     pub fn close_active(&mut self) {
         let Some(i) = self.active else {
             return;

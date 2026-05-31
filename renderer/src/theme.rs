@@ -387,6 +387,9 @@ pub fn DIFF_ADD_BG() -> [f32; 4] { [0.18, 0.43, 0.24, 0.30] }
 pub fn DIFF_DEL_BG() -> [f32; 4] { [0.50, 0.18, 0.18, 0.30] }
 pub fn DIFF_HUNK_BG() -> [f32; 4] { [0.20, 0.30, 0.42, 0.28] }
 pub fn DIFF_FILLER_BG() -> [f32; 4] { [0.0, 0.0, 0.0, 0.22] } // "no line here" on a side
+// Activity-bar count badge (e.g. Source Control changed-file count).
+pub fn BADGE_BG() -> [f32; 4] { [0.0, 0.48, 0.80, 1.0] }
+pub fn BADGE_FG() -> Color { Color::rgb(0xFF, 0xFF, 0xFF) }
 pub fn DIFF_HUNK_FG() -> Color { Color::rgb(0x56, 0x9C, 0xD6) }
 pub fn TITLE_BAR_BG() -> [f32; 4] { current().read().unwrap().title_bar_bg }
 pub fn TITLE_FG() -> Color { current().read().unwrap().title_fg }

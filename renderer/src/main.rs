@@ -20,6 +20,7 @@ mod layout;
 mod markdown;
 mod marketplace;
 mod menus;
+mod perf;
 mod media;
 mod quad;
 mod render;
@@ -110,6 +111,14 @@ pub(crate) const MENU_ACTIONS: &[(MenuAction, &str)] = &[
     (MenuAction::CopyPath, "Copy Path"),
 ];
 
+/// Image file types the `image` crate can decode (SVG is text/XML — opened as text).
+fn is_image_path(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tiff" | "tif")
+    )
+}
+
 /// An open right-click context menu over the file tree.
 pub(crate) struct ContextMenu {
     pub(crate) anchor: (f32, f32),
@@ -182,6 +191,7 @@ pub(crate) struct App {
     pub(crate) extensions_panel: Option<ui::extensions_panel::ExtensionsPanel>,
     pub(crate) extensions: Vec<Extension>,
     pub(crate) text_drag: Option<InputId>, // active mouse drag-selection in a text input
+    pub(crate) image_drag_last: Option<(f32, f32)>, // last cursor pos while panning an image
     pub(crate) ext_remote: Vec<marketplace::RemoteExt>, // current marketplace search results
     pub(crate) worker_tx: Sender<WorkerMsg>,
     pub(crate) worker_rx: Receiver<WorkerMsg>,
@@ -252,6 +262,7 @@ impl App {
             extensions_panel: None, // built in `resumed`
             extensions: Vec::new(),
             text_drag: None,
+            image_drag_last: None,
             ext_remote: Vec::new(),
             worker_tx,
             worker_rx,
@@ -986,6 +997,10 @@ impl App {
 
     /// Open `path` and place the caret at (1-based `line`, byte `col`).
     fn open_file_at(&mut self, path: PathBuf, line: usize, col: usize) {
+        if is_image_path(&path) {
+            self.open_image(path);
+            return;
+        }
         if let Some(gpu) = self.gpu.as_mut() {
             if self.workspace.open_file(&path, &mut gpu.font_system).is_ok() {
                 self.detail.open_extension = None;
@@ -1000,6 +1015,25 @@ impl App {
             }
         }
         self.ensure_cursor_visible();
+        self.redraw();
+    }
+
+    /// Open an image file as a read-only image tab: decode + upload it to the media
+    /// renderer (once), then add/focus its tab.
+    fn open_image(&mut self, path: PathBuf) {
+        let key = path.to_string_lossy().to_string();
+        let Some(g) = self.gpu.as_mut() else { return };
+        if !g.media.has(&key) {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let frames = crate::media::decode_full(&bytes);
+                    g.media.upload_frames(&g.device, &g.queue, &key, frames);
+                }
+                Err(_) => return,
+            }
+        }
+        self.workspace.open_image(&path, key, &mut g.font_system);
+        self.detail.open_extension = None;
         self.redraw();
     }
 
@@ -1239,6 +1273,7 @@ impl App {
                         self.apply_settings();
                     }
                 }
+                self.refresh_source_control(); // a save changes git status → update badge
             }
             Command::Close => {
                 self.request_close_active();
@@ -1309,6 +1344,7 @@ impl App {
         if let Some(sp) = self.search.as_mut() {
             sp.reset();
         }
+        self.refresh_source_control(); // update the change-count badge for the new repo
         self.redraw();
     }
 
@@ -1376,21 +1412,29 @@ impl App {
         let Some(text) = self.workspace.active_doc().and_then(|d| d.selected_text()) else {
             return;
         };
+        let n = text.len();
         if let Some(cb) = self.clipboard.as_mut() {
+            let t = std::time::Instant::now();
             let _ = cb.set_text(text);
+            perf::log(&format!("copy: clipboard set_text({n}B) {:?}", t.elapsed()));
         }
     }
 
     fn paste(&mut self) {
+        let t0 = std::time::Instant::now();
         let text = match self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
             Some(t) => t,
             None => return,
         };
+        let t_clip = t0.elapsed();
+        let n = text.len();
+        let t1 = std::time::Instant::now();
         if let Some(gpu) = self.gpu.as_mut() {
             if let Some(d) = self.workspace.active_doc_mut() {
                 d.insert_str(&text, &mut gpu.font_system);
             }
         }
+        perf::log(&format!("paste: clipboard get_text {:?}, insert+reshape({n}B) {:?}", t_clip, t1.elapsed()));
         self.ensure_cursor_visible();
     }
 
@@ -1509,6 +1553,39 @@ impl App {
                 self.close_app_menu();
             }
             return;
+        }
+
+        // Image tab: zoom-control buttons, else begin drag-to-pan.
+        if let Some(key) = self.workspace.active_doc().and_then(|d| d.image.clone()) {
+            let region = render::editor_region(&layout);
+            if region.contains((x, y)) {
+                let cells = render::image_ctrl_cells(region);
+                let hit = cells.iter().position(|c| c.contains((x, y)));
+                if let Some(h) = hit {
+                    let c = (region.x + region.w * 0.5, region.y + region.h * 0.5);
+                    let size = self.gpu.as_ref().and_then(|g| g.media.size(&key));
+                    if let Some(d) = self.workspace.active_doc_mut() {
+                        match h {
+                            0 => {
+                                if let Some((iw, ih)) = size {
+                                    d.image_zoom_at(c, region, iw, ih, 1.0 / 1.25);
+                                }
+                            }
+                            1 => d.image_actual(),
+                            2 => {
+                                if let Some((iw, ih)) = size {
+                                    d.image_zoom_at(c, region, iw, ih, 1.25);
+                                }
+                            }
+                            _ => d.image_fit(),
+                        }
+                    }
+                    self.redraw();
+                } else {
+                    self.image_drag_last = Some((x, y)); // start panning
+                }
+                return;
+            }
         }
 
         // A click anywhere while an inline create field is open commits it
@@ -1812,10 +1889,8 @@ impl App {
                     self.workspace.tree.toggle(idx);
                 } else {
                     let path = self.workspace.tree.nodes[idx].path.clone();
-                    if let Some(gpu) = self.gpu.as_mut() {
-                        let _ = self.workspace.open_file(&path, &mut gpu.font_system);
-                    }
-                    self.detail.open_extension = None; // opening a file dismisses the ext page
+                    // Route through open_file_at so images open as image tabs.
+                    self.open_file_at(path, 1, 0);
                 }
                 self.redraw();
             }
@@ -1903,6 +1978,17 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, x: f32, y: f32) {
+        // Pan an image tab while dragging.
+        if let Some((lx, ly)) = self.image_drag_last {
+            if self.mouse_pressed {
+                if let Some(d) = self.workspace.active_doc_mut() {
+                    d.image_pan_by(x - lx, y - ly);
+                }
+                self.image_drag_last = Some((x, y));
+                self.redraw();
+                return;
+            }
+        }
         // Drag-select within a text input.
         if let Some(id) = self.text_drag {
             if self.mouse_pressed {
@@ -1986,6 +2072,7 @@ impl App {
     fn on_mouse_release(&mut self) {
         self.editor.on_release();
         self.text_drag = None;
+        self.image_drag_last = None;
         self.sidebar_split.release();
         self.terminal.split.release();
         self.terminal.release_scrolls();
@@ -2036,6 +2123,20 @@ impl App {
         if self.detail.open_extension.is_some() && layout.editor_text.contains(p) {
             if self.detail.ext_detail_scroll.on_wheel(0.0, dy) {
                 self.redraw();
+            }
+            return;
+        }
+        // Image tab: the wheel zooms about the cursor instead of scrolling.
+        if let Some(key) = self.workspace.active_doc().and_then(|d| d.image.clone()) {
+            let region = render::editor_region(&layout);
+            if region.contains(p) {
+                if let Some((iw, ih)) = self.gpu.as_ref().and_then(|g| g.media.size(&key)) {
+                    let factor = if dy > 0.0 { 1.1 } else { 1.0 / 1.1 };
+                    if let Some(d) = self.workspace.active_doc_mut() {
+                        d.image_zoom_at(p, region, iw, ih, factor);
+                    }
+                    self.redraw();
+                }
             }
             return;
         }
@@ -2640,6 +2741,8 @@ impl ApplicationHandler for App {
                     ));
                 }
                 self.open_initial();
+                // Populate the Source Control change-count badge at startup.
+                self.refresh_source_control();
             }
             Err(e) => {
                 eprintln!("init failed: {e:?}");

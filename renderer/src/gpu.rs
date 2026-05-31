@@ -34,6 +34,11 @@ pub struct UiBuffers {
     pub line_numbers: Gutter,
     pub line_numbers2: Gutter, // right pane's gutter in a side-by-side diff
     pub menu_dropdown: Menu,   // top menu-bar dropdown (File/Edit/…)
+    pub scm_badge: TextLabel,  // change-count badge on the Source Control icon
+    pub img_minus: TextLabel,  // image zoom-out control
+    pub img_plus: TextLabel,   // image zoom-in control
+    pub img_fit: TextLabel,    // image fit control
+    pub img_pct: TextLabel,    // image zoom percentage (set per frame)
     pub palette_input: TextInput,
     pub palette_list: ListView,
     pub find_input: TextInput,
@@ -216,6 +221,23 @@ impl GpuState {
             find_input: TextInput::new(&mut font_system, 800.0, theme::FIND_BAR_HEIGHT),
             menu: Menu::new(&mut font_system, 200.0),
             menu_dropdown: Menu::new(&mut font_system, 220.0),
+            scm_badge: TextLabel::new(&mut font_system, 40.0, theme::ACTIVITY_ICON_SIZE),
+            img_minus: {
+                let mut l = TextLabel::new(&mut font_system, 38.0, 30.0);
+                l.set(&mut font_system, "\u{2212}", theme::UI_FAMILY());
+                l
+            },
+            img_plus: {
+                let mut l = TextLabel::new(&mut font_system, 38.0, 30.0);
+                l.set(&mut font_system, "+", theme::UI_FAMILY());
+                l
+            },
+            img_fit: {
+                let mut l = TextLabel::new(&mut font_system, 50.0, 30.0);
+                l.set(&mut font_system, "Fit", theme::UI_FAMILY());
+                l
+            },
+            img_pct: TextLabel::new(&mut font_system, 64.0, 30.0),
             dialog: Dialog::new(&mut font_system),
             ext_detail: ExtensionDetail::new(&mut font_system),
             terminal_panes: Vec::new(), // grown on demand as panes are split
