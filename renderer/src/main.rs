@@ -111,6 +111,29 @@ pub(crate) const MENU_ACTIONS: &[(MenuAction, &str)] = &[
     (MenuAction::CopyPath, "Copy Path"),
 ];
 
+/// Rasterize the bundled Nova logo (SVG) to a window/taskbar icon. The SVG is the
+/// single source of truth; returns None if rendering fails (icon is non-critical).
+fn app_icon() -> Option<winit::window::Icon> {
+    use resvg::{tiny_skia, usvg};
+    const SIZE: u32 = 256;
+    let tree = usvg::Tree::from_str(include_str!("../assets/logo.svg"), &usvg::Options::default()).ok()?;
+    let mut pixmap = tiny_skia::Pixmap::new(SIZE, SIZE)?;
+    let s = tree.size();
+    let scale = (SIZE as f32 / s.width()).min(SIZE as f32 / s.height());
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    // tiny-skia is premultiplied RGBA; winit wants straight (un-premultiplied) alpha.
+    let mut rgba = pixmap.take();
+    for px in rgba.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a > 0 && a < 255 {
+            px[0] = ((px[0] as u32 * 255) / a) as u8;
+            px[1] = ((px[1] as u32 * 255) / a) as u8;
+            px[2] = ((px[2] as u32 * 255) / a) as u8;
+        }
+    }
+    winit::window::Icon::from_rgba(rgba, SIZE, SIZE).ok()
+}
+
 /// Image file types the `image` crate can decode (SVG is text/XML — opened as text).
 fn is_image_path(path: &std::path::Path) -> bool {
     matches!(
@@ -1397,6 +1420,14 @@ impl App {
         }
         if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
             scp.reshape(&mut g.font_system);
+        }
+        // Terminal: re-seed the cell advance and mark panes dirty so their grids
+        // re-shape + reflow (cols/rows) at the new font size.
+        self.terminal_cell_w = theme::FONT_SIZE() * 0.6;
+        for grp in self.terminal.groups.iter_mut() {
+            for pane in grp.panes.iter_mut() {
+                pane.dirty = true;
+            }
         }
         self.redraw();
     }
@@ -2788,6 +2819,7 @@ impl ApplicationHandler for App {
         let attrs = Window::default_attributes()
             .with_title("Nova")
             .with_decorations(false)
+            .with_window_icon(app_icon())
             .with_inner_size(LogicalSize::new(1400.0, 900.0));
         let window = Arc::new(el.create_window(attrs).expect("create window"));
         match pollster::block_on(GpuState::new(window)) {

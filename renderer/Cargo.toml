@@ -19,6 +19,7 @@ glyphon = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 pollster = "0.4"
 portable-pty = "0.8"
+resvg = "0.45"
 pulldown-cmark = { version = "0.13", default-features = false }
 rfd = "0.15"
 vte = "0.13"

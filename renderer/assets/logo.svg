@@ -1,0 +1,41 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="novaGradient" x1="120" y1="120" x2="392" y2="392" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#42C6FF"/>
+      <stop offset="50%" stop-color="#6E7BFF"/>
+      <stop offset="100%" stop-color="#B14DFF"/>
+    </linearGradient>
+
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" rx="120" fill="#0D1117"/>
+
+  <!-- Glow -->
+  <circle cx="256" cy="256" r="120" fill="url(#glow)" opacity="0.12"/>
+
+  <!-- Star Shape -->
+  <g filter="url(#softGlow)">
+    <path d="M256 70L278 230L442 256L278 282L256 442L234 282L70 256L234 230L256 70Z"
+          fill="url(#novaGradient)"/>
+
+    <path d="M256 120L268 244L392 256L268 268L256 392L244 268L120 256L244 244L256 120Z"
+          fill="#FFFFFF"
+          opacity="0.95"/>
+  </g>
+
+  <!-- Center Glow -->
+  <circle cx="256" cy="256" r="22" fill="#FFFFFF" opacity="0.95"/>
+</svg>

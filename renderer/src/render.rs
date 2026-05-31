@@ -431,6 +431,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         .map(|(s, c)| (s, to_attr(c)))
                         .collect();
                     let buf = &mut gpu.ui.terminal_panes[i];
+                    // Re-apply metrics each reshape so the grid font tracks UI zoom.
+                    buf.set_metrics(fs, glyphon::Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
                     buf.set_size(fs, None, Some(rect.h + 200.0));
                     buf.set_rich_text(
                         fs,
