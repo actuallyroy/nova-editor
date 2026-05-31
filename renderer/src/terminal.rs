@@ -591,6 +591,13 @@ impl Terminal {
         if cwd.is_dir() {
             cmd.cwd(cwd);
         }
+        // Advertise a capable terminal so TUIs (claude code, vim, less, …) use the
+        // alternate screen + truecolor. Without TERM (e.g. a macOS GUI launch) they
+        // fall back to repainting the normal screen, which floods the scrollback
+        // with duplicate frames as you scroll. We support these (alt screen, SGR
+        // colors, SGR mouse), so xterm-256color is accurate.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         let child = pair.slave.spawn_command(cmd).ok()?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().ok()?;
