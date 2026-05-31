@@ -71,6 +71,7 @@ pub struct Document {
     pub image: Option<String>,           // Some(media key) => this tab renders an image
     pub image_scale: Option<f32>,        // None = fit-to-window; Some(s) = absolute scale
     pub image_pan: (f32, f32),           // pan offset (px) from centered position
+    pub feedback: bool,                  // Some => Ctrl+Enter submits it as a GitHub issue
 }
 
 fn apply_buffer_text(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, lines: usize, lang: Lang, ext: &str, wrap_width: Option<f32>) {
@@ -187,7 +188,20 @@ impl Document {
             image: None,
             image_scale: None,
             image_pan: (0.0, 0.0),
+            feedback: false,
         }
+    }
+
+    /// An editable "Feedback" tab. The user types a report and presses Ctrl+Enter
+    /// to file it as a GitHub issue (first line = title, rest = body).
+    pub fn new_feedback(fs: &mut FontSystem) -> Self {
+        let template = "<!-- First line = issue title, the rest = body. Ctrl+Enter to submit to GitHub. -->\n\n";
+        let mut d = Document::new(None, template.to_string(), fs);
+        d.name = "Feedback".to_string();
+        d.feedback = true;
+        let end = d.rope.len_bytes();
+        d.sel = Selection::caret(end);
+        d
     }
 
     /// A read-only image tab. The picture itself is uploaded to `gpu.media` under
@@ -219,6 +233,7 @@ impl Document {
             image: Some(key),
             image_scale: None,
             image_pan: (0.0, 0.0),
+            feedback: false,
         }
     }
 
@@ -282,6 +297,7 @@ impl Document {
             image: None,
             image_scale: None,
             image_pan: (0.0, 0.0),
+            feedback: false,
         }
     }
 

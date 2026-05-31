@@ -196,6 +196,7 @@ pub(crate) struct App {
     pub(crate) hovered_menu: Option<usize>,
     pub(crate) open_menu: Option<usize>,        // which top menu's dropdown is open
     pub(crate) menu_dd_hover: Option<usize>,    // hovered entry within the open dropdown
+    pub(crate) feedback_form: Option<ui::feedback_form::FeedbackForm>, // modal feedback form
     pub(crate) hovered_layout: Option<usize>,
     pub(crate) hovered_explorer: Option<usize>,
     pub(crate) selected_tree: Option<usize>,
@@ -271,6 +272,7 @@ impl App {
             hovered_menu: None,
             open_menu: None,
             menu_dd_hover: None,
+            feedback_form: None,
             hovered_layout: None,
             hovered_explorer: None,
             selected_tree: None,
@@ -310,6 +312,20 @@ impl App {
         let layout = self.layout();
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
         let mut changed = false;
+
+        // While the modal feedback form is open it owns the cursor (text in fields,
+        // pointer on controls) — don't fall through to the editor's I-beam.
+        if self.feedback_form.is_some() {
+            let win = self.gpu.as_ref().map_or((1280.0, 800.0), |g| (g.config.width as f32, g.config.height as f32));
+            let c = self.feedback_form.as_ref().unwrap().cursor(p, win);
+            if c != self.cursor_icon {
+                self.cursor_icon = c;
+                if let Some(g) = self.gpu.as_ref() {
+                    g.window.set_cursor(c);
+                }
+            }
+            return;
+        }
 
         // Dialog (topmost modal) captures hover.
         if let Some(has_check) = self.dialog.as_ref().map(|d| d.has_check) {
@@ -856,6 +872,7 @@ impl App {
         match m {
             menus::MenuCmd::Cmd(c) => self.exec_command(c),
             menus::MenuCmd::Palette => self.open_palette(),
+            menus::MenuCmd::Feedback => self.open_feedback(),
             menus::MenuCmd::Exit => self.pending_close = true,
         }
     }
@@ -1038,6 +1055,64 @@ impl App {
             }
         }
         self.ensure_cursor_visible();
+        self.redraw();
+    }
+
+    /// Open the modal feedback / report-issue form (Help → Send Feedback).
+    fn open_feedback(&mut self) {
+        if let Some(g) = self.gpu.as_mut() {
+            self.feedback_form = Some(ui::feedback_form::FeedbackForm::new(&mut g.font_system));
+            self.close_app_menu();
+        }
+        self.redraw();
+    }
+
+    /// File a GitHub issue via the user's `gh` CLI login. Falls back to opening the
+    /// prefilled new-issue page in the browser if `gh` isn't available.
+    fn submit_issue(&mut self, title: String, body: String) {
+        const REPO: &str = "actuallyroy/nova-editor";
+        let mut cmd = std::process::Command::new("gh");
+        cmd.args(["issue", "create", "--repo", REPO, "--title", &title, "--body", &body]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // no console flash
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => {
+                let url = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if url.starts_with("http") {
+                    open_url(&url); // show the created issue
+                }
+            }
+            _ => {
+                // No gh / not authed / error → open the prefilled new-issue page.
+                let url = format!(
+                    "https://github.com/{}/issues/new?title={}&body={}",
+                    REPO,
+                    urlencode(&title),
+                    urlencode(&body)
+                );
+                open_url(&url);
+            }
+        }
+        self.redraw();
+    }
+
+    /// Apply the result of a feedback-form input event.
+    fn handle_feedback_action(&mut self, act: ui::feedback_form::FormAction) {
+        use ui::feedback_form::FormAction;
+        match act {
+            FormAction::Submit => {
+                if let Some((title, body)) = self.feedback_form.as_ref().and_then(|f| f.issue()) {
+                    self.feedback_form = None;
+                    self.submit_issue(title, body);
+                }
+                // Empty title → keep the form open.
+            }
+            FormAction::Close => self.feedback_form = None,
+            FormAction::None => {}
+        }
         self.redraw();
     }
 
@@ -1566,6 +1641,19 @@ impl App {
     fn on_mouse_press(&mut self, x: f32, y: f32) {
         let layout = self.layout();
 
+        // The feedback form is modal: it swallows all clicks while open.
+        if self.feedback_form.is_some() {
+            let win = self.gpu.as_ref().map_or((1280.0, 800.0), |g| (g.config.width as f32, g.config.height as f32));
+            let clicks = if self.register_click(x, y) { 2 } else { 1 };
+            let act = self
+                .feedback_form
+                .as_mut()
+                .map(|f| f.on_press((x, y), win, clicks))
+                .unwrap_or(ui::feedback_form::FormAction::None);
+            self.handle_feedback_action(act);
+            return;
+        }
+
         // A modal dialog swallows all clicks: checkbox toggles, buttons act.
         if let Some(has_check) = self.dialog.as_ref().map(|d| d.has_check) {
             let hit = self.gpu.as_ref().map(|g| {
@@ -2059,6 +2147,15 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, x: f32, y: f32) {
+        // Feedback form: drag-select within the focused field.
+        if self.mouse_pressed && self.feedback_form.is_some() {
+            let win = self.gpu.as_ref().map_or((1280.0, 800.0), |g| (g.config.width as f32, g.config.height as f32));
+            if let Some(f) = self.feedback_form.as_mut() {
+                f.on_drag((x, y), win);
+            }
+            self.redraw();
+            return;
+        }
         // Pan an image tab while dragging.
         if let Some((lx, ly)) = self.image_drag_last {
             if self.mouse_pressed {
@@ -2154,6 +2251,9 @@ impl App {
         self.editor.on_release();
         self.text_drag = None;
         self.image_drag_last = None;
+        if let Some(f) = self.feedback_form.as_mut() {
+            f.end_drag();
+        }
         self.sidebar_split.release();
         self.terminal.split.release();
         self.terminal.release_scrolls();
@@ -2248,6 +2348,16 @@ impl App {
         }
         let extend = self.mods.shift_key();
         let ctrl = self.mods.control_key();
+
+        // The feedback form is modal: route keys to it (Esc closes, Ctrl+Enter submits).
+        if self.feedback_form.is_some() {
+            let mut act = ui::feedback_form::FormAction::None;
+            if let (Some(form), Some(g)) = (self.feedback_form.as_mut(), self.gpu.as_mut()) {
+                act = form.on_key(&event, ctrl, extend, &mut g.font_system, self.clipboard.as_mut());
+            }
+            self.handle_feedback_action(act);
+            return;
+        }
 
         // A modal dialog swallows keys; Escape cancels it.
         if self.dialog.is_some() {
@@ -2638,6 +2748,18 @@ enum Focus {
 
 /// Open a URL in the OS default browser. Best-effort, http(s) only (so README
 /// link text can't launch arbitrary commands).
+/// Percent-encode a string for use in a URL query value.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 fn open_url(url: &str) {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return;

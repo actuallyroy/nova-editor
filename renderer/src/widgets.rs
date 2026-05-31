@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, TextArea, TextBounds};
+use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, TextArea, TextBounds, Wrap};
 use winit::window::CursorIcon;
 
 use crate::icon::IconInstance;
@@ -306,6 +306,7 @@ pub struct TextInput {
     epoch: u64,
     cursor: CursorIcon,
     pub align: VAlign,
+    multiline: bool, // wrap + grow vertically; caret tracks the shaped layout
     caret: usize,  // byte index of the caret in `text`
     anchor: usize, // selection anchor; == caret when there's no selection
 }
@@ -321,9 +322,19 @@ impl TextInput {
             epoch: theme::shape_epoch(),
             cursor: CursorIcon::Text,
             align: VAlign::Center,
+            multiline: false,
             caret: 0,
             anchor: 0,
         }
+    }
+
+    /// Enable multi-line editing (word-wrap + top-aligned, layout-aware caret).
+    pub fn multiline(mut self, on: bool) -> Self {
+        self.multiline = on;
+        if on {
+            self.align = VAlign::Top;
+        }
+        self
     }
 
     /// Re-shape after a zoom change (forces fresh metrics next reshape).
@@ -358,6 +369,8 @@ impl TextInput {
         }
         self.epoch = theme::shape_epoch();
         self.buffer.set_metrics(fs, Metrics::new(theme::UI_FONT_SIZE(), theme::UI_LINE_HEIGHT()));
+        self.buffer
+            .set_wrap(fs, if self.multiline { Wrap::WordOrGlyph } else { Wrap::None });
         self.buffer.set_text(
             fs,
             &content,
@@ -366,6 +379,47 @@ impl TextInput {
         );
         self.buffer.shape_until_scroll(fs, false);
         self.shown = content;
+    }
+
+    /// Absolute byte index where logical line `line` starts in `text`.
+    fn line_start_byte(&self, line: usize) -> usize {
+        if line == 0 {
+            return 0;
+        }
+        let mut seen = 0;
+        for (i, c) in self.text.char_indices() {
+            if c == '\n' {
+                seen += 1;
+                if seen == line {
+                    return i + 1;
+                }
+            }
+        }
+        self.text.len()
+    }
+
+    /// Buffer-local (x, top, height) of the caret. cosmic-text glyph offsets are
+    /// per-logical-line, so we resolve the caret's line + column first, then place
+    /// it — including on a freshly-inserted empty line (no glyphs yet).
+    fn caret_xy(&self) -> (f32, f32, f32) {
+        let lh = theme::UI_LINE_HEIGHT();
+        let caret = self.caret.min(self.text.len());
+        let line = self.text[..caret].matches('\n').count();
+        let col = caret - self.line_start_byte(line);
+        let (mut last_bottom, mut last_h) = (0.0, lh);
+        for run in self.buffer.layout_runs() {
+            if run.line_i == line {
+                for g in run.glyphs.iter() {
+                    if g.start as usize >= col {
+                        return (g.x, run.line_top, run.line_height);
+                    }
+                }
+                return (run.line_w, run.line_top, run.line_height);
+            }
+            last_bottom = run.line_top + run.line_height;
+            last_h = run.line_height;
+        }
+        (0.0, last_bottom, last_h) // caret on an empty trailing line
     }
 
     pub fn set_placeholder(&mut self, fs: &mut FontSystem, s: &str) {
@@ -530,19 +584,62 @@ impl TextInput {
         0.0
     }
 
-    /// Byte index nearest the local x (relative to the text start).
+    /// Byte index nearest the local x (relative to the text start). Single-line.
     fn byte_at_local_x(&self, local_x: f32) -> usize {
+        self.byte_at_local(local_x, 0.0)
+    }
+
+    /// Byte index nearest local (x, y) within the shaped layout. For multi-line
+    /// inputs this resolves the row by `y` first; single-line uses the only row.
+    fn byte_at_local(&self, local_x: f32, local_y: f32) -> usize {
         if self.text.is_empty() {
             return 0;
         }
-        if let Some(run) = self.buffer.layout_runs().next() {
+        for run in self.buffer.layout_runs() {
+            let on_row = !self.multiline
+                || (local_y >= run.line_top && local_y < run.line_top + run.line_height);
+            if !on_row {
+                continue;
+            }
+            let ls = self.line_start_byte(run.line_i);
             for g in run.glyphs.iter() {
                 if local_x < g.x + g.w * 0.5 {
-                    return g.start;
+                    return ls + g.start as usize;
                 }
             }
+            // Past the last glyph on this row → end of the row.
+            return run.glyphs.last().map(|g| ls + g.end as usize).unwrap_or(ls);
         }
         self.text.len()
+    }
+
+    fn local_top(&self, rect: Rect) -> f32 {
+        if self.multiline {
+            rect.y + 4.0
+        } else {
+            rect.text_top(theme::UI_LINE_HEIGHT(), self.align)
+        }
+    }
+
+    /// Handle a click in this field: focus, then place caret (1 click), select the
+    /// word (2), or select all (3+). The single source of truth for click selection
+    /// — callers pass the click count and the field handles the rest.
+    pub fn on_click(&mut self, rect: Rect, pad_x: f32, x: f32, y: f32, clicks: u32) {
+        self.focused = true;
+        let b = self.byte_at_local(x - rect.x - pad_x, y - self.local_top(rect));
+        match clicks {
+            n if n >= 3 => self.select_all(),
+            2 => self.select_word_byte(b),
+            _ => {
+                self.caret = b;
+                self.anchor = b;
+            }
+        }
+    }
+
+    /// Extend the selection to a click/drag position (mouse drag).
+    pub fn on_drag(&mut self, rect: Rect, pad_x: f32, x: f32, y: f32) {
+        self.caret = self.byte_at_local(x - rect.x - pad_x, y - self.local_top(rect));
     }
 
     /// Place the caret (clearing selection) from a screen-space click.
@@ -560,6 +657,12 @@ impl TextInput {
     /// Select the whole word under a screen-space x (double-click).
     pub fn select_word_at(&mut self, rect: Rect, pad_x: f32, x: f32) {
         let b = self.byte_at_local_x(x - rect.x - pad_x);
+        self.select_word_byte(b);
+    }
+
+    /// Select the word containing byte `b` (double-click; the single source of word
+    /// selection used by both `select_word_at` and `on_click`).
+    fn select_word_byte(&mut self, b: usize) {
         let is_word = |c: char| c.is_alphanumeric() || c == '_';
         // Walk left to the word start.
         let mut start = b;
@@ -593,30 +696,54 @@ impl TextInput {
 
     /// A thin caret bar at the caret position.
     pub fn caret_quad(&self, rect: Rect, pad_x: f32) -> Quad {
+        if self.multiline {
+            let (cx, top, lh) = self.caret_xy();
+            let h = (lh - 4.0).max(6.0);
+            return Quad::new(rect.x + pad_x + cx, rect.y + 4.0 + top + 2.0, 1.5, h, theme::CURSOR());
+        }
         let x = rect.x + pad_x + self.x_for_byte(self.caret);
         let h = theme::UI_LINE_HEIGHT() - 6.0;
         let y = rect.text_top(h, self.align);
         Quad::new(x, y, 1.5, h, theme::CURSOR())
     }
 
-    /// Selection highlight rect(s) — one quad for the single line.
+    /// Selection highlight rect(s) — one quad per shaped row the selection covers
+    /// (so it works for both single-line and multi-line fields).
     pub fn selection_quads(&self, rect: Rect, pad_x: f32, out: &mut Vec<Quad>) {
         if !self.has_selection() {
             return;
         }
         let (a, b) = self.sel_range();
-        let x0 = rect.x + pad_x + self.x_for_byte(a);
-        let x1 = rect.x + pad_x + self.x_for_byte(b);
-        let h = theme::UI_LINE_HEIGHT() - 2.0;
-        let y = rect.text_top(h, self.align);
-        out.push(Quad::new(x0, y, (x1 - x0).max(1.0), h, theme::SELECTION()));
+        let left = rect.x + pad_x;
+        let top0 = self.local_top(rect);
+        for run in self.buffer.layout_runs() {
+            let ls = self.line_start_byte(run.line_i);
+            let (mut x0, mut x1) = (f32::MAX, f32::MIN);
+            for g in run.glyphs.iter() {
+                let (gs, ge) = (ls + g.start as usize, ls + g.end as usize);
+                if ge <= a || gs >= b {
+                    continue;
+                }
+                x0 = x0.min(g.x);
+                x1 = x1.max(g.x + g.w);
+            }
+            if x1 > x0 {
+                let y = top0 + if self.multiline { run.line_top } else { 0.0 };
+                out.push(Quad::new(left + x0, y + 1.0, (x1 - x0).max(1.0), run.line_height - 2.0, theme::SELECTION()));
+            }
+        }
     }
 
     pub fn draw<'a>(&'a self, rect: Rect, pad_x: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
+        let top = if self.multiline {
+            rect.y + 4.0
+        } else {
+            rect.text_top(theme::UI_LINE_HEIGHT(), self.align)
+        };
         areas.push(TextArea {
             buffer: &self.buffer,
             left: rect.x + pad_x,
-            top: rect.text_top(theme::UI_LINE_HEIGHT(), self.align),
+            top,
             scale: 1.0,
             bounds: TextBounds {
                 left: rect.x as i32,

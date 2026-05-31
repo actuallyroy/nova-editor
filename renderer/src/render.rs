@@ -1637,6 +1637,46 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.queue.submit(Some(enc3.finish()));
     }
 
+    // ---- Feedback form overlay (topmost modal) ----
+    if let Some(form) = app.feedback_form.as_ref() {
+        let win = (cfg_w as f32, cfg_h as f32);
+        let mut bg: Vec<Quad> = Vec::new();
+        let mut fg: Vec<Quad> = Vec::new();
+        form.draw_quads(win, app.cursor_blink_on, &mut bg, &mut fg);
+        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &bg, &fg, (cfg_w, cfg_h));
+        let mut fareas: Vec<TextArea> = Vec::new();
+        form.draw_text(win, &mut fareas);
+        gpu.text_renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut gpu.font_system,
+            &mut gpu.atlas,
+            &gpu.viewport,
+            fareas,
+            &mut gpu.swash_cache,
+        )?;
+        let mut encf = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("nova-feedback-pass"),
+        });
+        {
+            let mut pass = encf.begin_render_pass(&RenderPassDescriptor {
+                label: Some("nova-feedback"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            gpu.quad_renderer.render_bg(&mut pass);
+            gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+            gpu.quad_renderer.render_fg(&mut pass);
+        }
+        gpu.queue.submit(Some(encf.finish()));
+    }
+
     frame.present();
     gpu.atlas.trim();
     Ok(())
