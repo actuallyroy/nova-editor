@@ -52,7 +52,7 @@ pub fn open_ext_view(
                 downloads: 0,
                 rating: 0.0,
                 supported: e.supported(),
-                installed: e.installed,
+                installed: true, // it came from the on-disk scan, so it's installed
                 remote: false,
                 key: e.name.clone(),
             })
@@ -60,6 +60,10 @@ pub fn open_ext_view(
         OpenExt::Remote(i) => {
             let e = remote.get(i)?;
             let name = if e.display.is_empty() { e.name.clone() } else { e.display.clone() };
+            // Already installed if a scanned extension matches publisher + name.
+            let installed = extensions.iter().any(|x| {
+                x.publisher.eq_ignore_ascii_case(&e.namespace) && x.name.eq_ignore_ascii_case(&e.name)
+            });
             Some(OpenExtView {
                 name,
                 publisher: e.namespace.clone(),
@@ -69,7 +73,7 @@ pub fn open_ext_view(
                 downloads: e.downloads,
                 rating: e.rating,
                 supported: true,
-                installed: false,
+                installed,
                 remote: true,
                 key: e.id(),
             })

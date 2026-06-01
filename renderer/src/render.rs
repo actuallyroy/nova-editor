@@ -154,7 +154,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // their offsets are clamped and their thumbs are positioned this frame.
     if app.sidebar_visible && app.sidebar_view == SidebarView::Extensions {
         if let Some(ep) = app.extensions_panel.as_mut() {
-            ep.update(layout.tree_region());
+            ep.update(&mut gpu.font_system, layout.tree_region());
         }
     }
     // File-tree scroll viewport (content = one row per tree node).

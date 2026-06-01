@@ -235,6 +235,9 @@ pub(crate) struct App {
     pub(crate) lsp_last_sync: Instant,
     /// Pull-diagnostics request id → document URI (ESLint uses the pull model).
     pub(crate) lsp_diag_pending: std::collections::HashMap<i64, String>,
+    /// Name of the extension currently being installed (drives the "Installing…"
+    /// button state and blocks duplicate clicks).
+    pub(crate) installing: Option<String>,
     /// Extension detail page (README/CHANGELOG/Features). All its state lives in
     /// `ui::ext_detail_view::ExtDetailView`; accessed as `self.detail.*`.
     pub(crate) detail: ui::ext_detail_view::ExtDetailView,
@@ -312,6 +315,7 @@ impl App {
             lsp: lsp::LspManager::new(),
             lsp_last_sync: Instant::now(),
             lsp_diag_pending: std::collections::HashMap::new(),
+            installing: None,
             detail: ui::ext_detail_view::ExtDetailView::new(),
             pending_close: false,
             terminal: ui::terminal_panel::TerminalPanel::new(root.clone()),
@@ -1205,8 +1209,17 @@ impl App {
 
     /// Download + install a marketplace extension on a background thread.
     fn install_remote(&mut self, idx: usize) {
+        if self.installing.is_some() {
+            return; // an install is already in flight
+        }
         let Some(ext) = self.ext_remote.get(idx).cloned() else { return };
-        let Some(root) = extensions::dir() else { return };
+        let Some(root) = extensions::dir() else {
+            self.show_info_dialog("Couldn't locate the extensions folder (~/.vscode/extensions).");
+            return;
+        };
+        let label = if ext.display.is_empty() { ext.name.clone() } else { ext.display.clone() };
+        self.installing = Some(label);
+        self.show_info_dialog("Installing… downloading from the marketplace.");
         marketplace::install_async(self.worker_tx.clone(), ext, root);
     }
 
@@ -3052,15 +3065,25 @@ impl ApplicationHandler for App {
                 WorkerMsg::Search { gen, results } => {
                     if self.extensions_panel.as_ref().map_or(false, |ep| ep.search_gen() == gen) {
                         self.ext_remote = results;
+                        if let Some(ep) = self.extensions_panel.as_mut() {
+                            ep.finish_search();
+                        }
                         self.rebuild_ext_rows();
                         self.redraw();
                     }
                 }
                 WorkerMsg::Installed { result } => {
-                    if result.is_ok() {
-                        self.extensions = extensions::scan();
+                    self.installing = None;
+                    match result {
+                        Ok(()) => {
+                            self.extensions = extensions::scan();
+                            self.rebuild_ext_rows();
+                            self.show_info_dialog("Extension installed. Reload the window (or reopen) to activate it.");
+                        }
+                        Err(e) => {
+                            self.show_info_dialog(&format!("Install failed: {e}"));
+                        }
                     }
-                    self.rebuild_ext_rows();
                     self.redraw();
                 }
                 WorkerMsg::Readme { gen, text } => {

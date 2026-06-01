@@ -19,7 +19,7 @@ use crate::marketplace::{self, RemoteExt, WorkerMsg};
 use crate::quad::Quad;
 use crate::theme;
 use crate::ui::Intent;
-use crate::widgets::{ExtSpec, ExtensionList, Rect, ScrollOpts, ScrollView, TextInput};
+use crate::widgets::{ExtSpec, ExtensionList, Rect, ScrollOpts, ScrollView, TextInput, TextLabel};
 use crate::{ext_filter_rect, ext_list_region};
 
 pub struct ExtensionsPanel {
@@ -32,6 +32,8 @@ pub struct ExtensionsPanel {
     hovered: Option<usize>,
     dragging: bool, // filter-box text drag-select
     search_gen: u64, // discards stale background search results
+    searching: bool, // a marketplace query is in flight (drives the "Searching…" line)
+    l_status: TextLabel, // "Searching…" / "No extensions found"
 }
 
 impl ExtensionsPanel {
@@ -48,7 +50,14 @@ impl ExtensionsPanel {
             hovered: None,
             dragging: false,
             search_gen: 0,
+            searching: false,
+            l_status: TextLabel::new(fs, theme::SIDEBAR_WIDTH(), theme::UI_LINE_HEIGHT()),
         }
+    }
+
+    /// Called when a marketplace search response (matching the current gen) arrives.
+    pub fn finish_search(&mut self) {
+        self.searching = false;
     }
 
     pub fn focused(&self) -> bool {
@@ -107,6 +116,7 @@ impl ExtensionsPanel {
             return;
         }
         self.search_gen += 1;
+        self.searching = true;
         marketplace::search_async(tx.clone(), query, self.search_gen);
     }
 
@@ -117,9 +127,18 @@ impl ExtensionsPanel {
     }
 
     // ---- Shaping: keep the scroll metrics in sync with the row content height. ----
-    pub fn update(&mut self, region: Rect) {
+    pub fn update(&mut self, fs: &mut FontSystem, region: Rect) {
         let list = ext_list_region(region);
         self.scroll.set_metrics(list, (list.w, self.rows.content_height()));
+        // Keep the status label's text current (shaped here; pushed in draw_text).
+        let status = if self.searching {
+            "Searching…"
+        } else if self.showing_remote && self.rows.len() == 0 {
+            "No extensions found"
+        } else {
+            ""
+        };
+        self.l_status.set(fs, status, theme::UI_FAMILY());
     }
 
     // ---- Main-pass drawing (filter chrome + selection + caret). The scrollable
@@ -141,6 +160,16 @@ impl ExtensionsPanel {
         let fr = ext_filter_rect(region);
         let fc = if self.filter.text().is_empty() { theme::FG_DIM() } else { theme::FG_TEXT() };
         self.filter.draw(fr, theme::zpx(6.0), fc, areas);
+        // Status line under the filter (text set in `update`): "Searching…" / empty hint.
+        if self.show_status() {
+            let list = ext_list_region(region);
+            let row = Rect { x: list.x + theme::zpx(12.0), y: list.y + theme::zpx(8.0), w: list.w, h: theme::UI_LINE_HEIGHT() };
+            self.l_status.draw_left(row, 0.0, theme::FG_DIM(), areas);
+        }
+    }
+
+    fn show_status(&self) -> bool {
+        self.searching || (self.showing_remote && self.rows.len() == 0)
     }
 
     // ---- Clipped list pass data (drawn by the renderer into a scissored pass). ----
