@@ -463,6 +463,11 @@ pub const SCROLLBAR_FADE_HOLD_MS: f32 = 900.0;
 pub const SCROLLBAR_FADE_MS: f32 = 300.0;
 pub fn DIALOG_BTN_H() -> f32 { 30.0 * ui_zoom() }
 
+// Diagnostic underline colors (quad RGBA), by LSP severity.
+pub fn DIAGNOSTIC_ERROR() -> [f32; 4] { [0.94, 0.30, 0.30, 1.0] }
+pub fn DIAGNOSTIC_WARNING() -> [f32; 4] { [0.85, 0.65, 0.13, 1.0] }
+pub fn DIAGNOSTIC_INFO() -> [f32; 4] { [0.27, 0.52, 0.82, 1.0] }
+
 // Editor font metrics are runtime (driven by `editor.fontSize` / `editor.lineHeight`).
 #[allow(non_snake_case)]
 pub fn FONT_SIZE() -> f32 { crate::settings::font_size() * ui_zoom() }

@@ -30,6 +30,11 @@ pub enum WorkerMsg {
     // Feedback form: screenshot uploaded (if any) + GitHub issue created — Ok(url)
     // on success, Err(message) otherwise.
     FeedbackDone { result: Result<String, String> },
+    // ---- Language server (see lsp.rs) ----
+    LspInitialized,                                              // initialize response arrived
+    LspDiagnostics { uri: String, diags: Vec<crate::lsp::Diagnostic> }, // publishDiagnostics
+    LspLog { server: &'static str, message: String },           // server log / stderr line
+    LspExited { server: &'static str },                         // server process ended
 }
 
 /// Where a README image comes from: a remote URL or a local file path.

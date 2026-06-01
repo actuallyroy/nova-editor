@@ -72,6 +72,10 @@ pub struct Document {
     pub image_scale: Option<f32>,        // None = fit-to-window; Some(s) = absolute scale
     pub image_pan: (f32, f32),           // pan offset (px) from centered position
     pub feedback: bool,                  // Some => Ctrl+Enter submits it as a GitHub issue
+    pub version: i32,                    // LSP document version (bumped on every edit)
+    pub diagnostics: Vec<crate::lsp::Diagnostic>, // current LSP diagnostics for this doc
+    pub lsp_dirty: bool,                 // text changed since the last didChange was sent
+    pub lsp_open: bool,                  // a didOpen has been sent to a server for this doc
 }
 
 fn apply_buffer_text(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, lines: usize, lang: Lang, ext: &str, wrap_width: Option<f32>) {
@@ -189,6 +193,10 @@ impl Document {
             image_scale: None,
             image_pan: (0.0, 0.0),
             feedback: false,
+            version: 0,
+            diagnostics: Vec::new(),
+            lsp_dirty: false,
+            lsp_open: false,
         }
     }
 
@@ -234,6 +242,10 @@ impl Document {
             image_scale: None,
             image_pan: (0.0, 0.0),
             feedback: false,
+            version: 0,
+            diagnostics: Vec::new(),
+            lsp_dirty: false,
+            lsp_open: false,
         }
     }
 
@@ -298,6 +310,10 @@ impl Document {
             image_scale: None,
             image_pan: (0.0, 0.0),
             feedback: false,
+            version: 0,
+            diagnostics: Vec::new(),
+            lsp_dirty: false,
+            lsp_open: false,
         }
     }
 
@@ -437,6 +453,47 @@ impl Document {
         self.future.clear();
         self.sel = sel_after;
         self.dirty = true;
+        // LSP: the text changed — bump the version and flag a pending didChange
+        // (App sends it debounced from the idle tick).
+        self.version += 1;
+        self.lsp_dirty = true;
+    }
+
+    /// `file://` URI for this document, if it has a path.
+    pub fn uri(&self) -> Option<String> {
+        self.path.as_deref().map(crate::lsp::path_to_uri)
+    }
+
+    /// LSP language id (e.g. "javascript"), if a server serves this file type.
+    pub fn language_id(&self) -> Option<&'static str> {
+        crate::lsp::language_id(&self.ext)
+    }
+
+    /// Full document text (for LSP full-text sync).
+    pub fn text(&self) -> String {
+        self.rope.to_string()
+    }
+
+    /// Absolute byte offset for an LSP position `(line, utf16_char)`. LSP characters
+    /// are UTF-16 code units within the line; the rope is UTF-8, so walk the line.
+    pub fn lsp_byte(&self, line: u32, ch: u32) -> usize {
+        let line = (line as usize).min(self.rope.len_lines().saturating_sub(1));
+        let line_start = self.rope.line_to_byte(line);
+        let mut utf16 = 0u32;
+        let mut byte = 0usize;
+        for c in self.rope.line(line).chars() {
+            if utf16 >= ch || c == '\n' {
+                break;
+            }
+            utf16 += c.len_utf16() as u32;
+            byte += c.len_utf8();
+        }
+        line_start + byte
+    }
+
+    /// Absolute byte (lo, hi) range of a diagnostic, for highlight rendering.
+    pub fn diag_byte_range(&self, d: &crate::lsp::Diagnostic) -> (usize, usize) {
+        (self.lsp_byte(d.start_line, d.start_char), self.lsp_byte(d.end_line, d.end_char))
     }
 
     pub fn insert_str(&mut self, s: &str, fs: &mut FontSystem) {

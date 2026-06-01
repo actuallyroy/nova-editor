@@ -18,6 +18,7 @@ mod gpu;
 mod icon;
 mod git;
 mod layout;
+mod lsp;
 mod markdown;
 mod marketplace;
 mod menus;
@@ -228,6 +229,10 @@ pub(crate) struct App {
     pub(crate) ext_remote: Vec<marketplace::RemoteExt>, // current marketplace search results
     pub(crate) worker_tx: Sender<WorkerMsg>,
     pub(crate) worker_rx: Receiver<WorkerMsg>,
+    /// Language-server clients (ESLint, …) — owns child processes + routing.
+    pub(crate) lsp: lsp::LspManager,
+    /// Last debounced-didChange tick, so we don't flood the server while typing.
+    pub(crate) lsp_last_sync: Instant,
     /// Extension detail page (README/CHANGELOG/Features). All its state lives in
     /// `ui::ext_detail_view::ExtDetailView`; accessed as `self.detail.*`.
     pub(crate) detail: ui::ext_detail_view::ExtDetailView,
@@ -302,6 +307,8 @@ impl App {
             ext_remote: Vec::new(),
             worker_tx,
             worker_rx,
+            lsp: lsp::LspManager::new(),
+            lsp_last_sync: Instant::now(),
             detail: ui::ext_detail_view::ExtDetailView::new(),
             pending_close: false,
             terminal: ui::terminal_panel::TerminalPanel::new(root.clone()),
@@ -1638,6 +1645,59 @@ impl App {
     fn zoom_step(&mut self, delta: f32) {
         let z = (theme::ui_zoom() + delta).clamp(0.5, 3.0);
         self.set_zoom(z);
+    }
+
+    /// Drive language-server document sync from the idle tick: open any served
+    /// document not yet sent to a server, and send a debounced full-text didChange
+    /// for edited ones. Centralized here so file-open/edit paths stay LSP-agnostic.
+    fn sync_lsp(&mut self) {
+        let Some(ext_dir) = crate::extensions::extensions_dir() else { return };
+        let ext_roots = [ext_dir];
+        let now = Instant::now();
+        let debounce = now.duration_since(self.lsp_last_sync) > Duration::from_millis(250);
+
+        struct Work { uri: String, lang: &'static str, version: i32, text: String, open: bool }
+        let mut work: Vec<Work> = Vec::new();
+        for d in &self.workspace.documents {
+            let (Some(lang), Some(uri)) = (d.language_id(), d.uri()) else { continue };
+            if lsp::server_for_language(lang).is_none() {
+                continue;
+            }
+            let open = !d.lsp_open;
+            let change = d.lsp_dirty && debounce;
+            if open || change {
+                work.push(Work { uri, lang, version: d.version, text: d.text(), open });
+            }
+        }
+        if work.is_empty() {
+            return;
+        }
+        // Ensure the (single, Phase-1) ESLint server is running for this workspace.
+        if let Err(e) = self.lsp.ensure_eslint(&self.cwd, &ext_roots, &self.worker_tx) {
+            eprintln!("[lsp:eslint] not started: {e}");
+            // Don't retry every tick once we know it can't start; mark docs handled.
+            for d in self.workspace.documents.iter_mut() {
+                d.lsp_open = true;
+                d.lsp_dirty = false;
+            }
+            return;
+        }
+        for w in &work {
+            if w.open {
+                self.lsp.did_open("eslint", &w.uri, w.lang, w.version, &w.text);
+            } else {
+                self.lsp.did_change("eslint", &w.uri, w.version, &w.text);
+            }
+        }
+        for d in self.workspace.documents.iter_mut() {
+            if let Some(uri) = d.uri() {
+                if work.iter().any(|w| w.uri == uri) {
+                    d.lsp_open = true;
+                    d.lsp_dirty = false;
+                }
+            }
+        }
+        self.lsp_last_sync = now;
     }
 
     fn apply_settings(&mut self) {
@@ -3040,6 +3100,26 @@ impl ApplicationHandler for App {
                         self.show_info_dialog("Update failed. Please try again or download from GitHub.");
                     }
                 }
+                WorkerMsg::LspInitialized => {
+                    self.lsp.on_initialized();
+                }
+                WorkerMsg::LspDiagnostics { uri, diags } => {
+                    if let Some(d) = self
+                        .workspace
+                        .documents
+                        .iter_mut()
+                        .find(|d| d.uri().as_deref() == Some(uri.as_str()))
+                    {
+                        d.diagnostics = diags;
+                        self.redraw();
+                    }
+                }
+                WorkerMsg::LspLog { server, message } => {
+                    eprintln!("[lsp:{server}] {message}");
+                }
+                WorkerMsg::LspExited { server } => {
+                    self.lsp.drop_server(server);
+                }
                 WorkerMsg::FeedbackDone { result } => match result {
                     Ok(url) if url.starts_with("http") => open_url(&url),
                     Ok(_) => self.show_info_dialog("Thanks! Your feedback was submitted."),
@@ -3051,6 +3131,9 @@ impl ApplicationHandler for App {
         }
 
         let now = Instant::now();
+
+        // Language-server document sync (open + debounced didChange).
+        self.sync_lsp();
 
         // files.autoSave (afterDelay): save dirty docs ~1s after the last edit.
         if settings::auto_save() && now.duration_since(self.last_edit) > Duration::from_millis(1000) {

@@ -113,7 +113,7 @@ impl Extension {
     }
 }
 
-fn extensions_dir() -> Option<PathBuf> {
+pub(crate) fn extensions_dir() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     let dir = PathBuf::from(home).join(".vscode").join("extensions");
     dir.is_dir().then_some(dir)

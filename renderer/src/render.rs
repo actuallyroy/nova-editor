@@ -827,6 +827,52 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
+        // Diagnostic underlines (LSP). One ~2px bar at the bottom of each covered
+        // visual row, colored by severity — reuses the selection byte→x mapping.
+        if !d.diagnostics.is_empty() {
+            let uz = theme::ui_zoom();
+            for diag in &d.diagnostics {
+                let (lo, hi) = d.diag_byte_range(diag);
+                let lo_line = d.rope.byte_to_line(lo);
+                let hi_line = d.rope.byte_to_line(hi.min(d.rope.len_bytes()));
+                let lo_col = lo - d.rope.line_to_byte(lo_line);
+                let hi_col = hi.saturating_sub(d.rope.line_to_byte(hi_line));
+                let color = match diag.severity {
+                    crate::lsp::Severity::Error => theme::DIAGNOSTIC_ERROR(),
+                    crate::lsp::Severity::Warning => theme::DIAGNOSTIC_WARNING(),
+                    _ => theme::DIAGNOSTIC_INFO(),
+                };
+                for run in d.buffer.layout_runs() {
+                    let line = run.line_i;
+                    if line < lo_line || line > hi_line {
+                        continue;
+                    }
+                    let (col_start, col_end) = if lo_line == hi_line {
+                        (lo_col, hi_col)
+                    } else if line == lo_line {
+                        (lo_col, usize::MAX)
+                    } else if line == hi_line {
+                        (0, hi_col)
+                    } else {
+                        (0, usize::MAX)
+                    };
+                    let (xs, xe) = x_range_in_run(&run, col_start, col_end);
+                    let w = (xe - xs).max(3.0 * uz);
+                    let line_y = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y();
+                    let under_y = line_y + run.line_height - 2.0 * uz;
+                    if let Some((qy, qh)) = clip_v(under_y, 2.0 * uz) {
+                        fg_quads.push(Quad::new(
+                            layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x(),
+                            qy,
+                            w,
+                            qh,
+                            color,
+                        ));
+                    }
+                }
+            }
+        }
+
         // Cursor (foreground so it sits over glyphs) — gated by blink. Read-only
         // tabs (images, diffs) have nothing to edit, so they show no caret.
         if app.cursor_blink_on && !d.read_only {
