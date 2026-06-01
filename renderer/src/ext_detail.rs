@@ -224,7 +224,7 @@ impl ExtensionDetail {
         let x = Self::main_x(r);
         let y = Self::content_y(r);
         let w = (Self::sidebar_x(r) - Self::content_gap() - x).max(80.0);
-        Rect { x, y, w, h: (r.y + r.h - y - Self::pad()).max(40.0) }
+        Rect { x, y, w, h: (r.y + r.h - y - Self::pad()).max(0.0) }
     }
     fn sidebar_rect(r: Rect) -> Rect {
         Rect { x: Self::sidebar_x(r) + theme::zpx(16.0), y: Self::content_y(r), w: Self::sidebar_w() - theme::zpx(28.0), h: r.h - Self::content_y(r) }
@@ -286,38 +286,59 @@ impl ExtensionDetail {
 
     pub fn icon_instance(&self, r: Rect) -> Option<IconInstance> {
         let ir = Self::icon_rect(r);
+        // Hide the icon entirely if it would spill below the editor region (e.g. a
+        // tall terminal leaves no room) — an atlas quad can't be partially clipped here.
+        if ir.y + ir.h > r.y + r.h {
+            return None;
+        }
         self.icon_uv.map(|uv| IconInstance { rect: [ir.x, ir.y, ir.w, ir.h], uv })
     }
 
     // ---- drawing ----
 
     pub fn draw_quads(&self, r: Rect, hovered_install: bool, hovered_tab: Option<DetailTab>, quads: &mut Vec<Quad>) {
+        // Clip chrome to the editor region (a tall terminal shortens it).
+        let bottom = r.y + r.h;
+        let clip = |rect: Rect| -> Option<Rect> {
+            (rect.y < bottom).then_some(Rect { h: rect.h.min(bottom - rect.y).max(0.0), ..rect })
+        };
         // Icon placeholder (real icon drawn via the atlas).
         if self.icon_uv.is_none() {
-            quads.push(Self::icon_rect(r).quad(self.icon_color));
+            if let Some(rr) = clip(Self::icon_rect(r)) {
+                quads.push(rr.quad(self.icon_color));
+            }
         }
         // Install button.
         if self.supported && !self.installed {
             let c = if hovered_install { theme::DIALOG_BTN_HOVER() } else { theme::DIALOG_BTN() };
-            quads.push(Self::install_rect(r).quad(c));
+            if let Some(rr) = clip(Self::install_rect(r)) {
+                quads.push(rr.quad(c));
+            }
         }
         // Tab bar bottom border across the main column.
         let tabs = self.tab_rects(r);
         let bar_y = Self::tabbar_y(r) + Self::tabbar_h();
         let main_x = Self::main_x(r);
         let bar_w = Self::sidebar_x(r) - Self::content_gap() - main_x;
-        quads.push(Quad::new(main_x, bar_y - 1.0, bar_w, 1.0, theme::BORDER()));
-        // Hovered tab subtle bg + active tab accent underline.
-        for (i, t) in DetailTab::ALL.iter().enumerate() {
-            if hovered_tab == Some(*t) && *t != self.tab {
-                quads.push(tabs[i].quad(theme::TREE_HOVER()));
+        if bar_y <= bottom {
+            quads.push(Quad::new(main_x, bar_y - 1.0, bar_w, 1.0, theme::BORDER()));
+            // Hovered tab subtle bg + active tab accent underline.
+            for (i, t) in DetailTab::ALL.iter().enumerate() {
+                if hovered_tab == Some(*t) && *t != self.tab {
+                    if let Some(rr) = clip(tabs[i]) {
+                        quads.push(rr.quad(theme::TREE_HOVER()));
+                    }
+                }
             }
+            let a = tabs[self.tab.index()];
+            quads.push(Quad::new(a.x, bar_y - 2.0, a.w, 2.0, color_quad(theme::FG_ACTIVE())));
         }
-        let a = tabs[self.tab.index()];
-        quads.push(Quad::new(a.x, bar_y - 2.0, a.w, 2.0, color_quad(theme::FG_ACTIVE())));
         // Vertical separator before the sidebar.
         let sx = Self::sidebar_x(r) - Self::content_gap() * 0.5;
-        quads.push(Quad::new(sx, Self::tabbar_y(r), 1.0, r.y + r.h - Self::tabbar_y(r), theme::BORDER()));
+        let sep_top = Self::tabbar_y(r);
+        if sep_top < bottom {
+            quads.push(Quad::new(sx, sep_top, 1.0, bottom - sep_top, theme::BORDER()));
+        }
     }
 
     pub fn draw_text<'a>(
@@ -328,34 +349,50 @@ impl ExtensionDetail {
         areas: &mut Vec<TextArea<'a>>,
         img_rects: &mut Vec<(String, Rect)>,
     ) {
+        // Clip everything to the editor region: when the terminal panel is tall the
+        // region is short, and the detail content must not spill over the terminal.
+        let bottom = r.y + r.h;
+        let clip = |rect: Rect| -> Option<Rect> {
+            (rect.y < bottom).then_some(Rect { h: rect.h.min(bottom - rect.y).max(0.0), ..rect })
+        };
         let htext_x = Self::header_text_x(r);
         let avail = Self::install_rect(r).x - htext_x - theme::zpx(16.0);
         let top = r.y + Self::header_top();
-        self.name.push(htext_x, Rect { x: htext_x, y: top, w: avail, h: theme::zpx(34.0) }, theme::FG_ACTIVE(), areas);
-        self.meta.push(htext_x, Rect { x: htext_x, y: top + theme::zpx(36.0), w: avail, h: theme::zpx(22.0) }, theme::FG_DIM(), areas);
-        self.desc.push(htext_x, Rect { x: htext_x, y: top + theme::zpx(58.0), w: avail, h: theme::zpx(40.0) }, theme::FG_TEXT(), areas);
+        if let Some(rr) = clip(Rect { x: htext_x, y: top, w: avail, h: theme::zpx(34.0) }) {
+            self.name.push(htext_x, rr, theme::FG_ACTIVE(), areas);
+        }
+        if let Some(rr) = clip(Rect { x: htext_x, y: top + theme::zpx(36.0), w: avail, h: theme::zpx(22.0) }) {
+            self.meta.push(htext_x, rr, theme::FG_DIM(), areas);
+        }
+        if let Some(rr) = clip(Rect { x: htext_x, y: top + theme::zpx(58.0), w: avail, h: theme::zpx(40.0) }) {
+            self.desc.push(htext_x, rr, theme::FG_TEXT(), areas);
+        }
 
         // Tab labels.
         let tabs = self.tab_rects(r);
         for (i, t) in DetailTab::ALL.iter().enumerate() {
-            let color = if *t == self.tab { theme::FG_ACTIVE() } else { theme::FG_DIM() };
-            self.tabs[i].draw_center(tabs[i], color, areas);
+            if let Some(rr) = clip(tabs[i]) {
+                let color = if *t == self.tab { theme::FG_ACTIVE() } else { theme::FG_DIM() };
+                self.tabs[i].draw_center(rr, color, areas);
+            }
         }
 
         // Active body (scrolled + clipped); collects image rects for the media layer.
         self.active_body().draw(Self::body_rect(r), scroll, size_of, areas, img_rects);
 
         // Sidebar metadata.
-        let sr = Self::sidebar_rect(r);
-        self.sidebar.push(sr.x, sr, theme::FG_TEXT(), areas);
+        if let Some(sr) = clip(Self::sidebar_rect(r)) {
+            self.sidebar.push(sr.x, sr, theme::FG_TEXT(), areas);
+        }
 
         // Install / Installed label.
         if self.supported {
-            let pill = Self::install_rect(r);
-            if self.installed {
-                self.installed_lbl.draw_center(pill, theme::FG_DIM(), areas);
-            } else {
-                self.install.draw_center(pill, theme::FG_ACTIVE(), areas);
+            if let Some(pill) = clip(Self::install_rect(r)) {
+                if self.installed {
+                    self.installed_lbl.draw_center(pill, theme::FG_DIM(), areas);
+                } else {
+                    self.install.draw_center(pill, theme::FG_ACTIVE(), areas);
+                }
             }
         }
     }
