@@ -159,6 +159,38 @@ pub fn resolve_node() -> Option<String> {
     None
 }
 
+/// Locate the globally-installed `typescript-language-server` CLI entry
+/// (`lib/cli.mjs`), launched with node. Probes the standard npm-global roots.
+pub fn typescript_ls_cli() -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        roots.push(PathBuf::from(appdata).join("npm").join("node_modules"));
+    }
+    #[cfg(not(windows))]
+    {
+        for p in ["/usr/local/lib/node_modules", "/opt/homebrew/lib/node_modules", "/usr/lib/node_modules"] {
+            roots.push(PathBuf::from(p));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join(".npm-global/lib/node_modules"));
+        }
+    }
+    for r in roots {
+        let p = r.join("typescript-language-server").join("lib").join("cli.mjs");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// `initializationOptions` for typescript-language-server (minimal; it auto-detects
+/// tsserver from the workspace or its bundled copy).
+pub fn ts_init_options() -> Value {
+    json!({ "hostInfo": "nova", "preferences": {} })
+}
+
 /// Locate the ESLint extension's bundled stdio server (`server/out/eslintServer.js`)
 /// among the installed extensions under `ext_dir` roots.
 pub fn eslint_server_path(ext_roots: &[PathBuf]) -> Option<PathBuf> {
@@ -357,6 +389,25 @@ impl LspClient {
         id
     }
 
+    /// Request full semantic tokens (LSP 3.17 `textDocument/semanticTokens/full`).
+    /// Returns the request id so the caller can map the response to this URI.
+    pub fn pull_semantic_tokens(&mut self, uri: &str) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/semanticTokens/full",
+            "params": { "textDocument": { "uri": uri } }
+        });
+        if self.initialized {
+            self.send_raw(msg);
+        } else {
+            self.pending.push(msg);
+        }
+        id
+    }
+
     pub fn shutdown(&mut self) {
         let id = self.next_id;
         self.next_id += 1;
@@ -365,11 +416,16 @@ impl LspClient {
     }
 }
 
-/// Owns the running language-server clients and routes document lifecycle events
-/// to the right one. Phase 1: one client per server name, rooted at the workspace.
+/// Owns the running language-server clients, the document-sync loop, and routing of
+/// server responses back onto documents — so `App` only calls `sync` + the `apply_*`
+/// handlers and holds none of this state itself.
 #[derive(Default)]
 pub struct LspManager {
     clients: Vec<LspClient>,
+    last_sync: Option<std::time::Instant>,
+    diag_pending: std::collections::HashMap<i64, String>, // diagnostic request id → uri
+    sem_pending: std::collections::HashMap<i64, String>,  // semantic-tokens request id → uri
+    sem_legend: Vec<String>,                              // semantic token-type names
 }
 
 impl LspManager {
@@ -402,6 +458,34 @@ impl LspManager {
         .ok_or("failed to spawn ESLint server")?;
         self.clients.push(client);
         Ok(())
+    }
+
+    /// Ensure the TypeScript language server (semantic tokens for JS/TS) is running
+    /// for `root`. Returns Err with a reason if node or the server can't be found.
+    pub fn ensure_ts(&mut self, root: &Path, tx: &Sender<WorkerMsg>) -> Result<(), String> {
+        if self.client_mut("typescript").is_some() {
+            return Ok(());
+        }
+        let node = resolve_node().ok_or("node not found on PATH")?;
+        let cli = typescript_ls_cli().ok_or("typescript-language-server not installed (npm i -g typescript-language-server typescript)")?;
+        let args = vec![cli.to_string_lossy().into_owned(), "--stdio".to_string()];
+        let client = LspClient::start(
+            "typescript",
+            &node,
+            &args,
+            root.to_path_buf(),
+            ts_init_options(),
+            json!({}), // workspace/configuration reply (defaults)
+            tx.clone(),
+        )
+        .ok_or("failed to spawn typescript-language-server")?;
+        self.clients.push(client);
+        Ok(())
+    }
+
+    /// Request semantic tokens from a server; returns the request id.
+    pub fn pull_semantic_tokens(&mut self, server: &str, uri: &str) -> Option<i64> {
+        self.client_mut(server).map(|c| c.pull_semantic_tokens(uri))
     }
 
     /// Finish the handshake on whichever client just got its initialize response.
@@ -446,6 +530,139 @@ impl LspManager {
             c.shutdown();
         }
         self.clients.clear();
+    }
+
+    // ---- Orchestration (driven from App's idle tick / worker loop) ----
+
+    /// Open any served document not yet sent to the servers, send a debounced
+    /// full-text didChange for edited ones, and request diagnostics (ESLint) +
+    /// semantic tokens (TypeScript). Best-effort per server.
+    pub fn sync(
+        &mut self,
+        docs: &mut [crate::document::Document],
+        cwd: &Path,
+        ext_roots: &[PathBuf],
+        tx: &Sender<WorkerMsg>,
+    ) {
+        let now = std::time::Instant::now();
+        let debounce = self
+            .last_sync
+            .map_or(true, |t| now.duration_since(t) > std::time::Duration::from_millis(250));
+        struct Work {
+            uri: String,
+            lang: &'static str,
+            version: i32,
+            text: String,
+            open: bool,
+        }
+        let mut work: Vec<Work> = Vec::new();
+        for d in docs.iter() {
+            let (Some(lang), Some(uri)) = (d.language_id(), d.uri()) else { continue };
+            if server_for_language(lang).is_none() {
+                continue;
+            }
+            let open = !d.lsp_open;
+            let change = d.lsp_dirty && debounce;
+            if open || change {
+                work.push(Work { uri, lang, version: d.version, text: d.text(), open });
+            }
+        }
+        if work.is_empty() {
+            return;
+        }
+        let eslint_ok = self.ensure_eslint(cwd, ext_roots, tx).is_ok();
+        let ts_ok = self.ensure_ts(cwd, tx).is_ok();
+        if !eslint_ok && !ts_ok {
+            for d in docs.iter_mut() {
+                d.lsp_open = true;
+                d.lsp_dirty = false;
+            }
+            return;
+        }
+        for w in &work {
+            if w.open {
+                if eslint_ok {
+                    self.did_open("eslint", &w.uri, w.lang, w.version, &w.text);
+                }
+                if ts_ok {
+                    self.did_open("typescript", &w.uri, w.lang, w.version, &w.text);
+                }
+            } else {
+                if eslint_ok {
+                    self.did_change("eslint", &w.uri, w.version, &w.text);
+                }
+                if ts_ok {
+                    self.did_change("typescript", &w.uri, w.version, &w.text);
+                }
+            }
+            if eslint_ok {
+                if let Some(id) = self.pull_diagnostics("eslint", &w.uri) {
+                    self.diag_pending.insert(id, w.uri.clone());
+                }
+            }
+            if ts_ok {
+                if let Some(id) = self.pull_semantic_tokens("typescript", &w.uri) {
+                    self.sem_pending.insert(id, w.uri.clone());
+                }
+            }
+        }
+        for d in docs.iter_mut() {
+            if let Some(uri) = d.uri() {
+                if work.iter().any(|w| w.uri == uri) {
+                    d.lsp_open = true;
+                    d.lsp_dirty = false;
+                }
+            }
+        }
+        self.last_sync = Some(now);
+    }
+
+    /// Initialize response arrived: store the semantic legend and finish handshakes.
+    pub fn on_initialized_legend(&mut self, sem_token_types: Vec<String>) {
+        if !sem_token_types.is_empty() {
+            self.sem_legend = sem_token_types;
+        }
+        self.on_initialized();
+    }
+
+    fn doc_for<'a>(docs: &'a mut [crate::document::Document], uri: &str) -> Option<&'a mut crate::document::Document> {
+        docs.iter_mut().find(|d| d.uri().map_or(false, |u| same_uri(&u, uri)))
+    }
+
+    /// Push `publishDiagnostics` → the matching document.
+    pub fn apply_diagnostics_push(&self, docs: &mut [crate::document::Document], uri: &str, diags: Vec<Diagnostic>) {
+        if let Some(d) = Self::doc_for(docs, uri) {
+            d.diagnostics = diags;
+        }
+    }
+
+    /// Pull diagnostic report (by request id) → the matching document.
+    pub fn apply_diagnostic_report(&mut self, docs: &mut [crate::document::Document], id: i64, diags: Vec<Diagnostic>) {
+        if let Some(uri) = self.diag_pending.remove(&id) {
+            if let Some(d) = Self::doc_for(docs, &uri) {
+                d.diagnostics = diags;
+            }
+        }
+    }
+
+    /// Semantic-tokens report (by request id) → decode + overlay on the document.
+    /// Returns true if a document was updated (caller should redraw).
+    pub fn apply_semantic(
+        &mut self,
+        docs: &mut [crate::document::Document],
+        fs: &mut glyphon::FontSystem,
+        id: i64,
+        data: Vec<u32>,
+    ) -> bool {
+        let Some(uri) = self.sem_pending.remove(&id) else { return false };
+        let toks = crate::highlight::decode_semantic(&data, &self.sem_legend);
+        if let Some(d) = Self::doc_for(docs, &uri) {
+            d.set_semantic(&toks);
+            d.reshape(fs);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -519,13 +736,28 @@ fn handle_server_message(msg: &Value, reply_tx: &Sender<Vec<u8>>, cfg_reply: &Va
         // ---- Responses to our requests ----
         (None, Some(id)) => {
             let result = msg.get("result");
-            if result.and_then(|r| r.get("capabilities")).is_some() {
-                // initialize response → finish the handshake.
-                let _ = tx.send(WorkerMsg::LspInitialized);
+            if let Some(caps) = result.and_then(|r| r.get("capabilities")) {
+                // initialize response → finish the handshake; carry the semantic-tokens
+                // legend (token-type names) so App can decode token reports.
+                let sem_token_types = caps
+                    .get("semanticTokensProvider")
+                    .and_then(|p| p.get("legend"))
+                    .and_then(|l| l.get("tokenTypes"))
+                    .and_then(|t| t.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let _ = tx.send(WorkerMsg::LspInitialized { sem_token_types });
             } else if let Some(r) = result {
-                // A pull-diagnostics report: { kind: "full"|"unchanged", items: [...] }.
-                // App maps the request id back to the document URI.
-                if r.get("items").is_some() || r.get("kind").is_some() {
+                if r.get("data").is_some() {
+                    // Semantic tokens report: { resultId?, data: [u32; 5n] }.
+                    let data: Vec<u32> = r
+                        .get("data")
+                        .and_then(|d| d.as_array())
+                        .map(|a| a.iter().filter_map(|n| n.as_u64().map(|x| x as u32)).collect())
+                        .unwrap_or_default();
+                    let _ = tx.send(WorkerMsg::LspSemanticTokens { id: id.as_i64().unwrap_or(0), data });
+                } else if r.get("items").is_some() || r.get("kind").is_some() {
+                    // Pull-diagnostics report: { kind: "full"|"unchanged", items: [...] }.
                     let diags = parse_diag_array(r.get("items"));
                     let _ = tx.send(WorkerMsg::LspDiagnosticReport { id: id.as_i64().unwrap_or(0), diags });
                 }
@@ -573,7 +805,13 @@ fn client_capabilities() -> Value {
             "hover": { "contentFormat": ["plaintext", "markdown"] },
             "completion": { "completionItem": { "snippetSupport": false } },
             "codeAction": { "codeActionLiteralSupport": { "codeActionKind": { "valueSet": ["quickfix", "source.fixAll"] } } },
-            "diagnostic": { "dynamicRegistration": true, "relatedDocumentSupport": false }
+            "diagnostic": { "dynamicRegistration": true, "relatedDocumentSupport": false },
+            "semanticTokens": {
+                "requests": { "full": true, "range": false },
+                "tokenTypes": ["namespace","type","class","enum","interface","struct","typeParameter","parameter","variable","property","enumMember","event","function","method","macro","keyword","modifier","comment","string","number","regexp","operator","decorator"],
+                "tokenModifiers": ["declaration","definition","readonly","static","deprecated","abstract","async","modification","documentation","defaultLibrary"],
+                "formats": ["relative"]
+            }
         },
         "workspace": { "configuration": true, "workspaceFolders": true, "applyEdit": true }
     })

@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Wrap};
+use glyphon::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Wrap};
 use ropey::Rope;
 
 use crate::syntax::{self, Lang};
@@ -78,6 +78,7 @@ pub struct Document {
     pub lsp_open: bool,                  // a didOpen has been sent to a server for this doc
     hl: Option<crate::highlight::LineCache>, // syntect incremental highlighter (None = no grammar)
     hl_dirty_from: usize,                // lowest line changed since the last highlight (usize::MAX = none)
+    semantic: Vec<(usize, usize, Color)>, // Layer-2 LSP semantic tokens (byte range → color)
 }
 
 /// Set the buffer's metrics/wrap/size and its (rich) text. `spans` are precomputed
@@ -90,7 +91,8 @@ fn apply_buffer_text(
     lines: usize,
     lang: Lang,
     wrap_width: Option<f32>,
-    spans: Option<Vec<(String, Attrs<'static>)>>,
+    spans: Option<Vec<(String, Color)>>,
+    semantic: &[(usize, usize, Color)],
 ) {
     // Pick up the current editor font size / line height (driven by settings).
     buffer.set_metrics(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
@@ -99,9 +101,13 @@ fn apply_buffer_text(
     let h = (lines as f32 + 2.0) * theme::LINE_HEIGHT() + 200.0;
     buffer.set_size(fs, wrap_width, Some(h));
     let mono = Attrs::new().family(Family::Name(theme::MONO_FAMILY()));
-    // syntect spans (Layer 1) if available; else markdown line styling; else plain.
-    let spans = spans.or_else(|| (lang == Lang::Markdown).then(|| md_spans(text)));
-    if let Some(spans) = spans {
+    // Layer 1 = syntect colors; Layer 2 = LSP semantic-token colors overlaid on top.
+    // Else markdown line styling; else plain.
+    let attr_spans: Option<Vec<(String, Attrs<'static>)>> = match spans {
+        Some(layer1) => Some(merge_spans(text, layer1, semantic, mono)),
+        None => (lang == Lang::Markdown).then(|| md_spans(text)),
+    };
+    if let Some(spans) = attr_spans {
         buffer.set_rich_text(
             fs,
             spans.iter().map(|(s, a)| (s.as_str(), *a)),
@@ -112,6 +118,48 @@ fn apply_buffer_text(
         buffer.set_text(fs, text, mono, Shaping::Advanced);
     }
     buffer.shape_until_scroll(fs, false);
+}
+
+/// Merge Layer-1 (syntect) colored spans with Layer-2 (LSP semantic) byte-range
+/// overrides into final `(text, Attrs)` runs. Fast path when there are no semantic
+/// tokens (just attach the mono family to each Layer-1 color); otherwise resolve a
+/// per-byte color array (semantic wins) and run-length-encode it on char boundaries.
+fn merge_spans(
+    text: &str,
+    layer1: Vec<(String, Color)>,
+    semantic: &[(usize, usize, Color)],
+    mono: Attrs<'static>,
+) -> Vec<(String, Attrs<'static>)> {
+    if semantic.is_empty() {
+        return layer1.into_iter().map(|(s, c)| (s, mono.color(c))).collect();
+    }
+    let mut colors: Vec<Color> = Vec::with_capacity(text.len());
+    for (s, c) in &layer1 {
+        for _ in 0..s.len() {
+            colors.push(*c);
+        }
+    }
+    colors.resize(text.len(), theme::FG_TEXT());
+    for &(b0, b1, c) in semantic {
+        for i in b0.min(text.len())..b1.min(text.len()) {
+            colors[i] = c;
+        }
+    }
+    let mut out: Vec<(String, Attrs<'static>)> = Vec::new();
+    let mut start = 0usize;
+    let mut cur = colors.first().copied().unwrap_or_else(theme::FG_TEXT);
+    for (idx, _) in text.char_indices() {
+        let c = colors[idx];
+        if c != cur {
+            out.push((text[start..idx].to_string(), mono.color(cur)));
+            start = idx;
+            cur = c;
+        }
+    }
+    if start < text.len() {
+        out.push((text[start..].to_string(), mono.color(cur)));
+    }
+    out
 }
 
 /// Line-level markdown highlighting (headings, quotes, rules, list markers,
@@ -177,7 +225,7 @@ impl Document {
         // Layer-1 highlighter: a syntect grammar for this file type (None → plain/markdown).
         let mut hl = crate::highlight::LineCache::new(&ext);
         let spans = hl.as_mut().map(|h| h.highlight(&display, 0));
-        apply_buffer_text(&mut buffer, fs, &display, display.matches('\n').count(), lang, wrap_width, spans);
+        apply_buffer_text(&mut buffer, fs, &display, display.matches('\n').count(), lang, wrap_width, spans, &[]);
         let name = match &path {
             Some(p) => p
                 .file_name()
@@ -212,6 +260,7 @@ impl Document {
             lsp_open: false,
             hl,
             hl_dirty_from: usize::MAX,
+            semantic: Vec::new(),
         }
     }
 
@@ -263,6 +312,7 @@ impl Document {
             lsp_open: false,
             hl: None,
             hl_dirty_from: usize::MAX,
+            semantic: Vec::new(),
         }
     }
 
@@ -301,7 +351,7 @@ impl Document {
         let mk = |fs: &mut FontSystem, text: &str| {
             let mut b = Buffer::new(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
             let display = text.replace('\r', "");
-            apply_buffer_text(&mut b, fs, &display, display.matches('\n').count(), Lang::PlainText, None, None);
+            apply_buffer_text(&mut b, fs, &display, display.matches('\n').count(), Lang::PlainText, None, None, &[]);
             b
         };
         let buffer = mk(fs, &diff.left_text);
@@ -333,6 +383,7 @@ impl Document {
             lsp_open: false,
             hl: None,
             hl_dirty_from: usize::MAX,
+            semantic: Vec::new(),
         }
     }
 
@@ -433,13 +484,22 @@ impl Document {
         // no text change since last highlight → returns cached spans, no re-tokenize).
         let dirty = std::mem::replace(&mut self.hl_dirty_from, usize::MAX);
         let spans = self.hl.as_mut().map(|h| h.highlight(&text, dirty));
-        apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, self.wrap_width, spans);
+        apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, self.wrap_width, spans, &self.semantic);
         crate::perf::log(&format!("reshape({lines} lines): to_string {:?}, highlight+shape {:?}", t_str, t1.elapsed()));
     }
 
     /// Force a full re-highlight on the next reshape (e.g. after a theme change).
     pub fn invalidate_highlight(&mut self) {
         self.hl_dirty_from = 0;
+    }
+
+    /// Store Layer-2 semantic tokens `(line, start_utf16, len_utf16, color)`, mapped
+    /// to byte ranges. They overlay the syntect colors on the next reshape.
+    pub fn set_semantic(&mut self, toks: &[(u32, u32, u32, Color)]) {
+        self.semantic = toks
+            .iter()
+            .map(|&(line, start, len, c)| (self.lsp_byte(line, start), self.lsp_byte(line, start + len), c))
+            .collect();
     }
 
     /// Replace the entire document from an external on-disk change (e.g. Replace

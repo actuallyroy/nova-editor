@@ -11,7 +11,7 @@
 
 use std::sync::OnceLock;
 
-use glyphon::{Attrs, Color, Family};
+use glyphon::Color;
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
 fn syntax_set() -> &'static SyntaxSet {
@@ -65,8 +65,45 @@ pub fn scope_color(s: &str) -> Color {
     }
 }
 
-fn attrs(color: Color) -> Attrs<'static> {
-    Attrs::new().family(Family::Name(crate::theme::MONO_FAMILY())).color(color)
+/// Color for an LSP semantic token type (Layer 2). `None` = don't override the
+/// Layer-1 color (so we only recolor where semantic info is meaningful).
+pub fn semantic_color(token_type: &str) -> Option<Color> {
+    use crate::theme;
+    Some(match token_type {
+        "namespace" | "type" | "class" | "enum" | "interface" | "struct" | "typeParameter" | "decorator" => {
+            theme::SYN_TYPE()
+        }
+        "function" | "method" | "macro" => theme::SYN_FUNCTION(),
+        "parameter" => theme::SYN_NUMBER(), // distinct hue (params can't be told apart by TextMate)
+        "variable" | "property" | "enumMember" | "event" => theme::SYN_VARIABLE(),
+        "keyword" | "modifier" => theme::SYN_KEYWORD(),
+        "string" => theme::SYN_STRING(),
+        "number" => theme::SYN_NUMBER(),
+        "comment" => theme::SYN_COMMENT(),
+        _ => return None,
+    })
+}
+
+/// Decode an LSP semantic-tokens `data` array (groups of 5 u32: deltaLine,
+/// deltaStartChar, length, tokenType, tokenModifiers) against the server's `legend`
+/// (token-type names) into absolute `(line, start_utf16, len_utf16, color)` tokens.
+/// Tokens whose type has no distinct color are dropped (Layer 1 shows through).
+pub fn decode_semantic(data: &[u32], legend: &[String]) -> Vec<(u32, u32, u32, Color)> {
+    let mut out = Vec::new();
+    let (mut line, mut start) = (0u32, 0u32);
+    for chunk in data.chunks_exact(5) {
+        let (dl, ds, len, ttype) = (chunk[0], chunk[1], chunk[2], chunk[3] as usize);
+        if dl > 0 {
+            line += dl;
+            start = ds;
+        } else {
+            start += ds;
+        }
+        if let Some(color) = legend.get(ttype).and_then(|t| semantic_color(t)) {
+            out.push((line, start, len, color));
+        }
+    }
+    out
 }
 
 /// The color for the top of a scope stack (deepest scope drives the color).
@@ -89,8 +126,8 @@ pub struct LineCache {
     ext: String,
     /// (ParseState, ScopeStack) snapshot at the start of line `i`.
     starts: Vec<(ParseState, ScopeStack)>,
-    /// Cached rich-text spans (substring, attrs) for line `i`, including its `\n`.
-    spans: Vec<Vec<(String, Attrs<'static>)>>,
+    /// Cached colored spans (substring, color) for line `i`, including its `\n`.
+    spans: Vec<Vec<(String, Color)>>,
 }
 
 impl LineCache {
@@ -106,7 +143,7 @@ impl LineCache {
     /// Re-tokenize `text` from `dirty_line` onward, reusing cached line states
     /// before it. Returns the full document's rich-text spans (concatenated lines).
     /// Pass `dirty_line = 0` for a fresh document.
-    pub fn highlight(&mut self, text: &str, dirty_line: usize) -> Vec<(String, Attrs<'static>)> {
+    pub fn highlight(&mut self, text: &str, dirty_line: usize) -> Vec<(String, Color)> {
         let ss = syntax_set();
         let lines: Vec<&str> = LinesWithEndingsIter::new(text).collect();
         // Truncate caches to the dirty boundary (keep states for [0, dirty_line]).
@@ -117,21 +154,21 @@ impl LineCache {
         for i in start..lines.len() {
             let (mut state, mut stack) = self.starts[i].clone();
             let line = lines[i];
-            let mut line_spans: Vec<(String, Attrs<'static>)> = Vec::new();
+            let mut line_spans: Vec<(String, Color)> = Vec::new();
             if let Ok(ops) = state.parse_line(line, ss) {
                 let mut last = 0usize;
                 for (idx, op) in ops {
                     if idx > last {
-                        line_spans.push((line[last..idx].to_string(), attrs(color_for_stack(&stack))));
+                        line_spans.push((line[last..idx].to_string(), color_for_stack(&stack)));
                     }
                     stack.apply(&op).ok();
                     last = idx;
                 }
                 if last < line.len() {
-                    line_spans.push((line[last..].to_string(), attrs(color_for_stack(&stack))));
+                    line_spans.push((line[last..].to_string(), color_for_stack(&stack)));
                 }
             } else {
-                line_spans.push((line.to_string(), attrs(crate::theme::FG_TEXT())));
+                line_spans.push((line.to_string(), crate::theme::FG_TEXT()));
             }
             if i < self.spans.len() {
                 self.spans[i] = line_spans;
