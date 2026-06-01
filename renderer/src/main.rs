@@ -233,6 +233,8 @@ pub(crate) struct App {
     pub(crate) lsp: lsp::LspManager,
     /// Last debounced-didChange tick, so we don't flood the server while typing.
     pub(crate) lsp_last_sync: Instant,
+    /// Pull-diagnostics request id → document URI (ESLint uses the pull model).
+    pub(crate) lsp_diag_pending: std::collections::HashMap<i64, String>,
     /// Extension detail page (README/CHANGELOG/Features). All its state lives in
     /// `ui::ext_detail_view::ExtDetailView`; accessed as `self.detail.*`.
     pub(crate) detail: ui::ext_detail_view::ExtDetailView,
@@ -309,6 +311,7 @@ impl App {
             worker_rx,
             lsp: lsp::LspManager::new(),
             lsp_last_sync: Instant::now(),
+            lsp_diag_pending: std::collections::HashMap::new(),
             detail: ui::ext_detail_view::ExtDetailView::new(),
             pending_close: false,
             terminal: ui::terminal_panel::TerminalPanel::new(root.clone()),
@@ -1687,6 +1690,10 @@ impl App {
                 self.lsp.did_open("eslint", &w.uri, w.lang, w.version, &w.text);
             } else {
                 self.lsp.did_change("eslint", &w.uri, w.version, &w.text);
+            }
+            // ESLint uses pull diagnostics — request them and map the id back to the URI.
+            if let Some(id) = self.lsp.pull_diagnostics("eslint", &w.uri) {
+                self.lsp_diag_pending.insert(id, w.uri.clone());
             }
         }
         for d in self.workspace.documents.iter_mut() {
@@ -3108,10 +3115,23 @@ impl ApplicationHandler for App {
                         .workspace
                         .documents
                         .iter_mut()
-                        .find(|d| d.uri().as_deref() == Some(uri.as_str()))
+                        .find(|d| d.uri().map_or(false, |u| lsp::same_uri(&u, &uri)))
                     {
                         d.diagnostics = diags;
                         self.redraw();
+                    }
+                }
+                WorkerMsg::LspDiagnosticReport { id, diags } => {
+                    if let Some(uri) = self.lsp_diag_pending.remove(&id) {
+                        if let Some(d) = self
+                            .workspace
+                            .documents
+                            .iter_mut()
+                            .find(|d| d.uri().map_or(false, |u| lsp::same_uri(&u, &uri)))
+                        {
+                            d.diagnostics = diags;
+                            self.redraw();
+                        }
                     }
                 }
                 WorkerMsg::LspLog { server, message } => {

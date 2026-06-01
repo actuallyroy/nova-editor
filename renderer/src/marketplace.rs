@@ -32,7 +32,8 @@ pub enum WorkerMsg {
     FeedbackDone { result: Result<String, String> },
     // ---- Language server (see lsp.rs) ----
     LspInitialized,                                              // initialize response arrived
-    LspDiagnostics { uri: String, diags: Vec<crate::lsp::Diagnostic> }, // publishDiagnostics
+    LspDiagnostics { uri: String, diags: Vec<crate::lsp::Diagnostic> }, // push publishDiagnostics
+    LspDiagnosticReport { id: i64, diags: Vec<crate::lsp::Diagnostic> }, // pull diagnostic response
     LspLog { server: &'static str, message: String },           // server log / stderr line
     LspExited { server: &'static str },                         // server process ended
 }

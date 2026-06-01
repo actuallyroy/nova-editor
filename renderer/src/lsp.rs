@@ -64,6 +64,23 @@ pub fn path_to_uri(path: &Path) -> String {
     }
 }
 
+/// Compare two `file://` URIs for the same file, tolerating the normalization a
+/// language server applies (drive-letter case on Windows, `%3A`/`%20` encoding,
+/// slash direction). Without this, ESLint's `file:///e:/…` won't match Nova's
+/// `file:///E:/…` and diagnostics get silently dropped.
+pub fn same_uri(a: &str, b: &str) -> bool {
+    fn norm(u: &str) -> String {
+        let s = u.trim_start_matches("file://").trim_start_matches('/');
+        let s = s.replace("%3A", ":").replace("%3a", ":").replace("%20", " ").replace('\\', "/");
+        if cfg!(windows) {
+            s.to_ascii_lowercase()
+        } else {
+            s
+        }
+    }
+    norm(a) == norm(b)
+}
+
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let rest = if cfg!(windows) { rest.trim_start_matches('/') } else { rest };
@@ -321,6 +338,25 @@ impl LspClient {
         self.notify("textDocument/didClose", json!({ "textDocument": { "uri": uri } }));
     }
 
+    /// Pull diagnostics for a document (LSP 3.17 `textDocument/diagnostic`). Returns
+    /// the request id so the caller can map the response back to this URI.
+    pub fn pull_diagnostics(&mut self, uri: &str) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/diagnostic",
+            "params": { "textDocument": { "uri": uri } }
+        });
+        if self.initialized {
+            self.send_raw(msg);
+        } else {
+            self.pending.push(msg);
+        }
+        id
+    }
+
     pub fn shutdown(&mut self) {
         let id = self.next_id;
         self.next_id += 1;
@@ -400,6 +436,11 @@ impl LspManager {
         }
     }
 
+    /// Request diagnostics for a doc; returns the request id (map it to the URI).
+    pub fn pull_diagnostics(&mut self, server: &str, uri: &str) -> Option<i64> {
+        self.client_mut(server).map(|c| c.pull_diagnostics(uri))
+    }
+
     pub fn shutdown_all(&mut self) {
         for c in &mut self.clients {
             c.shutdown();
@@ -477,9 +518,17 @@ fn handle_server_message(msg: &Value, reply_tx: &Sender<Vec<u8>>, cfg_reply: &Va
         }
         // ---- Responses to our requests ----
         (None, Some(id)) => {
-            // The initialize response (id 1) tells App to finish the handshake.
-            if id.as_i64() == Some(1) {
+            let result = msg.get("result");
+            if result.and_then(|r| r.get("capabilities")).is_some() {
+                // initialize response → finish the handshake.
                 let _ = tx.send(WorkerMsg::LspInitialized);
+            } else if let Some(r) = result {
+                // A pull-diagnostics report: { kind: "full"|"unchanged", items: [...] }.
+                // App maps the request id back to the document URI.
+                if r.get("items").is_some() || r.get("kind").is_some() {
+                    let diags = parse_diag_array(r.get("items"));
+                    let _ = tx.send(WorkerMsg::LspDiagnosticReport { id: id.as_i64().unwrap_or(0), diags });
+                }
             }
         }
         _ => {}
@@ -489,24 +538,29 @@ fn handle_server_message(msg: &Value, reply_tx: &Sender<Vec<u8>>, cfg_reply: &Va
 fn parse_diagnostics(params: Option<&Value>) -> Option<(String, Vec<Diagnostic>)> {
     let p = params?;
     let uri = p.get("uri")?.as_str()?.to_string();
+    Some((uri, parse_diag_array(p.get("diagnostics"))))
+}
+
+/// Parse an LSP diagnostics array (shared by push `publishDiagnostics` and pull
+/// `textDocument/diagnostic` reports).
+fn parse_diag_array(arr: Option<&Value>) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    if let Some(arr) = p.get("diagnostics").and_then(|d| d.as_array()) {
-        for d in arr {
-            let range = d.get("range")?;
-            let s = range.get("start")?;
-            let e = range.get("end")?;
-            out.push(Diagnostic {
-                start_line: s.get("line")?.as_u64()? as u32,
-                start_char: s.get("character")?.as_u64()? as u32,
-                end_line: e.get("line")?.as_u64()? as u32,
-                end_char: e.get("character")?.as_u64()? as u32,
-                severity: Severity::from_lsp(d.get("severity").and_then(|v| v.as_i64()).unwrap_or(1)),
-                message: d.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
-                source: d.get("source").and_then(|m| m.as_str()).map(|s| s.to_string()),
-            });
-        }
+    let Some(arr) = arr.and_then(|d| d.as_array()) else { return out };
+    for d in arr {
+        let Some(range) = d.get("range") else { continue };
+        let (Some(s), Some(e)) = (range.get("start"), range.get("end")) else { continue };
+        let g = |v: Option<&Value>, k: &str| v.and_then(|x| x.get(k)).and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+        out.push(Diagnostic {
+            start_line: g(Some(s), "line"),
+            start_char: g(Some(s), "character"),
+            end_line: g(Some(e), "line"),
+            end_char: g(Some(e), "character"),
+            severity: Severity::from_lsp(d.get("severity").and_then(|v| v.as_i64()).unwrap_or(1)),
+            message: d.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
+            source: d.get("source").and_then(|m| m.as_str()).map(|s| s.to_string()),
+        });
     }
-    Some((uri, out))
+    out
 }
 
 /// The capabilities Nova advertises. Conservative for Phase 1 (sync + diagnostics);
@@ -518,7 +572,8 @@ fn client_capabilities() -> Value {
             "publishDiagnostics": { "relatedInformation": false },
             "hover": { "contentFormat": ["plaintext", "markdown"] },
             "completion": { "completionItem": { "snippetSupport": false } },
-            "codeAction": { "codeActionLiteralSupport": { "codeActionKind": { "valueSet": ["quickfix", "source.fixAll"] } } }
+            "codeAction": { "codeActionLiteralSupport": { "codeActionKind": { "valueSet": ["quickfix", "source.fixAll"] } } },
+            "diagnostic": { "dynamicRegistration": true, "relatedDocumentSupport": false }
         },
         "workspace": { "configuration": true, "workspaceFolders": true, "applyEdit": true }
     })
