@@ -102,9 +102,13 @@ fn apply_buffer_text(
     buffer.set_size(fs, wrap_width, Some(h));
     let mono = Attrs::new().family(Family::Name(theme::MONO_FAMILY()));
     // Layer 1 = syntect colors; Layer 2 = LSP semantic-token colors overlaid on top.
-    // Else markdown line styling; else plain.
+    // With no Layer-1 grammar but semantic tokens present, color from semantics over a
+    // plain base. Else markdown line styling; else plain.
     let attr_spans: Option<Vec<(String, Attrs<'static>)>> = match spans {
         Some(layer1) => Some(merge_spans(text, layer1, semantic, mono)),
+        None if !semantic.is_empty() => {
+            Some(merge_spans(text, vec![(text.to_string(), theme::FG_TEXT())], semantic, mono))
+        }
         None => (lang == Lang::Markdown).then(|| md_spans(text)),
     };
     if let Some(spans) = attr_spans {

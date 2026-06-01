@@ -19,11 +19,17 @@ fn syntax_set() -> &'static SyntaxSet {
     S.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
-/// The bundled syntax for a file extension, if any.
+/// The bundled syntax for a file extension, if any. syntect's default set bundles
+/// JavaScript but not TypeScript, so TS-family extensions fall back to the JS grammar
+/// (a near-superset); Layer 2 semantic tokens fill in the type-specific coloring.
 fn syntax_for(ext: &str) -> Option<&'static SyntaxReference> {
     let ss = syntax_set();
     ss.find_syntax_by_extension(ext)
         .or_else(|| ss.find_syntax_by_token(ext))
+        .or_else(|| match ext {
+            "ts" | "mts" | "cts" | "tsx" | "jsx" | "mjs" | "cjs" => ss.find_syntax_by_extension("js"),
+            _ => None,
+        })
 }
 
 /// True if we have a grammar for this extension (so callers can skip the fallback).
