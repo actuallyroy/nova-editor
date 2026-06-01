@@ -457,10 +457,24 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         Shaping::Advanced,
                     );
                     buf.shape_until_scroll(fs, false);
-                    // Capture the real monospace advance so cursors map exactly.
-                    if let Some(adv) =
-                        buf.layout_runs().flat_map(|r| r.glyphs.iter()).map(|g| g.w).find(|w| *w > 0.0)
+                    // Capture the real monospace advance so cursors map exactly. Use the
+                    // MOST COMMON advance (the ASCII majority), not the first glyph: TUIs
+                    // like Claude Code mix in box-drawing/powerline glyphs whose fallback
+                    // font is wider, so picking the first glyph makes cell_w flip-flop
+                    // frame-to-frame — which storms PTY resizes (SIGWINCH) and floods
+                    // scrollback with redraws. The mode is stable regardless of content.
+                    let mut adv_counts: std::collections::HashMap<u32, (f32, u32)> =
+                        std::collections::HashMap::new();
+                    for w in buf
+                        .layout_runs()
+                        .flat_map(|r| r.glyphs.iter())
+                        .map(|g| g.w)
+                        .filter(|w| *w > 0.5)
                     {
+                        let e = adv_counts.entry(w.to_bits()).or_insert((w, 0));
+                        e.1 += 1;
+                    }
+                    if let Some((adv, _)) = adv_counts.values().copied().max_by_key(|(_, c)| *c) {
                         app.terminal_cell_w = adv;
                     }
                     pane.dirty = false;
