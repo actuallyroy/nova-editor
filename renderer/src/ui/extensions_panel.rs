@@ -82,7 +82,10 @@ impl ExtensionsPanel {
             // Marketplace results (already filtered by the remote query).
             for (idx, e) in ext_remote.iter().enumerate() {
                 let name = if e.display.is_empty() { e.name.clone() } else { e.display.clone() };
-                let meta = format!("{} · Marketplace", e.namespace);
+                // Mark results that are already installed (match by name — marketplace
+                // namespace can differ from the VS Code publisher).
+                let installed = extensions.iter().any(|x| x.name.eq_ignore_ascii_case(&e.name));
+                let meta = format!("{} · {}", e.namespace, if installed { "Installed" } else { "Marketplace" });
                 let desc: String = e.description.chars().take(80).collect();
                 let uv = e
                     .icon

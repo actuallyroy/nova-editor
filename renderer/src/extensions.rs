@@ -60,10 +60,10 @@ pub fn open_ext_view(
         OpenExt::Remote(i) => {
             let e = remote.get(i)?;
             let name = if e.display.is_empty() { e.name.clone() } else { e.display.clone() };
-            // Already installed if a scanned extension matches publisher + name.
-            let installed = extensions.iter().any(|x| {
-                x.publisher.eq_ignore_ascii_case(&e.namespace) && x.name.eq_ignore_ascii_case(&e.name)
-            });
+            // Already installed if a scanned extension matches by name. (We match on
+            // name, not publisher, because the marketplace namespace — e.g. Open VSX
+            // "prettier" — often differs from the VS Code publisher "esbenp".)
+            let installed = extensions.iter().any(|x| x.name.eq_ignore_ascii_case(&e.name));
             Some(OpenExtView {
                 name,
                 publisher: e.namespace.clone(),
