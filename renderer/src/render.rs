@@ -227,7 +227,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let region = editor_region(&layout);
             gpu.ui.ext_detail.set(
                 fs, region, &v.name, &v.publisher, &v.category, &v.description, &v.version,
-                v.downloads, v.rating, v.supported, v.installed, uv, app.detail.ext_readme.as_deref(),
+                v.downloads, v.rating, v.supported, v.installed, v.is_theme, uv, app.detail.ext_readme.as_deref(),
                 app.detail.ext_changelog.as_deref(), &app.detail.ext_features,
             );
         }
@@ -419,7 +419,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     gpu.ui.line_numbers.set_from_diff_side(fs, &diff.rows, true);
                     gpu.ui.line_numbers2.set_from_diff_side(fs, &diff.rows, false);
                 }
-                None => gpu.ui.line_numbers.set_from_buffer(fs, &d.buffer),
+                None => gpu.ui.line_numbers.set_from_buffer(fs, &d.buffer, d.head_line_col().0),
             }
         }
 
@@ -512,15 +512,31 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
-        // Palette list (the input owns its own text now).
+        // Palette list (the input owns its own text now). Rows come from the fixed
+        // command set or, in quick-pick mode, the dynamic item list.
         if let Some(pal) = layout.palette.as_ref() {
             let mut list_text = String::new();
-            for &i in app.palette.filtered.iter() {
-                let (_, label, shortcut) = COMMANDS[i];
-                if shortcut.is_empty() {
-                    list_text.push_str(&format!(" {}\n", label));
-                } else {
-                    list_text.push_str(&format!(" {}   [{}]\n", label, shortcut));
+            match app.palette.mode {
+                crate::commands::PaletteMode::Commands => {
+                    for &i in app.palette.filtered.iter() {
+                        let (_, label, shortcut) = COMMANDS[i];
+                        if shortcut.is_empty() {
+                            list_text.push_str(&format!(" {}\n", label));
+                        } else {
+                            list_text.push_str(&format!(" {}   [{}]\n", label, shortcut));
+                        }
+                    }
+                }
+                crate::commands::PaletteMode::QuickPick(_) => {
+                    for &i in app.palette.filtered.iter() {
+                        if let Some(it) = app.palette.items.get(i) {
+                            if it.detail.is_empty() {
+                                list_text.push_str(&format!(" {}\n", it.label));
+                            } else {
+                                list_text.push_str(&format!(" {}   [{}]\n", it.label, it.detail));
+                            }
+                        }
+                    }
                 }
             }
             gpu.ui

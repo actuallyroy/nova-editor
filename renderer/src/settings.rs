@@ -371,3 +371,30 @@ pub fn user_settings_path() -> Option<PathBuf> {
     }
     Some(path)
 }
+
+/// Persist `workbench.colorTheme` into the user settings file, preserving comments
+/// and other keys (line-based: rewrite the existing line, else insert one). Best-effort.
+pub fn set_color_theme(label: &str) {
+    let Some(path) = user_settings_path() else { return };
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut found = false;
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|l| {
+            if l.contains("\"workbench.colorTheme\"") {
+                found = true;
+                let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
+                let comma = if l.trim_end().ends_with(',') { "," } else { "" };
+                format!("{indent}\"workbench.colorTheme\": \"{label}\"{comma}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        if let Some(pos) = lines.iter().position(|l| l.contains('{')) {
+            lines.insert(pos + 1, format!("  \"workbench.colorTheme\": \"{label}\","));
+        }
+    }
+    let _ = std::fs::write(&path, lines.join("\n"));
+}

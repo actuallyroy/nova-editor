@@ -935,6 +935,8 @@ pub struct Gutter {
     buffer: Buffer,
     last_lines: usize,
     last_rows: usize,
+    last_active: usize,
+    last_epoch: u64,
 }
 
 impl Gutter {
@@ -943,6 +945,8 @@ impl Gutter {
             buffer: make_ui_buffer_mono(fs, w, 4000.0),
             last_lines: usize::MAX,
             last_rows: usize::MAX,
+            last_active: usize::MAX,
+            last_epoch: u64::MAX,
         }
     }
 
@@ -955,8 +959,10 @@ impl Gutter {
     /// on each logical line's first row, blanks on wrap-continuation rows. This
     /// keeps numbers aligned whether or not word-wrap is on (with wrap off there's
     /// one visual row per logical line, so it's just 1..n).
-    pub fn set_from_buffer(&mut self, fs: &mut FontSystem, src: &Buffer) {
-        // Cheap change-detection: (logical line count, total visual rows).
+    pub fn set_from_buffer(&mut self, fs: &mut FontSystem, src: &Buffer, active_line: usize) {
+        // Cheap change-detection: (logical line count, total visual rows, active line,
+        // theme epoch) — the active line's number is drawn bright, so a cursor move
+        // or theme change must rebuild.
         let mut rows = 0usize;
         let mut lines = 0usize;
         let mut prev = usize::MAX;
@@ -967,34 +973,43 @@ impl Gutter {
                 prev = run.line_i;
             }
         }
-        if rows == self.last_rows && lines == self.last_lines {
+        let epoch = theme::shape_epoch();
+        if rows == self.last_rows && lines == self.last_lines && active_line == self.last_active && epoch == self.last_epoch {
             return;
         }
 
+        // Build per-row colored spans: the active logical line's number bright
+        // (fg_gutter_active), the rest dim (fg_gutter). VS Code's active-line gutter.
         // NOTE: line 1's "1" doesn't render on real GPUs (glyphon drops this
         // buffer's first laid-out line) — known minor issue.
-        let mut s = String::with_capacity(rows * 6);
+        let mono = Attrs::new().family(Family::Name(theme::MONO_FAMILY()));
+        let dim = mono.color(theme::FG_GUTTER());
+        let active = mono.color(theme::FG_GUTTER_ACTIVE());
+        let mut spans: Vec<(String, Attrs)> = Vec::new();
         let mut prev = usize::MAX;
         for run in src.layout_runs() {
             if run.line_i != prev {
-                s.push_str(&format!("{:>4} \n", run.line_i + 1));
+                let a = if run.line_i == active_line { active } else { dim };
+                spans.push((format!("{:>4} \n", run.line_i + 1), a));
                 prev = run.line_i;
             } else {
-                s.push('\n'); // wrap-continuation row → blank
+                spans.push(("\n".to_string(), dim)); // wrap-continuation row → blank
             }
         }
         self.buffer.set_metrics(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
         self.buffer
             .set_size(fs, None, Some(rows as f32 * theme::LINE_HEIGHT() + 200.0));
-        self.buffer.set_text(
+        self.buffer.set_rich_text(
             fs,
-            &s,
-            Attrs::new().family(Family::Name(theme::MONO_FAMILY())),
+            spans.iter().map(|(s, a)| (s.as_str(), *a)),
+            mono,
             Shaping::Advanced,
         );
         self.buffer.shape_until_scroll(fs, false);
         self.last_lines = lines;
         self.last_rows = rows;
+        self.last_active = active_line;
+        self.last_epoch = epoch;
     }
 
     /// Gutter numbers for one side of a side-by-side diff: the old number per row

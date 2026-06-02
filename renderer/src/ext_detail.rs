@@ -46,6 +46,7 @@ pub struct ExtensionDetail {
     desc: TextLabel,
     install: TextLabel,
     uninstall: TextLabel,
+    set_theme: TextLabel,
     tabs: [TextLabel; 3],
     details: Markdown,
     features: Markdown,
@@ -56,6 +57,7 @@ pub struct ExtensionDetail {
     icon_color: [f32; 4],
     supported: bool,
     installed: bool,
+    is_theme: bool,
 }
 
 impl ExtensionDetail {
@@ -80,6 +82,8 @@ impl ExtensionDetail {
         install.set(fs, "Install", theme::UI_FAMILY());
         let mut uninstall = TextLabel::new(fs, 140.0, Self::btn_h());
         uninstall.set(fs, "Uninstall", theme::UI_FAMILY());
+        let mut set_theme = TextLabel::new(fs, 180.0, Self::btn_h());
+        set_theme.set(fs, "Set Color Theme", theme::UI_FAMILY());
         let tabs = [
             { let mut l = TextLabel::new(fs, 140.0, Self::tabbar_h()); l.set(fs, "DETAILS", theme::UI_FAMILY()); l },
             { let mut l = TextLabel::new(fs, 140.0, Self::tabbar_h()); l.set(fs, "FEATURES", theme::UI_FAMILY()); l },
@@ -91,6 +95,7 @@ impl ExtensionDetail {
             desc: mk(fs, 1000.0, 48.0),
             install,
             uninstall,
+            set_theme,
             tabs,
             details: Markdown::new(fs),
             features: Markdown::new(fs),
@@ -101,6 +106,7 @@ impl ExtensionDetail {
             icon_color: [0.3, 0.3, 0.3, 1.0],
             supported: false,
             installed: false,
+            is_theme: false,
         }
     }
 
@@ -116,6 +122,7 @@ impl ExtensionDetail {
     pub fn reshape(&mut self, fs: &mut FontSystem) {
         self.install.reshape(fs);
         self.uninstall.reshape(fs);
+        self.set_theme.reshape(fs);
         for t in &mut self.tabs {
             t.reshape(fs);
         }
@@ -136,6 +143,7 @@ impl ExtensionDetail {
         rating: f32,
         supported: bool,
         installed: bool,
+        is_theme: bool,
         icon_uv: Option<[f32; 4]>,
         readme: Option<&str>,
         changelog: Option<&str>,
@@ -202,6 +210,7 @@ impl ExtensionDetail {
         self.icon_color = icon_color(name);
         self.supported = supported;
         self.installed = installed;
+        self.is_theme = is_theme;
     }
 
     // ---- geometry ----
@@ -217,6 +226,13 @@ impl ExtensionDetail {
     }
     fn install_rect(r: Rect) -> Rect {
         Rect { x: Self::sidebar_x(r) - Self::content_gap() - Self::btn_w(), y: r.y + Self::header_top() + theme::zpx(4.0), w: Self::btn_w(), h: Self::btn_h() }
+    }
+    /// "Set Color Theme" button, sized to its label, sitting just left of the
+    /// Install/Uninstall button. Only meaningful for an installed theme extension.
+    fn set_theme_rect(&self, r: Rect) -> Rect {
+        let w = self.set_theme.width() + theme::zpx(24.0);
+        let ir = Self::install_rect(r);
+        Rect { x: ir.x - theme::zpx(10.0) - w, y: ir.y, w, h: ir.h }
     }
     fn tabbar_y(r: Rect) -> f32 {
         r.y + Self::header_top() + Self::icon() + theme::zpx(18.0)
@@ -288,9 +304,13 @@ impl ExtensionDetail {
     pub fn hit_uninstall(&self, r: Rect, p: (f32, f32)) -> bool {
         self.installed && Self::install_rect(r).contains(p)
     }
-    /// True when the header button is interactive (Install or Uninstall) — drives hover.
+    /// "Set Color Theme" button (installed theme extensions only).
+    pub fn hit_set_theme(&self, r: Rect, p: (f32, f32)) -> bool {
+        self.installed && self.is_theme && self.set_theme_rect(r).contains(p)
+    }
+    /// True when any header button is interactive — drives hover.
     pub fn hit_button(&self, r: Rect, p: (f32, f32)) -> bool {
-        self.hit_install(r, p) || self.hit_uninstall(r, p)
+        self.hit_install(r, p) || self.hit_uninstall(r, p) || self.hit_set_theme(r, p)
     }
     pub fn hit_tab(&self, r: Rect, p: (f32, f32)) -> Option<DetailTab> {
         self.tab_rects(r)
@@ -328,6 +348,12 @@ impl ExtensionDetail {
             let c = if hovered_install { theme::DIALOG_BTN_HOVER() } else { theme::DIALOG_BTN() };
             if let Some(rr) = clip(Self::install_rect(r)) {
                 quads.push(rr.quad(c));
+            }
+        }
+        // "Set Color Theme" button for an installed theme extension.
+        if self.installed && self.is_theme {
+            if let Some(rr) = clip(self.set_theme_rect(r)) {
+                quads.push(rr.quad(theme::DIALOG_BTN()));
             }
         }
         // Tab bar bottom border across the main column.
@@ -406,6 +432,11 @@ impl ExtensionDetail {
                 self.uninstall.draw_center(pill, theme::FG_ACTIVE(), areas);
             } else if self.supported {
                 self.install.draw_center(pill, theme::FG_ACTIVE(), areas);
+            }
+        }
+        if self.installed && self.is_theme {
+            if let Some(pill) = clip(self.set_theme_rect(r)) {
+                self.set_theme.draw_center(pill, theme::FG_ACTIVE(), areas);
             }
         }
     }

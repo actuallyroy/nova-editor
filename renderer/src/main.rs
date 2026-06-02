@@ -1073,14 +1073,16 @@ impl App {
     /// applies the theme immediately; other supported kinds just mark installed
     /// (their declarative contributions aren't loaded yet).
     fn install_extension(&mut self, i: usize) {
-        let (kind, theme_path, grammar_paths) = match self.extensions.get(i) {
-            Some(e) => (e.kind, e.theme_path.clone(), e.grammar_paths.clone()),
+        let (kind, themes, grammar_paths) = match self.extensions.get(i) {
+            Some(e) => (e.kind, e.themes.clone(), e.grammar_paths.clone()),
             None => return,
         };
         match kind {
             ExtKind::Theme => {
-                if let Some(p) = theme_path {
-                    if let Some(t) = theme::load_vscode(&p) {
+                // Apply the extension's first theme as a preview; the picker (Set Color
+                // Theme) lets the user choose among all of them and persists the choice.
+                if let Some(first) = themes.first() {
+                    if let Some(t) = theme::load_vscode(&first.path) {
                         theme::set(t);
                     }
                 }
@@ -1600,6 +1602,61 @@ impl App {
         self.redraw();
     }
 
+    /// Build the quick-pick item list of available color themes: the built-in plus
+    /// every theme contributed by installed extensions. `only_ext` scopes it to one
+    /// extension (the detail page's "Set Color Theme" button).
+    fn theme_items(&self, only_ext: Option<usize>) -> Vec<commands::PickItem> {
+        let mut items = Vec::new();
+        if only_ext.is_none() {
+            items.push(commands::PickItem { label: "Nova Dark".into(), detail: "dark · built-in".into() });
+        }
+        for (idx, e) in self.extensions.iter().enumerate() {
+            if only_ext.map_or(false, |o| o != idx) {
+                continue;
+            }
+            for t in &e.themes {
+                items.push(commands::PickItem {
+                    label: t.label.clone(),
+                    detail: if t.dark { "dark" } else { "light" }.to_string(),
+                });
+            }
+        }
+        items
+    }
+
+    /// Open the command palette as a color-theme quick-pick (whole registry, or one
+    /// extension's themes when `only_ext` is set).
+    fn open_theme_picker(&mut self, only_ext: Option<usize>) {
+        let items = self.theme_items(only_ext);
+        if items.is_empty() {
+            return;
+        }
+        self.palette.open_quick_pick(commands::PickKind::SetColorTheme, items);
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.palette_input.clear(&mut g.font_system);
+            g.ui.palette_input.focus(true);
+        }
+        self.redraw();
+    }
+
+    /// Commit a quick-pick selection.
+    fn exec_pick(&mut self, kind: commands::PickKind, label: &str) {
+        match kind {
+            commands::PickKind::SetColorTheme => {
+                self.apply_theme_by_name(label);
+                settings::set_color_theme(label); // persist across restarts
+                if let Some(g) = self.gpu.as_mut() {
+                    g.ui.line_numbers.invalidate();
+                    g.ui.line_numbers2.invalidate();
+                    for d in self.workspace.documents.iter_mut() {
+                        d.reshape(&mut g.font_system);
+                    }
+                }
+                self.redraw();
+            }
+        }
+    }
+
     /// Re-filter the palette from its input's current text.
     fn refilter_palette(&mut self) {
         let q = self
@@ -1675,6 +1732,7 @@ impl App {
                     self.open_folder(folder);
                 }
             }
+            Command::ColorTheme => self.open_theme_picker(None),
         }
         self.redraw();
     }
@@ -1825,11 +1883,13 @@ impl App {
             theme::set(theme::Theme::dark());
             return;
         }
+        // Match the saved name against any contributed theme's label (VS Code keys
+        // `workbench.colorTheme` by the theme label, not the extension name).
         for e in &self.extensions {
-            if e.kind == ExtKind::Theme && e.name.eq_ignore_ascii_case(name) {
-                if let Some(p) = &e.theme_path {
-                    if let Some(t) = theme::load_vscode(p) {
-                        theme::set(t);
+            for t in &e.themes {
+                if t.label.eq_ignore_ascii_case(name) {
+                    if let Some(theme) = theme::load_vscode(&t.path) {
+                        theme::set(theme);
                         return;
                     }
                 }
@@ -2209,7 +2269,10 @@ impl App {
                 .and_then(|gpu| gpu.ui.palette_list.row_at(pal.list, (x, y), self.palette.filtered.len()));
             if let Some(idx) = row {
                 self.palette.selected = idx;
-                if let Some(cmd) = self.palette.selected_command() {
+                if let Some((kind, label)) = self.palette.selected_pick() {
+                    self.palette.close();
+                    self.exec_pick(kind, &label);
+                } else if let Some(cmd) = self.palette.selected_command() {
                     self.palette.close();
                     self.exec_command(cmd);
                 }
@@ -2445,18 +2508,24 @@ impl App {
                     self.redraw();
                     return;
                 }
-                let (hit_install, hit_uninstall) = self
+                let (hit_install, hit_uninstall, hit_set_theme) = self
                     .gpu
                     .as_ref()
                     .map(|g| {
                         (
                             g.ui.ext_detail.hit_install(region, (x, y)),
                             g.ui.ext_detail.hit_uninstall(region, (x, y)),
+                            g.ui.ext_detail.hit_set_theme(region, (x, y)),
                         )
                     })
-                    .unwrap_or((false, false));
+                    .unwrap_or((false, false, false));
                 if hit_install {
                     self.install_open();
+                } else if hit_set_theme {
+                    // Open the picker scoped to this extension's themes.
+                    if let Some(OpenExt::Local(i)) = self.detail.open_extension {
+                        self.open_theme_picker(Some(i));
+                    }
                 } else if hit_uninstall {
                     self.uninstall_open();
                 }
@@ -2852,7 +2921,10 @@ impl App {
                         return;
                     }
                     Key::Named(NamedKey::Enter) => {
-                        if let Some(cmd) = self.palette.selected_command() {
+                        if let Some((kind, label)) = self.palette.selected_pick() {
+                            self.palette.close();
+                            self.exec_pick(kind, &label);
+                        } else if let Some(cmd) = self.palette.selected_command() {
                             self.palette.close();
                             self.exec_command(cmd);
                         }

@@ -111,8 +111,8 @@ impl ExtDetailView {
                 if !e.grammar_paths.is_empty() {
                     s.push_str(&format!("- {} grammar file(s)\n", e.grammar_paths.len()));
                 }
-                if e.theme_path.is_some() {
-                    s.push_str("- 1 color theme\n");
+                if !e.themes.is_empty() {
+                    s.push_str(&format!("- {} color theme(s)\n", e.themes.len()));
                 }
                 s
             }

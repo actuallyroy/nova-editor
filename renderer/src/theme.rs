@@ -172,6 +172,18 @@ pub fn set(theme: Theme) {
     *current().write().unwrap() = theme;
 }
 
+/// Blend `fg` toward `bg` by `t` (0 = fg, 1 = bg) — used to derive a dim foreground
+/// that tracks the theme instead of falling back to the dark-theme grey.
+fn blend(fg: (u8, u8, u8, f32), bg: (u8, u8, u8, f32), t: f32) -> Color {
+    let mix = |a: u8, b: u8| ((a as f32) * (1.0 - t) + (b as f32) * t).round() as u8;
+    Color::rgb(mix(fg.0, bg.0), mix(fg.1, bg.1), mix(fg.2, bg.2))
+}
+
+/// Perceived-luminance test for picking light-vs-dark-appropriate derivations.
+fn is_light((r, g, b, _): (u8, u8, u8, f32)) -> bool {
+    (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) > 140.0
+}
+
 fn parse_hex(s: &str) -> Option<(u8, u8, u8, f32)> {
     let h = s.strip_prefix('#')?;
     let n = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
@@ -192,56 +204,97 @@ pub fn load_vscode(path: &std::path::Path) -> Option<Theme> {
 
     if let Some(colors) = v.get("colors").and_then(|c| c.as_object()) {
         let rgb = |key: &str| colors.get(key).and_then(|x| x.as_str()).and_then(parse_hex);
-        let mut col = |key: &str, dst: &mut Color| {
-            if let Some((r, g, b, _)) = rgb(key) {
-                *dst = Color::rgb(r, g, b);
-            }
-        };
-        col("editor.foreground", &mut t.fg_text);
-        col("statusBar.foreground", &mut t.status_bar_fg);
-        col("titleBar.activeForeground", &mut t.title_fg);
-        col("tab.activeForeground", &mut t.tab_fg_active);
-        col("tab.inactiveForeground", &mut t.tab_fg_inactive);
-        col("editorLineNumber.foreground", &mut t.fg_gutter);
-        col("icon.foreground", &mut t.activity_icon_fg);
+        // First key present wins (VS Code falls back across related keys).
+        let rgb_any = |keys: &[&str]| keys.iter().find_map(|k| rgb(k));
 
-        let mut quad = |key: &str, dst: &mut [f32; 4]| {
-            if let Some((r, g, b, a)) = rgb(key) {
-                *dst = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a];
+        // ---- Foundational fg/bg, used to derive anything the theme omits ----
+        let editor_fg = rgb_any(&["editor.foreground", "foreground"]).unwrap_or((0xD4, 0xD4, 0xD4, 1.0));
+        let editor_bg = rgb("editor.background").unwrap_or((0x14, 0x14, 0x14, 1.0));
+        let to_color = |(r, g, b, _): (u8, u8, u8, f32)| Color::rgb(r, g, b);
+        let to_quad = |(r, g, b, a): (u8, u8, u8, f32)| [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a];
+
+        let mut col = |keys: &[&str], dst: &mut Color| {
+            if let Some(c) = rgb_any(keys) {
+                *dst = to_color(c);
             }
         };
-        if let Some((r, g, b, _)) = rgb("editor.background") {
-            t.bg_editor = wgpu::Color {
-                r: r as f64 / 255.0,
-                g: g as f64 / 255.0,
-                b: b as f64 / 255.0,
-                a: 1.0,
-            };
-            t.tab_active = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0];
-            // Default the panel to a faintly-raised editor bg so it stays distinct
-            // on light themes too; panel.background overrides below if present.
-            t.panel_bg = [
-                (r as f32 / 255.0 + 0.02).min(1.0),
-                (g as f32 / 255.0 + 0.02).min(1.0),
-                (b as f32 / 255.0 + 0.02).min(1.0),
-                1.0,
-            ];
+        // Foreground text colors (the contrast-critical ones).
+        col(&["editor.foreground", "foreground"], &mut t.fg_text);
+        col(&["foreground", "editor.foreground"], &mut t.fg_active);
+        col(&["sideBar.foreground", "foreground"], &mut t.fg_text); // tree/list text
+        col(&["statusBar.foreground"], &mut t.status_bar_fg);
+        col(&["titleBar.activeForeground", "foreground"], &mut t.title_fg);
+        col(&["tab.activeForeground", "foreground"], &mut t.tab_fg_active);
+        col(&["tab.inactiveForeground", "descriptionForeground"], &mut t.tab_fg_inactive);
+        col(&["editorLineNumber.foreground"], &mut t.fg_gutter);
+        col(&["editorLineNumber.activeForeground", "editor.foreground"], &mut t.fg_gutter_active);
+        // Inactive activity-bar icons are DIM (VS Code uses activityBar.inactiveForeground);
+        // only the active view's icon is bright. Pulling `foreground` here made them all bright.
+        col(&["activityBar.inactiveForeground", "icon.foreground", "descriptionForeground"], &mut t.activity_icon_fg);
+        col(&["activityBar.foreground", "icon.foreground", "foreground"], &mut t.activity_icon_active);
+        col(&["tab.activeForeground"], &mut t.close_fg_hover);
+        // Dim/secondary text: prefer the theme's descriptionForeground, else blend
+        // the foreground ~45% toward the background so it's never the dark-theme grey.
+        t.fg_dim = rgb("descriptionForeground")
+            .map(to_color)
+            .unwrap_or_else(|| blend(editor_fg, editor_bg, 0.45));
+        t.close_fg = t.fg_dim;
+        // If the theme gave no explicit inactive icon/foreground, dim it like fg_dim.
+        if rgb("activityBar.inactiveForeground").is_none() && rgb("icon.foreground").is_none() {
+            t.activity_icon_fg = t.fg_dim;
         }
-        quad("panel.background", &mut t.panel_bg);
-        quad("panel.border", &mut t.panel_border);
-        quad("activityBar.background", &mut t.activity_bar_bg);
-        quad("sideBar.background", &mut t.sidebar_bg);
-        quad("editorGroupHeader.tabsBackground", &mut t.tab_bar_bg);
-        quad("tab.inactiveBackground", &mut t.tab_inactive);
-        quad("tab.activeBackground", &mut t.tab_active);
-        quad("statusBar.background", &mut t.status_bar_bg);
-        quad("titleBar.activeBackground", &mut t.title_bar_bg);
-        quad("editor.selectionBackground", &mut t.selection);
-        quad("list.hoverBackground", &mut t.tree_hover);
-        quad("list.inactiveSelectionBackground", &mut t.tree_active_file);
-        quad("list.activeSelectionBackground", &mut t.tree_selected);
-        quad("quickInput.background", &mut t.palette_bg);
-        quad("menu.background", &mut t.context_bg);
+
+        let mut quad = |keys: &[&str], dst: &mut [f32; 4]| {
+            if let Some(c) = rgb_any(keys) {
+                *dst = to_quad(c);
+            }
+        };
+        // Editor background drives the clear color + a faintly-raised panel default.
+        let (br, bg_, bb, _) = editor_bg;
+        t.bg_editor = wgpu::Color { r: br as f64 / 255.0, g: bg_ as f64 / 255.0, b: bb as f64 / 255.0, a: 1.0 };
+        t.tab_active = [br as f32 / 255.0, bg_ as f32 / 255.0, bb as f32 / 255.0, 1.0];
+        let raise = if is_light(editor_bg) { -0.03 } else { 0.02 };
+        t.panel_bg = [
+            (br as f32 / 255.0 + raise).clamp(0.0, 1.0),
+            (bg_ as f32 / 255.0 + raise).clamp(0.0, 1.0),
+            (bb as f32 / 255.0 + raise).clamp(0.0, 1.0),
+            1.0,
+        ];
+
+        quad(&["panel.background"], &mut t.panel_bg);
+        quad(&["panel.border", "editorGroup.border", "contrastBorder"], &mut t.panel_border);
+        quad(&["activityBar.background"], &mut t.activity_bar_bg);
+        quad(&["sideBar.background"], &mut t.sidebar_bg);
+        quad(&["editorGroupHeader.tabsBackground", "editor.background"], &mut t.tab_bar_bg);
+        quad(&["tab.inactiveBackground"], &mut t.tab_inactive);
+        quad(&["tab.activeBackground"], &mut t.tab_active);
+        quad(&["tab.hoverBackground", "list.hoverBackground"], &mut t.tab_hover);
+        quad(&["statusBar.background"], &mut t.status_bar_bg);
+        quad(&["titleBar.activeBackground"], &mut t.title_bar_bg);
+        quad(&["editor.selectionBackground"], &mut t.selection);
+        quad(&["editor.lineHighlightBackground"], &mut t.line_highlight);
+        quad(&["editor.findMatchHighlightBackground", "editor.findMatchBackground"], &mut t.find_match);
+        quad(&["editorCursor.foreground", "editor.foreground"], &mut t.cursor);
+        quad(&["scrollbarSlider.background"], &mut t.scrollbar_thumb);
+        quad(&["scrollbarSlider.hoverBackground"], &mut t.scrollbar_thumb_hover);
+        quad(&["list.hoverBackground"], &mut t.tree_hover);
+        quad(&["list.inactiveSelectionBackground", "list.activeSelectionBackground"], &mut t.tree_active_file);
+        quad(&["list.activeSelectionBackground"], &mut t.tree_selected);
+        quad(&["editorWidget.border", "panel.border", "contrastBorder"], &mut t.border);
+        // Quick pick / palette + dialogs.
+        quad(&["quickInput.background", "editorWidget.background", "menu.background"], &mut t.palette_bg);
+        quad(&["quickInput.border", "editorWidget.border", "focusBorder"], &mut t.palette_border);
+        quad(&["input.background"], &mut t.palette_input_bg);
+        quad(&["quickInputList.focusBackground", "list.activeSelectionBackground"], &mut t.palette_selected);
+        quad(&["button.background", "list.activeSelectionBackground"], &mut t.dialog_btn);
+        quad(&["button.hoverBackground", "button.background"], &mut t.dialog_btn_hover);
+        // Header search box + menus.
+        quad(&["input.background"], &mut t.search_bg);
+        quad(&["input.border", "focusBorder"], &mut t.search_border);
+        quad(&["menu.background", "editorWidget.background"], &mut t.context_bg);
+        quad(&["menu.border", "editorWidget.border"], &mut t.context_border);
+        quad(&["menu.selectionBackground", "list.activeSelectionBackground"], &mut t.context_sel);
+        quad(&["menu.selectionBackground", "list.hoverBackground"], &mut t.menu_hover);
     }
 
     if let Some(tokens) = v.get("tokenColors").and_then(|t| t.as_array()) {

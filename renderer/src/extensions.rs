@@ -29,6 +29,9 @@ pub struct OpenExtView {
     pub supported: bool,
     pub installed: bool,
     pub remote: bool,
+    /// Installed theme extension → show a "Set Color Theme" button (opens the picker
+    /// scoped to this extension's themes).
+    pub is_theme: bool,
     pub key: String, // icon-atlas key (name for local, "publisher.name" for remote)
 }
 
@@ -54,6 +57,7 @@ pub fn open_ext_view(
                 supported: e.supported(),
                 installed: true, // it came from the on-disk scan, so it's installed
                 remote: false,
+                is_theme: e.kind == ExtKind::Theme && !e.themes.is_empty(),
                 key: e.name.clone(),
             })
         }
@@ -75,6 +79,7 @@ pub fn open_ext_view(
                 supported: true,
                 installed,
                 remote: true,
+                is_theme: false, // remote: can't set a theme until it's installed
                 key: e.id(),
             })
         }
@@ -89,6 +94,15 @@ pub enum ExtKind {
     Code,        // needs a JS host / webview — unsupported
 }
 
+/// One color theme contributed by an extension (a `contributes.themes` entry).
+/// `label` is the user-facing name and the key used by `workbench.colorTheme`.
+#[derive(Clone)]
+pub struct ThemeDef {
+    pub label: String,
+    pub dark: bool, // uiTheme: vs-dark / hc-black ⇒ dark; vs / hc-light ⇒ light
+    pub path: PathBuf,
+}
+
 pub struct Extension {
     pub name: String,
     /// Marketplace id (`namespace.name`, lowercased) derived from the install
@@ -98,7 +112,9 @@ pub struct Extension {
     pub description: String,
     pub version: String,
     pub kind: ExtKind,
-    pub theme_path: Option<PathBuf>,
+    /// Every color theme this extension contributes (`contributes.themes`). A theme
+    /// extension can ship several (e.g. Dracula → "Dracula", "Dracula Soft", …).
+    pub themes: Vec<ThemeDef>,
     pub grammar_paths: Vec<PathBuf>,
     pub icon_path: Option<PathBuf>, // raster icon shipped by the extension, if any
     pub readme_path: Option<PathBuf>, // README.md shipped by the extension, if any
@@ -266,24 +282,43 @@ fn parse(v: &Value, ext_dir: &std::path::Path) -> Option<Extension> {
         })
         .unwrap_or_default();
 
+    // All contributed color themes (label + light/dark + JSON path). A theme entry's
+    // `label` falls back to the file stem; `uiTheme` decides light vs dark.
+    let theme_defs: Vec<ThemeDef> = themes
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let rel = t.get("path").and_then(|p| p.as_str())?;
+                    let path = ext_dir.join(rel.trim_start_matches("./"));
+                    let label = t
+                        .get("label")
+                        .and_then(|l| l.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            path.file_stem().and_then(|s| s.to_str()).unwrap_or("Theme").to_string()
+                        });
+                    let ui = t.get("uiTheme").and_then(|u| u.as_str()).unwrap_or("vs-dark");
+                    let dark = !(ui == "vs" || ui == "hc-light");
+                    Some(ThemeDef { label, dark, path })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Themes and TextMate grammars are usable without JS (we parse/run them
     // natively), so they're installable even if the package also ships code.
     // Snippet/language-only packs are a supported class; anything else with a JS
     // entry needs the (not-yet-built) extension runtime, so it's unsupported.
-    let (kind, theme_path) = if let Some(themes) = themes {
-        let path = themes
-            .iter()
-            .find_map(|t| t.get("path").and_then(|p| p.as_str()))
-            .map(|p| ext_dir.join(p.trim_start_matches("./")));
-        (ExtKind::Theme, path)
+    let kind = if !theme_defs.is_empty() {
+        ExtKind::Theme
     } else if !grammar_paths.is_empty() {
-        (ExtKind::Grammar, None)
+        ExtKind::Grammar
     } else if has_main {
-        (ExtKind::Code, None)
+        ExtKind::Code
     } else if has_snippets || has_languages {
-        (ExtKind::Declarative, None)
+        ExtKind::Declarative
     } else {
-        (ExtKind::Code, None)
+        ExtKind::Code
     };
 
     Some(Extension {
@@ -293,7 +328,7 @@ fn parse(v: &Value, ext_dir: &std::path::Path) -> Option<Extension> {
         description,
         version,
         kind,
-        theme_path,
+        themes: theme_defs,
         grammar_paths,
         icon_path,
         readme_path,
