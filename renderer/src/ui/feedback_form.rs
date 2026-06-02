@@ -381,10 +381,11 @@ impl FeedbackForm {
         let mut body = self.details.text().trim().to_string();
         if self.include_sysinfo {
             body.push_str(&format!(
-                "\n\n---\nNova {} · {} ({})",
+                "\n\n---\nNova {} · {} ({})\n{}",
                 env!("CARGO_PKG_VERSION"),
                 std::env::consts::OS,
-                std::env::consts::ARCH
+                std::env::consts::ARCH,
+                crate::diagnostics_report(),
             ));
         }
         Some((format!("{prefix}{title}"), body))

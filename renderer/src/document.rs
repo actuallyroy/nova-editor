@@ -84,12 +84,14 @@ pub struct Document {
 /// Set the buffer's metrics/wrap/size and its (rich) text. `spans` are precomputed
 /// by the caller (via the syntect `LineCache`); when `None`, falls back to markdown
 /// line styling or plain text.
+#[allow(clippy::too_many_arguments)]
 fn apply_buffer_text(
     buffer: &mut Buffer,
     fs: &mut FontSystem,
     text: &str,
     lines: usize,
     lang: Lang,
+    ext: &str,
     wrap_width: Option<f32>,
     spans: Option<Vec<(String, Color)>>,
     semantic: &[(usize, usize, Color)],
@@ -109,7 +111,10 @@ fn apply_buffer_text(
         None if !semantic.is_empty() => {
             Some(merge_spans(text, vec![(text.to_string(), theme::FG_TEXT())], semantic, mono))
         }
-        None => (lang == Lang::Markdown).then(|| md_spans(text)),
+        // No bundled syntect grammar: fall back to an installed TextMate grammar
+        // (e.g. rainbow-csv), then markdown line styling, then plain.
+        None => crate::textmate::spans_for(ext, text)
+            .or_else(|| (lang == Lang::Markdown).then(|| md_spans(text))),
     };
     if let Some(spans) = attr_spans {
         buffer.set_rich_text(
@@ -229,7 +234,7 @@ impl Document {
         // Layer-1 highlighter: a syntect grammar for this file type (None → plain/markdown).
         let mut hl = crate::highlight::LineCache::new(&ext);
         let spans = hl.as_mut().map(|h| h.highlight(&display, 0));
-        apply_buffer_text(&mut buffer, fs, &display, display.matches('\n').count(), lang, wrap_width, spans, &[]);
+        apply_buffer_text(&mut buffer, fs, &display, display.matches('\n').count(), lang, &ext, wrap_width, spans, &[]);
         let name = match &path {
             Some(p) => p
                 .file_name()
@@ -355,7 +360,7 @@ impl Document {
         let mk = |fs: &mut FontSystem, text: &str| {
             let mut b = Buffer::new(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
             let display = text.replace('\r', "");
-            apply_buffer_text(&mut b, fs, &display, display.matches('\n').count(), Lang::PlainText, None, None, &[]);
+            apply_buffer_text(&mut b, fs, &display, display.matches('\n').count(), Lang::PlainText, "", None, None, &[]);
             b
         };
         let buffer = mk(fs, &diff.left_text);
@@ -488,7 +493,7 @@ impl Document {
         // no text change since last highlight → returns cached spans, no re-tokenize).
         let dirty = std::mem::replace(&mut self.hl_dirty_from, usize::MAX);
         let spans = self.hl.as_mut().map(|h| h.highlight(&text, dirty));
-        apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, self.wrap_width, spans, &self.semantic);
+        apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, &self.ext, self.wrap_width, spans, &self.semantic);
         crate::perf::log(&format!("reshape({lines} lines): to_string {:?}, highlight+shape {:?}", t_str, t1.elapsed()));
     }
 

@@ -741,6 +741,11 @@ impl App {
             self.set_zoom(z);
         }
 
+        // Scan installed extensions up front so "Installed" status is accurate from
+        // the start and grammar extensions (rainbow-csv, …) activate on launch.
+        self.extensions = extensions::scan();
+        self.activate_installed_grammars();
+
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
@@ -978,6 +983,21 @@ impl App {
                         if let Some(cb) = self.clipboard.as_mut() {
                             let _ = cb.set_text(s);
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Activate already-installed extensions' declarative contributions on startup
+    /// (and after a scan): register each grammar extension's TextMate grammar so it
+    /// works without re-clicking Install every session (e.g. rainbow-csv colors CSV).
+    fn activate_installed_grammars(&mut self) {
+        for e in &self.extensions {
+            if e.kind == ExtKind::Grammar {
+                for gp in &e.grammar_paths {
+                    if let Some(g) = textmate::Grammar::load(gp) {
+                        textmate::register(g, &[]);
                     }
                 }
             }
@@ -2949,6 +2969,31 @@ enum Focus {
 /// Resolve the `gh` executable. macOS GUI apps don't inherit the shell PATH, so a
 /// bare "gh" often isn't found (it lives in /opt/homebrew/bin etc.) — check the
 /// common locations and fall back to a login-shell lookup before giving up.
+/// A diagnostic snapshot for bug reports (feedback form): the environment bits that
+/// most often explain "extension X isn't working" — node, the ESLint/TS servers, and
+/// the installed-extension count. Runs a couple of quick probes; only on submit.
+pub(crate) fn diagnostics_report() -> String {
+    let node = lsp::resolve_node().unwrap_or_else(|| "NOT FOUND".to_string());
+    let ts = if lsp::typescript_ls_cli().is_some() { "found" } else { "not found" };
+    let ext_dir = extensions::dir();
+    let eslint = match &ext_dir {
+        Some(d) if lsp::eslint_server_path(std::slice::from_ref(d)).is_some() => "found",
+        _ => "not found",
+    };
+    let (dir_str, count) = match &ext_dir {
+        Some(d) => {
+            let n = std::fs::read_dir(d)
+                .map(|r| r.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count())
+                .unwrap_or(0);
+            (d.display().to_string(), n)
+        }
+        None => ("not found".to_string(), 0),
+    };
+    format!(
+        "node: {node}\neslint server: {eslint}\ntypescript-language-server: {ts}\nextensions: {count} installed in {dir_str}"
+    )
+}
+
 pub(crate) fn gh_program() -> String {
     #[cfg(not(windows))]
     {
@@ -3041,8 +3086,16 @@ impl ApplicationHandler for App {
                     match result {
                         Ok(()) => {
                             self.extensions = extensions::scan();
+                            self.activate_installed_grammars(); // register grammars now (no reload needed)
                             self.rebuild_ext_rows();
-                            self.show_info_dialog("Extension installed. Reload the window (or reopen) to activate it.");
+                            // Re-highlight open docs so a newly-installed grammar lights up.
+                            if let Some(g) = self.gpu.as_mut() {
+                                for d in self.workspace.documents.iter_mut() {
+                                    d.invalidate_highlight();
+                                    d.reshape(&mut g.font_system);
+                                }
+                            }
+                            self.show_info_dialog("Extension installed.");
                         }
                         Err(e) => {
                             self.show_info_dialog(&format!("Install failed: {e}"));
