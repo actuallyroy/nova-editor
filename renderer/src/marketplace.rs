@@ -79,6 +79,26 @@ pub fn changelog_async(tx: Sender<WorkerMsg>, url: String, gen: u64) {
     });
 }
 
+/// Fetch a remote extension's FULL metadata (`/api/{ns}/{name}`), then its README +
+/// CHANGELOG. The search endpoint's `files` omits readme/changelog, so a searched
+/// extension's detail page is empty without this. Runs on one background thread,
+/// reusing the shared agent (so the metadata + both docs share one connection).
+pub fn meta_async(tx: Sender<WorkerMsg>, namespace: String, name: String, gen: u64) {
+    std::thread::spawn(move || {
+        let url = format!("{BASE}/api/{namespace}/{name}");
+        let Some(body) = get_string(&url) else { return };
+        let Ok(v) = serde_json::from_str::<Value>(&body) else { return };
+        let files = &v["files"];
+        let file = |k: &str| files.get(k).and_then(|u| u.as_str()).map(String::from);
+        if let Some(readme) = file("readme") {
+            let _ = tx.send(WorkerMsg::Readme { gen, text: get_string(&readme) });
+        }
+        if let Some(changelog) = file("changelog") {
+            let _ = tx.send(WorkerMsg::Changelog { gen, text: get_string(&changelog) });
+        }
+    });
+}
+
 /// Fetch + DECODE a README image on a background thread (so a big animated GIF
 /// never blocks the UI), then ship the frames to the main thread for cheap upload.
 /// `key` is the markdown's raw image reference (used to match it back).
@@ -116,12 +136,26 @@ impl RemoteExt {
     }
 }
 
+/// A shared HTTP agent with a connection pool, so repeated requests to open-vsx.org
+/// (the search query + each result's icon) reuse one keep-alive TLS connection instead
+/// of doing a fresh TCP+TLS handshake every time — that handshake, repeated per icon,
+/// was the bulk of the search latency.
+fn agent() -> &'static ureq::Agent {
+    static A: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    A.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(5))
+            .timeout_read(std::time::Duration::from_secs(10))
+            .build()
+    })
+}
+
 fn get_string(url: &str) -> Option<String> {
-    ureq::get(url).call().ok()?.into_string().ok()
+    agent().get(url).call().ok()?.into_string().ok()
 }
 
 fn get_bytes(url: &str, max: usize) -> Option<Vec<u8>> {
-    let resp = ureq::get(url).call().ok()?;
+    let resp = agent().get(url).call().ok()?;
     let mut buf = Vec::new();
     resp.into_reader().take(max as u64).read_to_end(&mut buf).ok()?;
     (!buf.is_empty()).then_some(buf)
@@ -180,7 +214,7 @@ pub fn search(query: &str, size: usize) -> Vec<RemoteExt> {
 /// `~/.vscode/extensions/<namespace>.<name>-<version>/`. Returns the new dir.
 pub fn install(ext: &RemoteExt, ext_root: &Path) -> Result<PathBuf, String> {
     let url = ext.download_url.as_ref().ok_or("no download url")?;
-    let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+    let resp = agent().get(url).call().map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
     resp.into_reader()
         .take(64 * 1024 * 1024)

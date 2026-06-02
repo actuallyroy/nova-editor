@@ -1289,9 +1289,11 @@ pub struct Dialog {
 impl Dialog {
     pub fn new(fs: &mut FontSystem) -> Self {
         Self {
-            message: TextLabel::new(fs, 600.0, 60.0),
+            // Wide buffer so the (single-line) message is measured in full and never
+            // clipped — the box sizes itself to this width.
+            message: TextLabel::new(fs, 4000.0, 60.0),
             buttons: Vec::new(),
-            check: TextLabel::new(fs, 320.0, 24.0),
+            check: TextLabel::new(fs, 4000.0, 24.0),
             width: 460.0,
         }
     }
@@ -1310,19 +1312,24 @@ impl Dialog {
     }
 
     pub fn box_rect(&self, win: (f32, f32), has_check: bool) -> Rect {
-        let h = if has_check { 176.0 } else { 148.0 };
-        Rect { x: (win.0 - self.width) * 0.5, y: (win.1 - h) * 0.5, w: self.width, h }
+        let h = theme::zpx(if has_check { 176.0 } else { 148.0 });
+        // Size to the message (so long prompts don't clip), with a sensible minimum.
+        // Everything scales with the UI zoom.
+        let pad = theme::zpx(40.0);
+        let w = (self.message.width() + pad * 2.0).max(theme::zpx(self.width));
+        Rect { x: (win.0 - w) * 0.5, y: (win.1 - h) * 0.5, w, h }
     }
 
     pub fn button_rects(&self, b: Rect) -> Vec<Rect> {
-        let bw = 100.0;
+        let bw = theme::zpx(100.0);
         let bh = theme::DIALOG_BTN_H();
-        let gap = 10.0;
+        let gap = theme::zpx(10.0);
+        let edge = theme::zpx(16.0);
         let n = self.buttons.len();
-        let y = b.y + b.h - bh - 16.0;
+        let y = b.y + b.h - bh - edge;
         (0..n)
             .map(|i| Rect {
-                x: b.x + b.w - 16.0 - (n - i) as f32 * (bw + gap) + gap,
+                x: b.x + b.w - edge - (n - i) as f32 * (bw + gap) + gap,
                 y,
                 w: bw,
                 h: bh,
@@ -1331,7 +1338,8 @@ impl Dialog {
     }
 
     fn check_box(&self, b: Rect) -> Rect {
-        Rect { x: b.x + 18.0, y: b.y + b.h - 30.0 - 17.0, w: 18.0, h: 18.0 }
+        let s = theme::zpx(18.0);
+        Rect { x: b.x + theme::zpx(18.0), y: b.y + b.h - theme::zpx(47.0), w: s, h: s }
     }
 
     pub fn button_at(&self, b: Rect, p: (f32, f32)) -> Option<usize> {
@@ -1341,7 +1349,7 @@ impl Dialog {
     /// True if `p` hit the checkbox or its label.
     pub fn check_hit(&self, b: Rect, p: (f32, f32)) -> bool {
         let cb = self.check_box(b);
-        Rect { x: cb.x, y: cb.y - 2.0, w: 220.0, h: cb.h + 4.0 }.contains(p)
+        Rect { x: cb.x, y: cb.y - theme::zpx(2.0), w: theme::zpx(220.0), h: cb.h + theme::zpx(4.0) }.contains(p)
     }
 
     pub fn draw_bg(
@@ -1368,14 +1376,15 @@ impl Dialog {
     }
 
     pub fn draw<'a>(&'a self, b: Rect, has_check: bool, areas: &mut Vec<TextArea<'a>>) {
-        let msg = Rect { x: b.x + 18.0, y: b.y + 14.0, w: b.w - 36.0, h: theme::UI_LINE_HEIGHT() };
+        let pad = theme::zpx(18.0);
+        let msg = Rect { x: b.x + pad, y: b.y + theme::zpx(20.0), w: b.w - pad * 2.0, h: theme::UI_LINE_HEIGHT() };
         self.message.draw_left(msg, 0.0, theme::FG_TEXT(), areas);
         for (lab, r) in self.buttons.iter().zip(self.button_rects(b)) {
             lab.draw_center(r, theme::FG_TEXT(), areas);
         }
         if has_check {
             let cb = self.check_box(b);
-            let lr = Rect { x: cb.x + cb.w + 8.0, y: cb.y - 2.0, w: 220.0, h: theme::UI_LINE_HEIGHT() };
+            let lr = Rect { x: cb.x + cb.w + theme::zpx(8.0), y: cb.y - theme::zpx(2.0), w: theme::zpx(220.0), h: theme::UI_LINE_HEIGHT() };
             self.check.draw_left(lr, 0.0, theme::FG_DIM(), areas);
         }
     }

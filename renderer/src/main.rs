@@ -652,7 +652,7 @@ impl App {
         }
         if self.sidebar_visible && self.sidebar_view == SidebarView::SourceControl {
             if let Some(scp) = self.source_control.as_mut() {
-                if scp.hover(p, layout.tree_region()) {
+                if scp.hover(p, layout.panel_region()) {
                     changed = true;
                 }
             }
@@ -793,15 +793,9 @@ impl App {
     }
 
     fn open_initial(&mut self) {
-        // Load user settings and apply the startup-time ones.
+        // Load user settings.
         let s = settings::reload();
         self.sidebar_visible = s.workbench_sidebar_visible;
-        self.apply_theme_by_name(&s.workbench_color_theme);
-
-        // Restore the persisted UI zoom before the first layout/draw.
-        if let Some(z) = state::State::load().zoom {
-            self.set_zoom(z);
-        }
 
         // Scan installed extensions up front so "Installed" status is accurate from
         // the start and grammar extensions (rainbow-csv, …) activate on launch.
@@ -810,6 +804,16 @@ impl App {
         // The panel was created with empty rows before this scan ran; push the
         // installed list into it now so the Extensions view isn't blank on launch.
         self.rebuild_ext_rows();
+
+        // Apply the saved color theme AFTER scanning — its label lives in an installed
+        // theme extension, so applying before the scan would never find it (and the UI
+        // would silently fall back to the built-in dark theme on every launch).
+        self.apply_theme_by_name(&s.workbench_color_theme);
+
+        // Restore the persisted UI zoom before the first layout/draw.
+        if let Some(z) = state::State::load().zoom {
+            self.set_zoom(z);
+        }
 
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -1823,6 +1827,9 @@ impl App {
             g.ui.palette_input.rezoom(&mut g.font_system);
             g.ui.find_input.rezoom(&mut g.font_system);
             g.create_input.rezoom(&mut g.font_system);
+            for b in g.create_icons.iter_mut() {
+                b.reshape(&mut g.font_system); // inline new-file/folder row icons
+            }
             g.ui.ext_detail.reshape(&mut g.font_system);
         }
         if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
@@ -2395,7 +2402,7 @@ impl App {
             && self.sidebar_view == SidebarView::SourceControl
             && layout.sidebar.contains((x, y))
         {
-            let region = layout.tree_region();
+            let region = layout.panel_region();
             let mut intents = Vec::new();
             let consumed = self
                 .source_control
@@ -3445,6 +3452,22 @@ impl ApplicationHandler for App {
         }
         let hover_wake = self.hover_pending.as_ref().map(|(.., t0)| *t0 + HOVER_DELAY);
 
+        // Debounced marketplace search: fire once the user pauses typing. While a search
+        // is staged or in flight, keep ticking ~110ms so the loader spinner animates.
+        let (debounce_wake, searching) = self
+            .extensions_panel
+            .as_mut()
+            .map(|ep| (ep.poll_search(&self.worker_tx), ep.is_searching()))
+            .unwrap_or((None, false));
+        if searching {
+            self.redraw();
+        }
+        let search_wake = if searching {
+            min_instant(debounce_wake, Some(now + Duration::from_millis(110)))
+        } else {
+            debounce_wake
+        };
+
         // Language-server document sync (open + debounced didChange).
         self.sync_lsp();
 
@@ -3526,7 +3549,8 @@ impl ApplicationHandler for App {
                 && self.workspace.documents.iter().any(|d| d.dirty && d.path.is_some());
             let autosave_wake =
                 autosave_pending.then(|| self.last_edit + Duration::from_millis(1100));
-            el.set_control_flow(match min_instant(min_instant(scroll_wake, autosave_wake), hover_wake) {
+            let wake = min_instant(min_instant(min_instant(scroll_wake, autosave_wake), hover_wake), search_wake);
+            el.set_control_flow(match wake {
                 Some(w) => ControlFlow::WaitUntil(w),
                 None => ControlFlow::Wait,
             });
@@ -3543,6 +3567,9 @@ impl ApplicationHandler for App {
         let mut wake = scroll_wake.map_or(blink_wake, |s| s.min(blink_wake));
         if let Some(hw) = hover_wake {
             wake = wake.min(hw);
+        }
+        if let Some(sw) = search_wake {
+            wake = wake.min(sw);
         }
         el.set_control_flow(ControlFlow::WaitUntil(wake));
     }

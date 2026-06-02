@@ -22,6 +22,12 @@ use crate::ui::Intent;
 use crate::widgets::{ExtSpec, ExtensionList, Rect, ScrollOpts, ScrollView, TextInput, TextLabel};
 use crate::{ext_filter_rect, ext_list_region};
 
+/// Monotonic base for animating the search spinner (frame = elapsed / interval).
+fn spin_base() -> std::time::Instant {
+    static B: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *B.get_or_init(std::time::Instant::now)
+}
+
 pub struct ExtensionsPanel {
     filter: TextInput,
     rows: ExtensionList,
@@ -34,6 +40,10 @@ pub struct ExtensionsPanel {
     search_gen: u64, // discards stale background search results
     searching: bool, // a marketplace query is in flight (drives the "Searching…" line)
     l_status: TextLabel, // "Searching…" / "No extensions found"
+    /// Debounce: the latest query + when it was typed. Promoted to a real request by
+    /// `poll_search` once the user pauses, so we don't fire (and download icons) on
+    /// every keystroke.
+    pending: Option<(String, std::time::Instant)>,
 }
 
 impl ExtensionsPanel {
@@ -52,6 +62,7 @@ impl ExtensionsPanel {
             search_gen: 0,
             searching: false,
             l_status: TextLabel::new(fs, theme::SIDEBAR_WIDTH(), theme::UI_LINE_HEIGHT()),
+            pending: None,
         }
     }
 
@@ -69,6 +80,12 @@ impl ExtensionsPanel {
     }
     pub fn search_gen(&self) -> u64 {
         self.search_gen
+    }
+
+    /// True while a marketplace search is staged or in flight (drives the spinner +
+    /// its animation ticks).
+    pub fn is_searching(&self) -> bool {
+        self.searching
     }
 
     /// Rebuild the row widgets from current extension data. Called when the data
@@ -111,15 +128,34 @@ impl ExtensionsPanel {
         self.visible = visible;
     }
 
-    /// Kick off a background marketplace search for the current filter text.
-    pub fn trigger_search(&mut self, tx: &Sender<WorkerMsg>) {
+    /// Stage a marketplace search for the current filter text. Debounced: the actual
+    /// request fires from `poll_search` once the user stops typing (so we don't spawn a
+    /// search + icon downloads on every keystroke).
+    pub fn trigger_search(&mut self, _tx: &Sender<WorkerMsg>) {
         let query = self.filter.text().trim().to_string();
         if query.is_empty() {
+            self.pending = None;
+            self.searching = false;
             return;
         }
-        self.search_gen += 1;
-        self.searching = true;
-        marketplace::search_async(tx.clone(), query, self.search_gen);
+        self.pending = Some((query, std::time::Instant::now()));
+        self.searching = true; // show "Searching…" immediately for responsiveness
+    }
+
+    /// Fire the staged search once the debounce window has elapsed. Returns the
+    /// deadline to wake at while a search is still pending (None when nothing pends).
+    pub fn poll_search(&mut self, tx: &Sender<WorkerMsg>) -> Option<std::time::Instant> {
+        let (query, t0) = self.pending.as_ref()?;
+        let deadline = *t0 + std::time::Duration::from_millis(250);
+        if std::time::Instant::now() >= deadline {
+            let query = query.clone();
+            self.pending = None;
+            self.search_gen += 1;
+            marketplace::search_async(tx.clone(), query, self.search_gen);
+            None
+        } else {
+            Some(deadline)
+        }
     }
 
     /// Re-shape the filter input + every row after a zoom change.
@@ -133,8 +169,14 @@ impl ExtensionsPanel {
         let list = ext_list_region(region);
         self.scroll.set_metrics(list, (list.w, self.rows.content_height()));
         // Keep the status label's text current (shaped here; pushed in draw_text).
+        // While searching, animate a small spinner so it reads as an active loader.
+        let spinner;
         let status = if self.searching {
-            "Searching…"
+            // ASCII spinner (guaranteed to render in the UI font, unlike braille glyphs).
+            const SP: [&str; 4] = ["|", "/", "-", "\\"];
+            let frame = (spin_base().elapsed().as_millis() / 120) as usize % SP.len();
+            spinner = format!("{}  Searching…", SP[frame]);
+            spinner.as_str()
         } else if self.showing_remote && self.rows.len() == 0 {
             "No extensions found"
         } else {
@@ -183,6 +225,11 @@ impl ExtensionsPanel {
         fg: &mut Vec<Quad>,
         icons: &mut Vec<IconInstance>,
     ) {
+        // While a (new) search is in flight, hide the stale rows so only "Searching…"
+        // shows — otherwise the old list and the status line overlap.
+        if self.searching {
+            return;
+        }
         let list = ext_list_region(region);
         let scroll = self.scroll.offset().1;
         self.rows.draw_quads(list, scroll, self.hovered, quads);
@@ -190,6 +237,9 @@ impl ExtensionsPanel {
         self.scroll.draw(now, fg); // scrollbar thumb on top (clipped by the pass)
     }
     pub fn list_areas<'b>(&'b self, region: Rect, areas: &mut Vec<TextArea<'b>>) {
+        if self.searching {
+            return;
+        }
         let list = ext_list_region(region);
         self.rows.draw_text(list, self.scroll.offset().1, areas);
     }

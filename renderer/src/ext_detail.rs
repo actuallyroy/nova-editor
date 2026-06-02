@@ -397,7 +397,14 @@ impl ExtensionDetail {
             (rect.y < bottom).then_some(Rect { h: rect.h.min(bottom - rect.y).max(0.0), ..rect })
         };
         let htext_x = Self::header_text_x(r);
-        let avail = Self::install_rect(r).x - htext_x - theme::zpx(16.0);
+        // Stop the header text before the left-most header button (the Set Color Theme
+        // button sits left of Install/Uninstall) so the long title can't overlap it.
+        let buttons_left = if self.installed && self.is_theme {
+            self.set_theme_rect(r).x
+        } else {
+            Self::install_rect(r).x
+        };
+        let avail = buttons_left - htext_x - theme::zpx(16.0);
         let top = r.y + Self::header_top();
         if let Some(rr) = clip(Rect { x: htext_x, y: top, w: avail, h: theme::zpx(34.0) }) {
             self.name.push(htext_x, rr, theme::FG_ACTIVE(), areas);

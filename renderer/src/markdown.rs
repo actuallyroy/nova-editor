@@ -16,11 +16,14 @@ fn attrs(family: &'static str, color: Color) -> Attrs<'static> {
 }
 
 fn heading_metrics(level: HeadingLevel) -> Metrics {
+    // Scale with the UI zoom, like body text (theme::UI_FONT_SIZE already does), so
+    // headings don't stay tiny at high zoom.
+    let z = theme::ui_zoom();
     match level {
-        HeadingLevel::H1 => Metrics::new(22.0, 30.0),
-        HeadingLevel::H2 => Metrics::new(18.0, 26.0),
-        HeadingLevel::H3 => Metrics::new(16.0, 24.0),
-        _ => Metrics::new(14.5, 22.0),
+        HeadingLevel::H1 => Metrics::new(22.0 * z, 30.0 * z),
+        HeadingLevel::H2 => Metrics::new(18.0 * z, 26.0 * z),
+        HeadingLevel::H3 => Metrics::new(16.0 * z, 24.0 * z),
+        _ => Metrics::new(14.5 * z, 22.0 * z),
     }
 }
 
@@ -70,10 +73,11 @@ pub struct Markdown {
     width: f32,
 }
 
-const IMG_GAP: f32 = 10.0;
-const IMG_PLACEHOLDER_H: f32 = 160.0;
-const IMG_MAX_H: f32 = 420.0;
-const BLOCK_GAP: f32 = 4.0; // vertical space between stacked text blocks
+// Image/block spacing + caps, scaled with the UI zoom so they track the text size.
+fn img_gap() -> f32 { 10.0 * theme::ui_zoom() }
+fn img_placeholder_h() -> f32 { 160.0 * theme::ui_zoom() }
+fn img_max_h() -> f32 { 420.0 * theme::ui_zoom() }
+fn block_gap() -> f32 { 4.0 * theme::ui_zoom() } // vertical space between stacked text blocks
 
 impl Markdown {
     pub fn new(_fs: &mut FontSystem) -> Self {
@@ -239,9 +243,9 @@ impl Markdown {
         match natural {
             Some((w, h)) if w > 0.0 => {
                 let dw = w.min(width);
-                (dw * h / w).min(IMG_MAX_H)
+                (dw * h / w).min(img_max_h())
             }
-            _ => IMG_PLACEHOLDER_H,
+            _ => img_placeholder_h(),
         }
     }
 
@@ -250,12 +254,12 @@ impl Markdown {
         let mut y = 0.0;
         for b in &self.blocks {
             match b {
-                Block::Text { height, .. } => y += height + BLOCK_GAP,
+                Block::Text { height, .. } => y += height + block_gap(),
                 // Only loaded images take space — unloaded/failed ones collapse to
                 // nothing (no empty gap) until their pixels arrive.
                 Block::Image { url } => {
                     if let Some(nat) = size_of(url) {
-                        y += Self::image_height(Some(nat), self.width) + IMG_GAP * 2.0;
+                        y += Self::image_height(Some(nat), self.width) + img_gap() * 2.0;
                     }
                 }
             }
@@ -295,18 +299,18 @@ impl Markdown {
                             custom_glyphs: &[],
                         });
                     }
-                    y += height + BLOCK_GAP;
+                    y += height + block_gap();
                 }
                 Block::Image { url } => {
                     // Only loaded images occupy space + draw; unloaded ones collapse.
                     if let Some((nw, nh)) = size_of(url) {
                         let dh = Self::image_height(Some((nw, nh)), self.width);
                         let dw = if nw > 0.0 { nw.min(self.width) } else { self.width };
-                        y += IMG_GAP;
+                        y += img_gap();
                         if y + dh > rect.y && y < rect.y + rect.h {
                             img_rects.push((url.clone(), Rect { x: rect.x, y, w: dw, h: dh }));
                         }
-                        y += dh + IMG_GAP;
+                        y += dh + img_gap();
                     }
                 }
             }
@@ -354,11 +358,11 @@ impl Markdown {
                             }
                         }
                     }
-                    y += height + BLOCK_GAP;
+                    y += height + block_gap();
                 }
                 Block::Image { url } => {
                     if let Some(nat) = size_of(url) {
-                        y += Self::image_height(Some(nat), self.width) + IMG_GAP * 2.0;
+                        y += Self::image_height(Some(nat), self.width) + img_gap() * 2.0;
                     }
                 }
             }

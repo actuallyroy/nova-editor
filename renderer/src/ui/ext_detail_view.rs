@@ -68,7 +68,7 @@ impl ExtDetailView {
         self.ext_img_base = None;
         self.requested_images.clear();
         gpu.ui.ext_detail.set_tab(DetailTab::Details);
-        self.ext_features = Self::build_features_md(which, extensions);
+        self.ext_features = Self::build_features_md(which, extensions, ext_remote);
         self.ext_doc_gen += 1;
         let gen = self.ext_doc_gen;
         match which {
@@ -83,40 +83,47 @@ impl ExtDetailView {
             }
             OpenExt::Remote(i) => {
                 if let Some(e) = ext_remote.get(i) {
-                    // Relative README images resolve against the readme URL's dir.
-                    self.ext_img_base = e.readme_url.clone();
-                    if let Some(url) = e.readme_url.clone() {
-                        marketplace::readme_async(worker_tx.clone(), url, gen);
-                    }
-                    if let Some(url) = e.changelog_url.clone() {
-                        marketplace::changelog_async(worker_tx.clone(), url, gen);
-                    }
+                    // The search response omits readme/changelog URLs, so fetch the full
+                    // metadata (which has them) then the docs. Relative README images
+                    // resolve against the Open VSX file base for this version.
+                    self.ext_img_base = Some(format!(
+                        "https://open-vsx.org/api/{}/{}/{}/file/",
+                        e.namespace, e.name, e.version
+                    ));
+                    marketplace::meta_async(worker_tx.clone(), e.namespace.clone(), e.name.clone(), gen);
                 }
             }
         }
     }
 
     /// Build the Features-tab markdown from what Nova knows about the extension.
-    fn build_features_md(which: OpenExt, extensions: &[Extension]) -> String {
-        match which {
-            OpenExt::Local(i) => {
-                let Some(e) = extensions.get(i) else { return String::new() };
-                let mut s = String::new();
-                match e.kind {
-                    ExtKind::Theme => s.push_str("### Color Theme\nContributes a color theme Nova can apply natively.\n\n"),
-                    ExtKind::Grammar => s.push_str("### Syntax Highlighting\nShips TextMate grammars Nova runs natively for syntax coloring.\n\n"),
-                    ExtKind::Declarative => s.push_str("### Language Support\nContributes snippets / language configuration.\n\n"),
-                    ExtKind::Code => s.push_str("### Code Extension\nNeeds the JavaScript extension runtime (not yet supported in Nova).\n\n"),
-                }
-                if !e.grammar_paths.is_empty() {
-                    s.push_str(&format!("- {} grammar file(s)\n", e.grammar_paths.len()));
-                }
-                if !e.themes.is_empty() {
-                    s.push_str(&format!("- {} color theme(s)\n", e.themes.len()));
-                }
-                s
-            }
-            OpenExt::Remote(_) => "Feature details are available after install.".to_string(),
+    /// Resolves the underlying installed extension — directly for a Local entry, or a
+    /// Remote (search) entry that happens to be installed — so an installed extension
+    /// shows real features even when opened from search results.
+    fn build_features_md(which: OpenExt, extensions: &[Extension], ext_remote: &[RemoteExt]) -> String {
+        let installed = match which {
+            OpenExt::Local(i) => extensions.get(i),
+            OpenExt::Remote(i) => ext_remote.get(i).and_then(|r| {
+                let id = r.id();
+                extensions.iter().find(|e| e.slug.eq_ignore_ascii_case(&id))
+            }),
+        };
+        let Some(e) = installed else {
+            return "Feature details are available after install.".to_string();
+        };
+        let mut s = String::new();
+        match e.kind {
+            ExtKind::Theme => s.push_str("### Color Theme\nContributes a color theme Nova can apply natively.\n\n"),
+            ExtKind::Grammar => s.push_str("### Syntax Highlighting\nShips TextMate grammars Nova runs natively for syntax coloring.\n\n"),
+            ExtKind::Declarative => s.push_str("### Language Support\nContributes snippets / language configuration.\n\n"),
+            ExtKind::Code => s.push_str("### Code Extension\nNeeds the JavaScript extension runtime (not yet supported in Nova).\n\n"),
         }
+        if !e.grammar_paths.is_empty() {
+            s.push_str(&format!("- {} grammar file(s)\n", e.grammar_paths.len()));
+        }
+        if !e.themes.is_empty() {
+            s.push_str(&format!("- {} color theme(s)\n", e.themes.len()));
+        }
+        s
     }
 }

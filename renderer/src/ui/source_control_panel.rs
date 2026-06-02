@@ -442,9 +442,10 @@ impl SourceControlPanel {
     }
 
     fn push_count<'b>(&self, label: &'b TextLabel, hdr: Rect, areas: &mut Vec<TextArea<'b>>) {
-        let w = label.width() + 12.0;
+        let w = label.width() + theme::zpx(12.0);
         let pill = Rect { x: hdr.x + hdr.w - w, y: hdr.y, w, h: row_h() };
-        label.push(pill.x + (pill.w - label.width()) * 0.5, pill, theme::FG_DIM(), areas);
+        // Bright text on the count pill (FG_DIM was unreadable on the dark-blue pill).
+        label.push(pill.x + (pill.w - label.width()) * 0.5, pill, theme::FG_TEXT(), areas);
     }
 
     fn icon_for(&self, act: Act) -> &TextLabel {
@@ -469,7 +470,7 @@ impl SourceControlPanel {
             return;
         }
         // Clip the row text to leave the status/action column clear.
-        let text_clip = Rect { w: (region.w - status_w() - 4.0).max(0.0), ..region };
+        let text_clip = Rect { w: (region.w - status_w() - theme::zpx(4.0)).max(0.0), ..region };
         list.draw_at(text_clip, region.y, theme::FG_DIM(), areas);
         let pad = list.pad_x();
         for (i, r) in rows.iter().enumerate() {
@@ -482,7 +483,8 @@ impl SourceControlPanel {
             }
             // Status letter at the far right.
             let (rr, gg, bb) = BADGE_RGB[r.badge];
-            let st = Rect { x: region.x + region.w - status_w(), y, w: 18.0, h: row_h() };
+            // Full status-column width (was a fixed 18px → the letter clipped at zoom).
+            let st = Rect { x: region.x + region.w - status_w(), y, w: status_w(), h: row_h() };
             self.badges[r.badge].push(st.x, st, Color::rgb(rr, gg, bb), areas);
             // Hover actions for this row.
             if hovered_idx == Some(i) {

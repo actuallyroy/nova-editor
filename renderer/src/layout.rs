@@ -264,7 +264,21 @@ impl Layout {
 
     /// The file-tree list region: the sidebar below the header + root row.
     pub fn tree_region(&self) -> Rect {
+        // The Explorer reserves a row below the header for its root ("NOVA-EDITOR") row.
         let top = self.sidebar.y + theme::SIDEBAR_HEADER_H() + theme::TREE_ROW_HEIGHT();
+        Rect {
+            x: self.sidebar.x,
+            y: top,
+            w: self.sidebar.w,
+            h: (self.sidebar.y + self.sidebar.h - top).max(0.0),
+        }
+    }
+
+    /// Content region for sidebar panels WITHOUT a root row (Source Control, Search,
+    /// Extensions): starts just below the header with a small pad, so there's no empty
+    /// row of gap between the header (e.g. "SOURCE CONTROL") and the first item.
+    pub fn panel_region(&self) -> Rect {
+        let top = self.sidebar.y + theme::SIDEBAR_HEADER_H() + theme::zpx(6.0);
         Rect {
             x: self.sidebar.x,
             y: top,

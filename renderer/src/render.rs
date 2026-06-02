@@ -171,7 +171,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
     if app.sidebar_visible && app.sidebar_view == SidebarView::SourceControl {
         if let Some(scp) = app.source_control.as_mut() {
-            scp.update(&mut gpu.font_system, layout.tree_region());
+            scp.update(&mut gpu.font_system, layout.panel_region());
         }
     }
     if app.detail.open_extension.is_some() {
@@ -554,6 +554,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // ---- Build quad lists ----
     let mut bg_quads: Vec<Quad> = Vec::new();
     let mut fg_quads: Vec<Quad> = Vec::new();
+    // A modal overlay (palette / dialog / feedback form) covers the center but not the
+    // edges, so every underlying overlay quad (scrollbars, detail icon, link underlines)
+    // must be suppressed while one is open — otherwise it bleeds through around the modal.
+    let modal_open = layout.palette.is_some() || app.dialog.is_some() || app.feedback_form.is_some();
 
     // Title bar bg + window-control hover (hover rect == the button rect).
     bg_quads.push(layout.title_bar.quad(theme::TITLE_BAR_BG()));
@@ -581,10 +585,12 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     if let Some(idx) = app.hovered_activity {
         bg_quads.push(act_rects[idx].quad(theme::ACTIVITY_BAR_ACTIVE()));
     }
-    // Active-section accent stripe on the active view's icon.
+    // Active view: subtle background highlight + the themed accent stripe on its
+    // left edge (VS Code's activityBar.activeBorder — Dracula's pink).
     if let Some(ai) = active_activity_idx(app.sidebar_visible, app.sidebar_view) {
         let r = act_rects[ai];
-        bg_quads.push(Quad::new(r.x, r.y, 2.0, r.h, [1.0, 1.0, 1.0, 0.85]));
+        bg_quads.push(r.quad(theme::ACTIVITY_BAR_ACTIVE()));
+        bg_quads.push(Quad::new(r.x, r.y, theme::zpx(2.0).max(2.0), r.h, theme::ACTIVITY_ACTIVE_BORDER()));
     }
     // Source Control change-count badge (blue pill, bottom-right of the SCM icon).
     let scm_count = app.source_control.as_ref().map_or(0, |s| s.change_count());
@@ -640,7 +646,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 }
             }
             // Auto-hiding file-tree scrollbar.
-            app.explorer.scroll.draw(now, &mut fg_quads);
+            if !modal_open {
+                app.explorer.scroll.draw(now, &mut fg_quads);
+            }
         } else if app.sidebar_view == SidebarView::Extensions {
             // Extensions panel: filter box chrome + selection/caret (fixed at top).
             // The scrollable rows draw in their own clipped pass after the main pass.
@@ -661,7 +669,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         } else if app.sidebar_view == SidebarView::SourceControl {
             if let Some(scp) = app.source_control.as_ref() {
-                scp.draw_quads(layout.tree_region(), app.cursor_blink_on, &mut bg_quads, &mut fg_quads);
+                scp.draw_quads(layout.panel_region(), app.cursor_blink_on, &mut bg_quads, &mut fg_quads);
             }
         }
         // Subtle right border.
@@ -908,7 +916,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
 
         // Editor scrollbars (auto-hide overlay; vertical + horizontal).
-        d.scroll.draw(now, &mut fg_quads);
+        if !modal_open {
+            d.scroll.draw(now, &mut fg_quads);
+        }
     }
 
     // Terminal panel — background, top divider, and the block cursor (when focused).
@@ -982,7 +992,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     }
                 }
                 // Auto-hiding scrollback scrollbar (overlay) for this pane.
-                pane.scroll.draw(now, &mut fg_quads);
+                if !modal_open {
+                    pane.scroll.draw(now, &mut fg_quads);
+                }
             }
         }
         // Terminal tab list (right side, shown when there's more than one tab).
@@ -995,7 +1007,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
 
     // README / extension detail page scrollbar (overlay over the editor area).
-    if app.detail.open_extension.is_some() {
+    if app.detail.open_extension.is_some() && !modal_open {
         app.detail.ext_detail_scroll.draw(now, &mut fg_quads);
     }
 
@@ -1073,9 +1085,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     let (cfg_w, cfg_h) = (gpu.config.width, gpu.config.height);
     gpu.quad_renderer
         .prepare(&gpu.device, &gpu.queue, &bg_quads, &fg_quads, (cfg_w, cfg_h));
-    // The detail-page header icon is drawn via the atlas in the main pass.
+    // The detail-page header icon is drawn via the atlas in the main pass. Suppress it
+    // when a modal is open, else its atlas quad draws over the modal.
     let mut detail_icons: Vec<icon::IconInstance> = Vec::new();
-    if app.detail.open_extension.is_some() {
+    if app.detail.open_extension.is_some() && !modal_open {
         if let Some(inst) = gpu.ui.ext_detail.icon_instance(editor_full) {
             detail_icons.push(inst);
         }
@@ -1200,7 +1213,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         } else if app.sidebar_view == SidebarView::SourceControl {
             if let Some(scp) = app.source_control.as_ref() {
-                scp.draw_text(tr, &mut areas);
+                scp.draw_text(layout.panel_region(), &mut areas);
             }
         }
     }
@@ -1486,7 +1499,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
 
     // Draw loaded images + link underlines in a clipped pass over the README body.
-    if app.detail.open_extension.is_some() {
+    // Suppressed under a modal (palette/dialog/feedback) — these are quads, so the
+    // text-suppression guard above doesn't cover them and they'd bleed through.
+    if app.detail.open_extension.is_some() && !modal_open {
         let region = editor_region(&layout);
         let clip = crate::ext_detail::ExtensionDetail::body_viewport(region);
         let scroll = app.detail.ext_detail_scroll.offset().1;

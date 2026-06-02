@@ -43,6 +43,7 @@ pub struct Theme {
     pub find_match: [f32; 4],
     pub activity_bar_bg: [f32; 4],
     pub activity_bar_active: [f32; 4],
+    pub activity_active_border: [f32; 4], // accent stripe on the active view's icon
     pub sidebar_bg: [f32; 4],
     pub panel_bg: [f32; 4],     // integrated terminal / bottom panel background
     pub panel_border: [f32; 4], // low-contrast divider between editor and panel
@@ -117,6 +118,7 @@ impl Theme {
             find_match: [0.6, 0.5, 0.0, 0.45],
             activity_bar_bg: [0.129, 0.137, 0.141, 1.0],
             activity_bar_active: [1.0, 1.0, 1.0, 0.08],
+            activity_active_border: [1.0, 1.0, 1.0, 0.85],
             sidebar_bg: [0.102, 0.110, 0.114, 1.0],
             // Slightly raised vs the editor (0.076) so the terminal reads as its
             // own surface, and a soft translucent-white divider on top.
@@ -164,12 +166,54 @@ impl Theme {
 
 fn current() -> &'static RwLock<Theme> {
     static T: OnceLock<RwLock<Theme>> = OnceLock::new();
-    T.get_or_init(|| RwLock::new(Theme::dark()))
+    T.get_or_init(|| {
+        let mut t = Theme::dark();
+        ensure_legible(&mut t); // floor the default too (it never goes through set())
+        RwLock::new(t)
+    })
 }
 
 /// Replace the active theme (e.g. after loading a VSCode color theme).
-pub fn set(theme: Theme) {
+pub fn set(mut theme: Theme) {
+    // Guarantee legibility for EVERY theme — built-in or loaded — in one place, so no
+    // dim/secondary foreground can slip through on any palette.
+    ensure_legible(&mut theme);
     *current().write().unwrap() = theme;
+    // Force every color-baking text widget (sidebar metadata, gutter, tab labels,
+    // rich labels) to re-shape with the new palette — otherwise they keep the colors
+    // they were first shaped with and the theme only half-applies.
+    bump_shape_epoch();
+}
+
+/// Force a minimum contrast on every dim/secondary UI foreground against the surface
+/// it's drawn on, blending toward the matching bright color when too faint. Runs for
+/// all themes (including the built-in dark), so dim chrome text is never illegible.
+/// Syntax/markdown colors are intentionally untouched — that's the theme's code palette.
+fn ensure_legible(t: &mut Theme) {
+    let eb = (
+        (t.bg_editor.r * 255.0) as u8,
+        (t.bg_editor.g * 255.0) as u8,
+        (t.bg_editor.b * 255.0) as u8,
+        1.0,
+    );
+    // fg_dim/fg_gutter appear on the editor AND the sidebar/panels — floor them against
+    // the DARKEST of those surfaces so dim text (e.g. the SOURCE CONTROL / CHANGES
+    // section headers, which live on the sidebar) is legible everywhere, not just the editor.
+    let darkest = [eb, quad_tuple(t.sidebar_bg), quad_tuple(t.panel_bg)]
+        .into_iter()
+        .min_by(|a, b| luminance(*a).partial_cmp(&luminance(*b)).unwrap())
+        .unwrap_or(eb);
+    // Target ~7:1 (WCAG AAA) for secondary text — 4.5 left mid-greys like #858585
+    // technically passing but reading as "dim". Higher floor = comfortably legible.
+    t.fg_dim = legible(t.fg_dim, darkest, t.fg_text, 7.0);
+    t.fg_active = legible(t.fg_active, eb, t.fg_text, 7.0);
+    t.fg_gutter = legible(t.fg_gutter, darkest, t.fg_text, 4.5);
+    t.close_fg = legible(t.close_fg, darkest, t.fg_text, 6.0);
+    t.tab_fg_inactive = legible(t.tab_fg_inactive, quad_tuple(t.tab_bar_bg), t.tab_fg_active, 6.0);
+    t.tab_fg_active = legible(t.tab_fg_active, quad_tuple(t.tab_active), t.fg_text, 7.0);
+    t.activity_icon_fg = legible(t.activity_icon_fg, quad_tuple(t.activity_bar_bg), t.activity_icon_active, 6.0);
+    t.status_bar_fg = legible(t.status_bar_fg, quad_tuple(t.status_bar_bg), t.fg_text, 6.0);
+    t.title_fg = legible(t.title_fg, quad_tuple(t.title_bar_bg), t.fg_text, 6.0);
 }
 
 /// Blend `fg` toward `bg` by `t` (0 = fg, 1 = bg) — used to derive a dim foreground
@@ -177,6 +221,45 @@ pub fn set(theme: Theme) {
 fn blend(fg: (u8, u8, u8, f32), bg: (u8, u8, u8, f32), t: f32) -> Color {
     let mix = |a: u8, b: u8| ((a as f32) * (1.0 - t) + (b as f32) * t).round() as u8;
     Color::rgb(mix(fg.0, bg.0), mix(fg.1, bg.1), mix(fg.2, bg.2))
+}
+
+fn rgb_tuple(c: Color) -> (u8, u8, u8, f32) {
+    (c.r(), c.g(), c.b(), 1.0)
+}
+fn quad_tuple(q: [f32; 4]) -> (u8, u8, u8, f32) {
+    ((q[0] * 255.0) as u8, (q[1] * 255.0) as u8, (q[2] * 255.0) as u8, 1.0)
+}
+/// WCAG relative luminance of an sRGB color.
+fn luminance((r, g, b, _): (u8, u8, u8, f32)) -> f32 {
+    let lin = |c: u8| {
+        let c = c as f32 / 255.0;
+        if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+/// WCAG contrast ratio between two colors (1.0 = identical, 21 = black/white).
+fn contrast_ratio(a: (u8, u8, u8, f32), b: (u8, u8, u8, f32)) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+/// Guarantee `fg` reads against `bg`: if its contrast is below `min`, blend it toward
+/// `toward` (the matching bright foreground) just enough to clear the floor. This is
+/// what keeps every theme's dim/inactive foregrounds (gutter, inactive tabs, icons,
+/// labels) legible without per-element tuning — applied uniformly in `load_vscode`.
+fn legible(fg: Color, bg: (u8, u8, u8, f32), toward: Color, min: f32) -> Color {
+    let fg_t = rgb_tuple(fg);
+    if contrast_ratio(fg_t, bg) >= min {
+        return fg;
+    }
+    let to_t = rgb_tuple(toward);
+    for step in 1..=10 {
+        let c = blend(fg_t, to_t, step as f32 / 10.0);
+        if contrast_ratio(rgb_tuple(c), bg) >= min {
+            return c;
+        }
+    }
+    toward
 }
 
 /// Perceived-luminance test for picking light-vs-dark-appropriate derivations.
@@ -225,24 +308,39 @@ pub fn load_vscode(path: &std::path::Path) -> Option<Theme> {
         col(&["statusBar.foreground"], &mut t.status_bar_fg);
         col(&["titleBar.activeForeground", "foreground"], &mut t.title_fg);
         col(&["tab.activeForeground", "foreground"], &mut t.tab_fg_active);
-        col(&["tab.inactiveForeground", "descriptionForeground"], &mut t.tab_fg_inactive);
-        col(&["editorLineNumber.foreground"], &mut t.fg_gutter);
+        // Inactive tab label: theme's color blended 40% toward the active tab color so
+        // it stays readable (Dracula's tab.inactiveForeground is very dim on its tab bar).
+        let tab_active = rgb_any(&["tab.activeForeground", "foreground"]).unwrap_or(editor_fg);
+        t.tab_fg_inactive = match rgb_any(&["tab.inactiveForeground", "descriptionForeground"]) {
+            Some(c) => blend(c, tab_active, 0.40),
+            None => blend(editor_fg, editor_bg, 0.40),
+        };
+        // Line numbers: theme's gutter color blended 35% toward the foreground so the
+        // inactive numbers stay legible (Dracula's editorLineNumber.foreground is dim);
+        // the active line uses fg_gutter_active (bright) below.
+        t.fg_gutter = match rgb("editorLineNumber.foreground") {
+            Some(c) => blend(c, editor_fg, 0.35),
+            None => blend(editor_fg, editor_bg, 0.50),
+        };
         col(&["editorLineNumber.activeForeground", "editor.foreground"], &mut t.fg_gutter_active);
-        // Inactive activity-bar icons are DIM (VS Code uses activityBar.inactiveForeground);
-        // only the active view's icon is bright. Pulling `foreground` here made them all bright.
-        col(&["activityBar.inactiveForeground", "icon.foreground", "descriptionForeground"], &mut t.activity_icon_fg);
-        col(&["activityBar.foreground", "icon.foreground", "foreground"], &mut t.activity_icon_active);
+        // Activity-bar icons: active is bright; inactive starts from the theme's
+        // inactiveForeground but is blended 40% toward the active color so it stays
+        // clearly legible (themes like Dracula make it very dim — ~2.6:1).
+        let icon_active = rgb_any(&["activityBar.foreground", "icon.foreground", "foreground"]).unwrap_or(editor_fg);
+        t.activity_icon_active = to_color(icon_active);
+        t.activity_icon_fg = match rgb_any(&["activityBar.inactiveForeground", "icon.foreground", "descriptionForeground"]) {
+            Some(inactive) => blend(inactive, icon_active, 0.40),
+            None => blend(editor_fg, editor_bg, 0.45), // dim, but legible
+        };
         col(&["tab.activeForeground"], &mut t.close_fg_hover);
         // Dim/secondary text: prefer the theme's descriptionForeground, else blend
         // the foreground ~45% toward the background so it's never the dark-theme grey.
+        // Secondary text: prefer the theme's descriptionForeground, else blend the
+        // foreground only ~28% toward bg (45% was too faint — labels vanished).
         t.fg_dim = rgb("descriptionForeground")
             .map(to_color)
-            .unwrap_or_else(|| blend(editor_fg, editor_bg, 0.45));
+            .unwrap_or_else(|| blend(editor_fg, editor_bg, 0.28));
         t.close_fg = t.fg_dim;
-        // If the theme gave no explicit inactive icon/foreground, dim it like fg_dim.
-        if rgb("activityBar.inactiveForeground").is_none() && rgb("icon.foreground").is_none() {
-            t.activity_icon_fg = t.fg_dim;
-        }
 
         let mut quad = |keys: &[&str], dst: &mut [f32; 4]| {
             if let Some(c) = rgb_any(keys) {
@@ -264,6 +362,14 @@ pub fn load_vscode(path: &std::path::Path) -> Option<Theme> {
         quad(&["panel.background"], &mut t.panel_bg);
         quad(&["panel.border", "editorGroup.border", "contrastBorder"], &mut t.panel_border);
         quad(&["activityBar.background"], &mut t.activity_bar_bg);
+        quad(&["activityBar.activeBackground"], &mut t.activity_bar_active);
+        // The active-view accent stripe: VS Code's activityBar.activeBorder (Dracula's
+        // pink). Fall back to the active icon color so it's always visible.
+        if let Some(c) = rgb("activityBar.activeBorder") {
+            t.activity_active_border = to_quad(c);
+        } else if let Some(c) = rgb_any(&["activityBar.foreground", "focusBorder", "foreground"]) {
+            t.activity_active_border = to_quad(c);
+        }
         quad(&["sideBar.background"], &mut t.sidebar_bg);
         quad(&["editorGroupHeader.tabsBackground", "editor.background"], &mut t.tab_bar_bg);
         quad(&["tab.inactiveBackground"], &mut t.tab_inactive);
@@ -407,6 +513,7 @@ pub fn LINE_HIGHLIGHT() -> [f32; 4] { current().read().unwrap().line_highlight }
 pub fn FIND_MATCH() -> [f32; 4] { current().read().unwrap().find_match }
 pub fn ACTIVITY_BAR_BG() -> [f32; 4] { current().read().unwrap().activity_bar_bg }
 pub fn ACTIVITY_BAR_ACTIVE() -> [f32; 4] { current().read().unwrap().activity_bar_active }
+pub fn ACTIVITY_ACTIVE_BORDER() -> [f32; 4] { current().read().unwrap().activity_active_border }
 pub fn SIDEBAR_BG() -> [f32; 4] { current().read().unwrap().sidebar_bg }
 pub fn PANEL_BG() -> [f32; 4] { current().read().unwrap().panel_bg }
 pub fn PANEL_BORDER() -> [f32; 4] { current().read().unwrap().panel_border }
