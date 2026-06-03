@@ -122,7 +122,9 @@ impl Layout {
                 + theme::PALETTE_ROW_HEIGHT() * visible as f32
                 + pad;
             let bx = (w - pw) * 0.5;
-            let by = theme::zpx(72.0);
+            // Drop down right below the top bar (which hosts the search that opens it),
+            // like VSCode's command center.
+            let by = theme::TITLE_BAR_H() + theme::zpx(6.0);
             let box_ = Rect { x: bx, y: by, w: pw, h: ph };
             let input = Rect {
                 x: box_.x + pad,

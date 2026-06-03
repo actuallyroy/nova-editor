@@ -1,6 +1,6 @@
 [package]
 name = "aether-renderer"
-version = "0.2.13"
+version = "0.2.14"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -26,6 +26,7 @@ rfd = "0.15"
 vte = "0.13"
 ropey = "1.6"
 rquickjs = "0.8"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
 # VS Code-style TextMate highlighting (pure-Rust fancy-regex backend — no C deps,
 # keeps the cross-platform release matrix safe). Bundles common-language syntaxes.

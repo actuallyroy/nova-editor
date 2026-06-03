@@ -1,17 +1,14 @@
-// Integrated terminal: a ConPTY-backed shell rendered into a cell grid.
-//
-// portable-pty spawns the shell and gives us a ConPTY whose output is a VT (ANSI)
-// byte stream. A background thread streams those bytes to the main loop, which
-// feeds them through a `vte` parser into a rows×cols grid of colored cells with a
-// cursor + scrollback (the `Perform` impl below). The renderer draws the grid; key
-// presses are translated to bytes and written back to the PTY.
+// Integrated terminal: a shell (owned by the pty-host daemon) rendered into a cell
+// grid. The daemon streams the shell's VT (ANSI) bytes to us over a socket; we feed
+// them through a `vte` parser into a rows×cols grid of colored cells with a cursor +
+// scrollback (the `Perform` impl below). The renderer draws the grid; key presses
+// are translated to bytes and sent back to the daemon, which forwards them to the
+// PTY. Because the daemon owns the PTY, shells survive a full GUI restart.
 
-use std::io::{Read, Write};
-use std::sync::mpsc::{channel, Receiver};
-
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use vte::{Params, Parser, Perform};
 
+use crate::ptyhost::client::{self, Conn};
+use crate::ptyhost::{Frame, TermId};
 use crate::widgets::{ScrollOpts, ScrollView};
 
 /// A single terminal split pane: the shell plus its own scrollback viewport and
@@ -32,8 +29,9 @@ pub struct Pane {
 pub type TermPos = (usize, usize);
 
 impl Pane {
-    pub fn spawn(rows: usize, cols: usize, cwd: &std::path::Path) -> Option<Pane> {
-        Terminal::spawn(rows, cols, cwd).map(|term| Pane {
+    /// Wrap a `Terminal` in a fresh pane (scroll viewport + selection state).
+    pub fn wrap(term: Terminal) -> Pane {
+        Pane {
             term,
             scroll: ScrollView::new(ScrollOpts {
                 vertical: true,
@@ -43,7 +41,7 @@ impl Pane {
             dirty: true,
             sel: None,
             sel_dragging: false,
-        })
+        }
     }
 
     /// The selected text, trimmed of trailing whitespace per line. None if empty.
@@ -607,96 +605,57 @@ impl Perform for Grid {
 }
 
 pub struct Terminal {
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    _child: Box<dyn Child + Send + Sync>,
-    rx: Receiver<Vec<u8>>,
+    /// Daemon-assigned id, or 0 while a `Create` is still in flight (unbound). Writes
+    /// before binding are dropped — the shell isn't ready yet anyway.
+    pub id: TermId,
+    /// Local tag used to bind the daemon's `Created` reply to this terminal (0 once
+    /// bound). Lets the panel match async creates back to the right pane.
+    pub tag: u64,
+    conn: Conn, // shared write half of the daemon connection
     parser: Parser,
     pub grid: Grid,
     pub title: String, // shell base name, shown on the terminal tab
+    pub exited: bool,  // the shell process has ended
 }
 
 impl Terminal {
-    /// Spawn the platform shell in a ConPTY sized to `rows`×`cols`, starting in
-    /// `cwd` (the workspace root, like VSCode) when it's a real directory.
-    pub fn spawn(rows: usize, cols: usize, cwd: &std::path::Path) -> Option<Self> {
-        let pty = native_pty_system();
-        let pair = pty
-            .openpty(PtySize { rows: rows as u16, cols: cols as u16, pixel_width: 0, pixel_height: 0 })
-            .ok()?;
-        // Platform shell: COMSPEC/cmd.exe on Windows, else $SHELL (login shell)
-        // falling back to bash/sh on Unix.
-        #[cfg(windows)]
-        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-        #[cfg(not(windows))]
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
-            if std::path::Path::new("/bin/bash").exists() {
-                "/bin/bash".to_string()
-            } else {
-                "/bin/sh".to_string()
-            }
-        });
-        let title = std::path::Path::new(&shell)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("shell")
-            .to_string();
-        let mut cmd = CommandBuilder::new(shell);
-        if cwd.is_dir() {
-            cmd.cwd(cwd);
-        }
-        // Advertise a capable terminal so TUIs (claude code, vim, less, …) use the
-        // alternate screen + truecolor. Without TERM (e.g. a macOS GUI launch) they
-        // fall back to repainting the normal screen, which floods the scrollback
-        // with duplicate frames as you scroll. We support these (alt screen, SGR
-        // colors, SGR mouse), so xterm-256color is accurate.
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        let child = pair.slave.spawn_command(cmd).ok()?;
-        drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader().ok()?;
-        let writer = pair.master.take_writer().ok()?;
-        let (tx, rx) = channel();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-        Some(Self {
-            master: pair.master,
-            writer,
-            _child: child,
-            rx,
+    /// A terminal whose shell is being created (id assigned later via `bind`).
+    pub fn new_unbound(conn: Conn, tag: u64, rows: usize, cols: usize) -> Self {
+        Self {
+            id: 0,
+            tag,
+            conn,
             parser: Parser::new(),
             grid: Grid::new(rows, cols),
-            title,
-        })
-    }
-
-    /// Drain any pending shell output into the grid. Returns true if anything changed.
-    pub fn poll(&mut self) -> bool {
-        let mut changed = false;
-        while let Ok(chunk) = self.rx.try_recv() {
-            for b in chunk {
-                self.parser.advance(&mut self.grid, b);
-            }
-            changed = true;
+            title: "shell".to_string(),
+            exited: false,
         }
-        changed
     }
 
-    /// Send raw bytes (translated key input) to the shell.
+    /// A terminal re-attached to an already-running daemon shell (known id).
+    pub fn new_bound(conn: Conn, id: TermId, rows: usize, cols: usize, title: String) -> Self {
+        Self { id, tag: 0, conn, parser: Parser::new(), grid: Grid::new(rows, cols), title, exited: false }
+    }
+
+    /// Bind a just-created shell's id/title (resolves a pending `new_unbound`).
+    pub fn bind(&mut self, id: TermId, title: String) {
+        self.id = id;
+        self.tag = 0;
+        self.title = title;
+    }
+
+    /// Feed a chunk of shell output (raw VT bytes) into the grid.
+    pub fn feed(&mut self, data: &[u8]) {
+        for &b in data {
+            self.parser.advance(&mut self.grid, b);
+        }
+    }
+
+    /// Send raw bytes (translated key input) to the shell via the daemon.
     pub fn write(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        if self.id != 0 {
+            client::send(&self.conn, Frame::Write { id: self.id, data: bytes.to_vec() });
+        }
     }
 
     /// True when a full-screen (alt-screen) app is running — it owns scrolling, so
@@ -836,13 +795,10 @@ impl Terminal {
     }
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        let _ = self.master.resize(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
         self.grid.resize(rows, cols);
+        if self.id != 0 {
+            client::send(&self.conn, Frame::Control(crate::ptyhost::Msg::Resize { id: self.id, rows: rows as u16, cols: cols as u16 }));
+        }
     }
 }
 

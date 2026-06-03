@@ -8,9 +8,11 @@
 // `gpu`/`render.rs`, since they need direct `gpu` access. Moving that in is a
 // follow-up.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crate::layout::Layout;
+use crate::ptyhost::client::{Client, Incoming};
 use crate::terminal;
 use crate::theme;
 use crate::widgets::{Axis, Rect, Splitter};
@@ -30,6 +32,14 @@ pub struct TerminalPanel {
     /// spawning doesn't have to thread it through every call; `App` keeps it in
     /// sync via `set_cwd` whenever the workspace root changes.
     cwd: PathBuf,
+    /// Connection to the pty-host daemon (lazily established on first terminal use,
+    /// spawning the daemon if needed). The daemon owns the shells so they survive a
+    /// GUI restart.
+    client: Option<Client>,
+    /// Local tags for shells whose `Created` reply hasn't arrived yet (FIFO; the
+    /// daemon replies in request order on one connection).
+    pending: VecDeque<u64>,
+    next_tag: u64,
 }
 
 impl TerminalPanel {
@@ -47,7 +57,91 @@ impl TerminalPanel {
             ),
             maximized: false,
             cwd,
+            client: None,
+            pending: VecDeque::new(),
+            next_tag: 1,
         }
+    }
+
+    /// Ensure we're connected to the daemon. Returns the daemon's existing terminals
+    /// the first time it connects (to re-attach), else an empty list.
+    fn ensure_connected(&mut self) -> Vec<crate::ptyhost::TermInfo> {
+        if self.client.is_some() {
+            return Vec::new();
+        }
+        match Client::connect_or_spawn() {
+            Some((client, terminals)) => {
+                self.client = Some(client);
+                terminals
+            }
+            None => Vec::new(),
+        }
+    }
+
+    fn term_by_id(&mut self, id: crate::ptyhost::TermId) -> Option<&mut terminal::Pane> {
+        self.groups.iter_mut().flat_map(|g| g.panes.iter_mut()).find(|p| p.term.id == id)
+    }
+
+    fn term_by_tag(&mut self, tag: u64) -> Option<&mut terminal::Pane> {
+        self.groups.iter_mut().flat_map(|g| g.panes.iter_mut()).find(|p| p.term.tag == tag)
+    }
+
+    /// Drain daemon frames: bind newly-created shells, feed output into grids, and
+    /// drop panes whose shell exited. Returns true if anything changed (needs redraw).
+    pub fn poll(&mut self) -> bool {
+        let Some(client) = self.client.as_ref() else {
+            return false;
+        };
+        let incoming = client.poll();
+        if incoming.is_empty() {
+            return false;
+        }
+        let mut exited = Vec::new();
+        for inc in incoming {
+            match inc {
+                Incoming::Created { id, title } => {
+                    if let Some(tag) = self.pending.pop_front() {
+                        if let Some(p) = self.term_by_tag(tag) {
+                            p.term.bind(id, title);
+                        }
+                    }
+                }
+                Incoming::Backlog { id, data } | Incoming::Output { id, data } => {
+                    if let Some(p) = self.term_by_id(id) {
+                        p.term.feed(&data);
+                        p.dirty = true;
+                    }
+                }
+                Incoming::Exited { id } => exited.push(id),
+            }
+        }
+        for id in exited {
+            self.remove_pane_by_id(id);
+        }
+        true
+    }
+
+    /// Remove the pane (and its now-empty group) whose shell exited, like VSCode.
+    fn remove_pane_by_id(&mut self, id: crate::ptyhost::TermId) {
+        for gi in 0..self.groups.len() {
+            if let Some(pi) = self.groups[gi].panes.iter().position(|p| p.term.id == id) {
+                self.groups[gi].panes.remove(pi);
+                let g = &mut self.groups[gi];
+                if !g.panes.is_empty() {
+                    g.focused = g.focused.min(g.panes.len() - 1);
+                }
+                break;
+            }
+        }
+        self.groups.retain(|g| !g.panes.is_empty());
+        if self.groups.is_empty() {
+            self.visible = false;
+            self.focused = false;
+            self.maximized = false;
+        } else {
+            self.active = self.active.min(self.groups.len() - 1);
+        }
+        self.mark_dirty();
     }
 
     /// Update the directory new shells will start in (called on Open Folder).
@@ -71,7 +165,9 @@ impl TerminalPanel {
 
     /// Spawn a pane sized to fit when the active tab shows `count` side-by-side
     /// panes, with the shell starting in `cwd` (the workspace root).
-    fn spawn_pane(&self, count: usize, panel: Option<Rect>, cell_w: f32) -> Option<terminal::Pane> {
+    fn spawn_pane(&mut self, count: usize, panel: Option<Rect>, cell_w: f32) -> Option<terminal::Pane> {
+        self.ensure_connected();
+        let client = self.client.as_ref()?;
         let panel = panel?;
         let area = terminal_pane_area(terminal_content(panel), self.groups.len().max(1));
         let rect = terminal_pane_rects(area, count.max(1))
@@ -79,7 +175,13 @@ impl TerminalPanel {
             .next()
             .unwrap_or(area);
         let (rows, cols) = terminal_grid_size(rect, cell_w);
-        terminal::Pane::spawn(rows, cols, &self.cwd)
+        // Ask the daemon to spawn a shell; bind its id when `Created` arrives (poll).
+        let tag = self.next_tag;
+        self.next_tag += 1;
+        client.create(&self.cwd.to_string_lossy(), rows as u16, cols as u16);
+        self.pending.push_back(tag);
+        let conn = client.conn();
+        Some(terminal::Pane::wrap(terminal::Terminal::new_unbound(conn, tag, rows, cols)))
     }
 
     /// Header `+`: open a new terminal tab (a fresh group). The previous tab keeps
@@ -116,7 +218,12 @@ impl TerminalPanel {
             return;
         }
         let i = g.focused.min(g.panes.len() - 1);
+        let id = g.panes[i].term.id;
         g.panes.remove(i);
+        if let Some(c) = self.client.as_ref() {
+            c.close(id);
+        }
+        let g = self.groups.get_mut(self.active).expect("active group still valid");
         if g.panes.is_empty() {
             self.groups.remove(self.active);
             if self.groups.is_empty() {
@@ -147,7 +254,12 @@ impl TerminalPanel {
         if i >= self.groups.len() {
             return;
         }
-        self.groups.remove(i);
+        let removed = self.groups.remove(i);
+        if let Some(c) = self.client.as_ref() {
+            for p in &removed.panes {
+                c.close(p.term.id);
+            }
+        }
         if self.groups.is_empty() {
             self.visible = false;
             self.focused = false;
@@ -182,8 +294,27 @@ impl TerminalPanel {
         self.visible && self.groups.is_empty()
     }
 
-    /// Spawn the first tab on first open, using the now-visible panel rect.
+    /// On first open: re-attach to any shells the daemon kept alive from a previous
+    /// session (one tab each), else spawn a fresh first tab.
     pub fn spawn_initial(&mut self, panel: Option<Rect>, cell_w: f32) {
+        let existing = self.ensure_connected();
+        if !existing.is_empty() {
+            let Some(panel) = panel else { return };
+            if let Some(client) = self.client.as_ref() {
+                // Size each re-attached terminal to a single full-width pane.
+                let area = terminal_pane_area(terminal_content(panel), existing.len().max(1));
+                let rect = terminal_pane_rects(area, 1).into_iter().next().unwrap_or(area);
+                let (rows, cols) = terminal_grid_size(rect, cell_w);
+                for info in existing {
+                    let term = terminal::Terminal::new_bound(client.conn(), info.id, rows, cols, info.title);
+                    client.attach(info.id);
+                    self.groups.push(terminal::Group::new(terminal::Pane::wrap(term)));
+                }
+                self.active = 0;
+                self.mark_dirty();
+            }
+            return;
+        }
         if let Some(p) = self.spawn_pane(1, panel, cell_w) {
             self.groups.push(terminal::Group::new(p));
             self.active = 0;

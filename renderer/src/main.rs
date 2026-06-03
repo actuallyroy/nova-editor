@@ -28,6 +28,7 @@ mod macos_menu;
 mod perf;
 mod update;
 mod media;
+mod ptyhost;
 mod quad;
 mod render;
 mod search;
@@ -4273,15 +4274,8 @@ impl ApplicationHandler for App {
         // Integrated terminal: drain every pane's shell output, and keep ticking
         // while open so new output appears promptly.
         if self.terminal.visible {
-            let mut changed = false;
-            for g in &mut self.terminal.groups {
-                for p in &mut g.panes {
-                    if p.term.poll() {
-                        p.dirty = true;
-                        changed = true;
-                    }
-                }
-            }
+            // Drain the daemon connection once; the panel routes output to its panes.
+            let mut changed = self.terminal.poll();
             // Blink the terminal block cursor on the standard cadence (PowerShell-style).
             if now.duration_since(self.term_last_blink) >= Duration::from_millis(theme::BLINK_MS) {
                 self.term_blink_on = !self.term_blink_on;
@@ -4494,6 +4488,12 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<()> {
     env_logger::init();
+    // Pty-host mode: this process is the detached daemon that owns terminal PTYs so
+    // they survive GUI restarts. It never opens a window — just runs the event loop.
+    if std::env::args().any(|a| a == "--pty-host") {
+        ptyhost::client::run_daemon()?;
+        return Ok(());
+    }
     // Move a legacy ~/.nova config dir to ~/.aether before anything reads config.
     settings::migrate_legacy_config_dir();
     // Optional path arg: a directory becomes the workspace root; a file is opened
