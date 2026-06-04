@@ -495,12 +495,29 @@ impl SourceControlPanel {
         } else {
             &[Act::Open, Act::Discard, Act::Stage]
         };
+        Self::rects_for(acts, region, y)
+    }
+
+    /// Hover actions on a tree-mode FOLDER row: stage/unstage every file under it
+    /// (#34). Discard is deliberately absent — it confirms per file.
+    fn folder_action_rects(region: Rect, y: f32, staged: bool) -> Vec<(Act, Rect)> {
+        let acts: &[Act] = if staged { &[Act::Unstage] } else { &[Act::Stage] };
+        Self::rects_for(acts, region, y)
+    }
+
+    fn rects_for(acts: &[Act], region: Rect, y: f32) -> Vec<(Act, Rect)> {
         let end = region.x + region.w - status_w() - 4.0 * theme::ui_zoom();
         let start = end - acts.len() as f32 * action_w();
         acts.iter()
             .enumerate()
             .map(|(i, &a)| (a, Rect { x: start + i as f32 * action_w(), y, w: action_w(), h: row_h() }))
             .collect()
+    }
+
+    /// Repo-relative folder path inside a `Vis::Folder` collapse key
+    /// (`"{staged}\0{path}"`).
+    fn folder_path(key: &str) -> &str {
+        key.splitn(2, '\u{0}').nth(1).unwrap_or("")
     }
 
     /// [stash, tree-toggle, refresh, more] toolbar rects, right-aligned in the
@@ -758,6 +775,16 @@ impl SourceControlPanel {
         let pad = list.pad_x();
         for (i, v) in vis.iter().enumerate() {
             let y = region.y + i as f32 * row_h();
+            // Folder rows: stage/unstage-all icons on hover (#34); no badge.
+            if matches!(v, Vis::Folder { .. }) {
+                if hovered_idx == Some(i) {
+                    for (act, ar) in Self::folder_action_rects(region, y, staged) {
+                        let lbl = self.icon_for(act);
+                        lbl.push_in(ar.x + (ar.w - lbl.width()) * 0.5, ar, vp, theme::FG_TEXT(), areas);
+                    }
+                }
+                continue;
+            }
             let Vis::File { row, .. } = v else { continue };
             let r = &rows[*row];
             if !self.tree_mode {
@@ -916,7 +943,29 @@ impl SourceControlPanel {
             }
             if let Some(i) = list.row_at(lr, pt, vis.len()) {
                 match &vis[i] {
-                    Vis::Folder { key, .. } => toggle = Some(key.clone()),
+                    Vis::Folder { key, .. } => {
+                        // Action icons first: stage/unstage every file under the
+                        // folder (#34); anywhere else toggles the collapse.
+                        let y = lr.y + i as f32 * row_h();
+                        let mut acted = false;
+                        for (act, ar) in Self::folder_action_rects(lr, y, staged) {
+                            if ar.contains(pt) {
+                                let dir = format!("{}/", Self::folder_path(key));
+                                for r in rows.iter().filter(|r| r.path.starts_with(&dir)) {
+                                    match act {
+                                        Act::Stage => out.push(Intent::GitStage(r.path.clone())),
+                                        Act::Unstage => out.push(Intent::GitUnstage(r.path.clone())),
+                                        _ => {}
+                                    }
+                                }
+                                acted = true;
+                                break;
+                            }
+                        }
+                        if !acted {
+                            toggle = Some(key.clone());
+                        }
+                    }
                     Vis::File { row, .. } => {
                         let r = &rows[*row];
                         let y = lr.y + i as f32 * row_h();
@@ -1162,6 +1211,51 @@ mod tests {
         let r2 = make_row("a/b/", '?');
         assert_eq!(r2.fname, "b");
         assert_eq!(r2.dir, "a");
+    }
+
+    // Clicking the stage (+) icon on a tree-mode FOLDER row stages every file
+    // under that folder (#34); clicking the row body still toggles the collapse.
+    #[test]
+    fn folder_stage_icon_stages_all_descendants() {
+        let _z = zoom_guard();
+        let (mut p, mut fs) = panel();
+        p.tree_mode = true;
+        p.unstaged_rows = vec![
+            make_row("src/a.rs", 'M'),
+            make_row("src/b.rs", 'M'),
+            make_row("README.md", 'M'),
+        ];
+        let region = Rect { x: 0.0, y: 0.0, w: 300.0, h: 1000.0 };
+        p.update(&mut fs, region);
+
+        // Vis order: folder "src" (idx 0), its two files, then README at root.
+        let lr = p.unstaged_list(region);
+        let y = lr.y; // folder row
+        let stage = SourceControlPanel::folder_action_rects(lr, y, false)
+            .into_iter()
+            .find(|(a, _)| matches!(a, Act::Stage))
+            .expect("folder stage action present")
+            .1;
+        let pt = (stage.x + stage.w * 0.5, stage.y + stage.h * 0.5);
+
+        let mut out = Vec::new();
+        let consumed = p.on_press(pt, region, &mut out);
+        assert!(consumed, "press should be consumed");
+        let staged: Vec<&str> = out
+            .iter()
+            .filter_map(|i| match i {
+                Intent::GitStage(p) => Some(p.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(staged, ["src/a.rs", "src/b.rs"], "stages exactly the folder's files");
+
+        // Clicking the folder row BODY (left of the icons) toggles collapse instead.
+        let body_pt = (lr.x + 10.0, lr.y + row_h() * 0.5);
+        let mut out2 = Vec::new();
+        p.on_press(body_pt, region, &mut out2);
+        assert!(out2.is_empty(), "body click emits no intents");
+        assert!(!p.collapsed.is_empty(), "body click collapsed the folder");
     }
 
     fn make_row(path: &str, code: char) -> Row {

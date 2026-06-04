@@ -25,7 +25,11 @@ jobs:
           - os: windows-latest
             bin: aether.exe
             asset: aether-windows-x86_64.exe
-          - os: ubuntu-latest
+          # Pinned to the OLDEST supported runner: the binary links against the
+          # build machine's glibc, and glibc is only forward-compatible. 22.04
+          # (glibc 2.35) covers Ubuntu 22.04+/Debian 12+ instead of demanding
+          # 2.39 from 24.04 (#35).
+          - os: ubuntu-22.04
             bin: aether
             asset: aether-linux-x86_64
           - os: macos-latest
@@ -46,7 +50,7 @@ jobs:
       # wayland, fontconfig), and a C/C++ toolchain for the bundled C deps
       # (tree-sitter grammars, QuickJS via rquickjs).
       - name: Install Linux dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \

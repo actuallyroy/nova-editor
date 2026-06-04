@@ -175,7 +175,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let rect = rects[i];
                 let (rows, cols) = crate::terminal_grid_size(rect, cell_w);
                 let (dc, dr) = pane.term.dims();
-                if dc != cols || dr != rows {
+                // Hold off while a re-attach backlog is in flight: those bytes
+                // target the pty's pre-restart dimensions; resizing first would
+                // replay TUI frames onto the wrong rows (#32). The resize (and its
+                // SIGWINCH repaint) happens right after the backlog lands.
+                if (dc != cols || dr != rows) && !pane.term.pending_backlog {
                     pane.term.resize(rows, cols);
                     pane.dirty = true;
                 }

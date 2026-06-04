@@ -149,6 +149,8 @@ pub struct Grid {
     cur_fg: [f32; 4],
     cur_bg: Option<[f32; 4]>, // active background (None = default)
     reverse: bool,            // SGR 7: swap fg/bg when writing cells
+    bold: bool,               // SGR 1: bright variant for the base ANSI colors
+    dim: bool,                // SGR 2: faint — fg blends toward the background
     scroll_top: usize,    // scroll region top row (inclusive)
     scroll_bottom: usize, // scroll region bottom row (inclusive)
     saved_cursor: (usize, usize),
@@ -179,6 +181,8 @@ impl Grid {
             cur_fg: DEFAULT_FG,
             cur_bg: None,
             reverse: false,
+            bold: false,
+            dim: false,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             saved_cursor: (0, 0),
@@ -380,6 +384,14 @@ impl Grid {
                     self.cur_fg = DEFAULT_FG;
                     self.cur_bg = None;
                     self.reverse = false;
+                    self.bold = false;
+                    self.dim = false;
+                }
+                1 => self.bold = true,          // bold/bright
+                2 => self.dim = true,           // faint (Claude Code's "ghost" text)
+                22 => {
+                    self.bold = false;
+                    self.dim = false;
                 }
                 7 => self.reverse = true,       // reverse video on
                 27 => self.reverse = false,     // reverse video off
@@ -452,12 +464,27 @@ impl Perform for Grid {
             self.newline();
             self.wrap_pending = false;
         }
+        // Resolve the effective foreground: bold brightens the base ANSI colors,
+        // dim (SGR 2) blends toward the background — that's what makes Claude
+        // Code's suggested text read as a "ghost" instead of typed input (#33).
+        let mut eff_fg = self.cur_fg;
+        if self.bold {
+            if let Some(i) = ANSI[..8].iter().position(|c| *c == eff_fg) {
+                eff_fg = ANSI[i + 8];
+            }
+        }
+        if self.dim {
+            let bg = self.cur_bg.unwrap_or(DEFAULT_BG);
+            for k in 0..3 {
+                eff_fg[k] = eff_fg[k] * 0.45 + bg[k] * 0.55;
+            }
+        }
         // Reverse video swaps fg/bg: the glyph is painted in the background colour
         // over a block of the foreground colour (this is how cursors render).
         let (fg, bg) = if self.reverse {
-            (self.cur_bg.unwrap_or(DEFAULT_BG), Some(self.cur_fg))
+            (self.cur_bg.unwrap_or(DEFAULT_BG), Some(eff_fg))
         } else {
-            (self.cur_fg, self.cur_bg)
+            (eff_fg, self.cur_bg)
         };
         if let Some(cell) = self.cells.get_mut(self.cur_row).and_then(|r| r.get_mut(self.cur_col)) {
             *cell = Cell { ch: c, fg, bg };
@@ -646,6 +673,10 @@ pub struct Terminal {
     pub grid: Grid,
     pub title: String, // shell base name, shown on the terminal tab
     pub exited: bool,  // the shell process has ended
+    /// Re-attach: true until the daemon's backlog has replayed. The panel's
+    /// per-frame size sync must not resize the grid before then — the backlog
+    /// bytes target the pty's pre-restart dimensions (#32).
+    pub pending_backlog: bool,
 }
 
 impl Terminal {
@@ -659,12 +690,24 @@ impl Terminal {
             grid: Grid::new(rows, cols),
             title: "shell".to_string(),
             exited: false,
+            pending_backlog: false,
         }
     }
 
-    /// A terminal re-attached to an already-running daemon shell (known id).
+    /// A terminal re-attached to an already-running daemon shell (known id). The
+    /// grid starts at the PTY's current size and must stay there until the
+    /// backlog has replayed (`pending_backlog` gates the panel's size sync).
     pub fn new_bound(conn: Conn, id: TermId, rows: usize, cols: usize, title: String) -> Self {
-        Self { id, tag: 0, conn, parser: Parser::new(), grid: Grid::new(rows, cols), title, exited: false }
+        Self {
+            id,
+            tag: 0,
+            conn,
+            parser: Parser::new(),
+            grid: Grid::new(rows, cols),
+            title,
+            exited: false,
+            pending_backlog: true,
+        }
     }
 
     /// Bind a just-created shell's id/title (resolves a pending `new_unbound`).

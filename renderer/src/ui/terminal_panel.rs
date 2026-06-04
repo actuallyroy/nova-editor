@@ -145,7 +145,16 @@ impl TerminalPanel {
                         }
                     }
                 }
-                Incoming::Backlog { id, data } | Incoming::Output { id, data } => {
+                Incoming::Backlog { id, data } => {
+                    if let Some(p) = self.term_by_id(id) {
+                        p.term.feed(&data);
+                        // Replay done at the pty's original size — the panel's size
+                        // sync may now resize (the SIGWINCH repaints TUIs cleanly).
+                        p.term.pending_backlog = false;
+                        p.dirty = true;
+                    }
+                }
+                Incoming::Output { id, data } => {
                     if let Some(p) = self.term_by_id(id) {
                         p.term.feed(&data);
                         p.dirty = true;
@@ -476,14 +485,23 @@ impl TerminalPanel {
         self.ensure_connected();
         let existing = std::mem::take(&mut self.reattach);
         if !existing.is_empty() {
-            let Some(panel) = panel else { return };
+            if panel.is_none() {
+                return;
+            }
             if let Some(client) = self.client.as_ref() {
-                // Size each re-attached terminal to a single full-width pane.
-                let area = terminal_pane_area(terminal_content(panel), existing.len().max(1));
-                let rect = terminal_pane_rects(area, 1).into_iter().next().unwrap_or(area);
-                let (rows, cols) = terminal_grid_size(rect, cell_w);
+                // Build each grid at the PTY'S CURRENT size, not the panel's: the
+                // backlog bytes were emitted for those dimensions, so TUI frames
+                // (Claude Code) replay onto the right rows. The per-frame size sync
+                // then resizes pty+grid to the panel, and the SIGWINCH makes the
+                // running program repaint cleanly at the new size (#32).
                 for info in existing {
-                    let term = terminal::Terminal::new_bound(client.conn(), info.id, rows, cols, info.title);
+                    let term = terminal::Terminal::new_bound(
+                        client.conn(),
+                        info.id,
+                        info.rows as usize,
+                        info.cols as usize,
+                        info.title,
+                    );
                     client.attach(info.id);
                     self.groups.push(terminal::Group::new(terminal::Pane::wrap(term)));
                 }

@@ -77,6 +77,10 @@ pub struct TermInfo {
     pub id: TermId,
     pub title: String,
     pub cwd: String,
+    /// Current pty dimensions — the re-attach grid must match them while the
+    /// backlog replays, or cursor-addressed TUI frames land on wrong rows (#32).
+    pub rows: u16,
+    pub cols: u16,
 }
 
 /// A framed message on the wire. Control is JSON; Write/Output carry raw terminal
@@ -171,8 +175,9 @@ pub fn info_path() -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         exe.hash(&mut h);
     }
-    // v3: added Msg::Rename — old daemons can't parse it, so they keep their own file.
-    crate::settings::config_dir().map(|d| d.join(format!("ptyhost-v3-{:08x}.json", h.finish() as u32)))
+    // v4: TermInfo gained rows/cols (re-attach size fix); v3 added Msg::Rename.
+    // Incompatible daemons keep their own file, so versions never talk past each other.
+    crate::settings::config_dir().map(|d| d.join(format!("ptyhost-v4-{:08x}.json", h.finish() as u32)))
 }
 
 /// Contents of the discovery file: where to connect + the auth token.

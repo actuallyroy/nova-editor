@@ -4994,6 +4994,7 @@ impl App {
                     && self.layout().terminal_panel.map_or(false, |tp| tp.contains(p));
                 if over_terminal {
                     self.terminal.write_focused(shell_quoted(&src).as_bytes());
+                    self.terminal.focused = true; // typing continues in the shell (#31)
                 } else if let Some(dir) = target {
                     self.move_tree_entry(&src, &dir);
                 }
@@ -6564,6 +6565,7 @@ impl ApplicationHandler for App {
                     && self.layout().terminal_panel.map_or(false, |tp| tp.contains(p));
                 if over_terminal {
                     self.terminal.write_focused(shell_quoted(&path).as_bytes());
+                    self.terminal.focused = true; // typing continues in the shell (#31)
                 } else if path.is_dir() {
                     self.open_folder(path);
                 } else {

@@ -27,6 +27,11 @@ struct Term {
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     backlog: VecDeque<u8>,
+    /// Current pty dimensions. Re-attach replays the backlog into a grid of THIS
+    /// size (the bytes were emitted for it); the GUI then resizes to its panel,
+    /// and the SIGWINCH makes TUIs (Claude Code) repaint cleanly (#32).
+    rows: u16,
+    cols: u16,
 }
 
 enum Event {
@@ -144,7 +149,7 @@ pub fn run() -> io::Result<()> {
                         let terminals: Vec<TermInfo> = terms
                             .iter()
                             .filter(|(_, t)| t.owner.is_none() && &t.workspace == workspace)
-                            .map(|(id, t)| TermInfo { id: *id, title: t.title.clone(), cwd: t.workspace.clone() })
+                            .map(|(id, t)| TermInfo { id: *id, title: t.title.clone(), cwd: t.workspace.clone(), rows: t.rows, cols: t.cols })
                             .collect();
                         send(&mut conns, cid, Frame::Control(Msg::Welcome { terminals }));
                     } else {
@@ -189,6 +194,8 @@ pub fn run() -> io::Result<()> {
                         if let Some(t) = terms.get_mut(&id) {
                             if t.owner == Some(cid) {
                                 let _ = t.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                                t.rows = rows;
+                                t.cols = cols;
                             }
                         }
                     }
@@ -246,7 +253,7 @@ pub fn run() -> io::Result<()> {
                         let terminals: Vec<TermInfo> = terms
                             .iter()
                             .filter(|(_, t)| t.owner.is_none() && !workspace.is_empty() && t.workspace == workspace)
-                            .map(|(id, t)| TermInfo { id: *id, title: t.title.clone(), cwd: t.workspace.clone() })
+                            .map(|(id, t)| TermInfo { id: *id, title: t.title.clone(), cwd: t.workspace.clone(), rows: t.rows, cols: t.cols })
                             .collect();
                         workspaces.insert(cid, workspace);
                         send(&mut conns, cid, Frame::Control(Msg::Welcome { terminals }));
@@ -320,6 +327,8 @@ fn spawn_term(cwd: &str, workspace: &str, owner: u64, rows: u16, cols: u16, id: 
         writer,
         child,
         backlog: VecDeque::new(),
+        rows,
+        cols,
     })
 }
 
