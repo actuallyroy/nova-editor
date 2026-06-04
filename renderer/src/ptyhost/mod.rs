@@ -79,7 +79,11 @@ pub struct TermInfo {
     pub cwd: String,
     /// Current pty dimensions — the re-attach grid must match them while the
     /// backlog replays, or cursor-addressed TUI frames land on wrong rows (#32).
+    /// `default` so a TermInfo from an older daemon still parses (0 ⇒ unknown,
+    /// the client falls back to its panel size).
+    #[serde(default)]
     pub rows: u16,
+    #[serde(default)]
     pub cols: u16,
 }
 
@@ -92,6 +96,9 @@ pub enum Frame {
     Write { id: TermId, data: Vec<u8> },
     /// Daemon→client shell output for a terminal.
     Output { id: TermId, data: Vec<u8> },
+    /// A frame from a NEWER peer this build can't decode — consumed and skipped
+    /// (never re-sent). Read loops must treat it as a no-op, not an error.
+    Ignored,
 }
 
 // Wire format: [u32 len][u8 tag][payload], len counts tag+payload.
@@ -112,6 +119,7 @@ impl Frame {
             }
             Frame::Write { id, data } => (TAG_WRITE, id_prefixed(*id, data)),
             Frame::Output { id, data } => (TAG_OUTPUT, id_prefixed(*id, data)),
+            Frame::Ignored => return Ok(()), // placeholder for skipped input; never sent
         };
         let len = (body.len() as u32) + 1; // +1 for the tag byte
         w.write_all(&len.to_be_bytes())?;
@@ -133,8 +141,16 @@ impl Frame {
         let payload = &body[1..];
         match tag {
             TAG_CONTROL => {
-                let msg = serde_json::from_slice(payload).map_err(io::Error::other)?;
-                Ok(Frame::Control(msg))
+                // Forward compatibility: a control message this build doesn't know
+                // (a newer peer's addition) must NOT kill the connection — that
+                // would detach every terminal over one optional feature. The frame
+                // is already consumed off the stream, so skipping it is safe; the
+                // sender simply doesn't get that feature from an older peer. This
+                // is what lets app updates keep their running sessions.
+                match serde_json::from_slice(payload) {
+                    Ok(msg) => Ok(Frame::Control(msg)),
+                    Err(_) => Ok(Frame::Ignored),
+                }
             }
             TAG_WRITE | TAG_OUTPUT => {
                 if payload.len() < 8 {
@@ -148,7 +164,8 @@ impl Frame {
                     Frame::Output { id, data }
                 })
             }
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unknown frame tag")),
+            // Unknown frame tags are length-delimited too — skip, don't disconnect.
+            _ => Ok(Frame::Ignored),
         }
     }
 }
@@ -164,20 +181,145 @@ fn id_prefixed(id: TermId, data: &[u8]) -> Vec<u8> {
 /// version is part of the FILENAME: old builds (v1 single-client protocol at
 /// `ptyhost.json`) and new builds never read each other's files, so a stale install
 /// can't capture new windows (and vice versa).
+/// Wire-protocol generation. Bump ONLY for breaking changes — additive messages
+/// and fields don't need one anymore (unknown control frames are skipped and new
+/// TermInfo fields default), so app updates keep their running sessions.
+/// History: v4 TermInfo rows/cols; v3 Msg::Rename; v2 multi-client.
+pub const PROTO_VERSION: u32 = 4;
+
+/// Which daemon family this build talks to. Debug and release builds get their
+/// OWN daemon (sharing one made them fight: duplicate daemons, debug launches
+/// forwarded to release windows). This used to hash the exe PATH, but that key
+/// is unstable — macOS app translocation runs the app from a randomized path,
+/// and DefaultHasher isn't pinned across toolchains — which minted a fresh
+/// daemon (and stranded the old one + its shells) on updates and even launches.
+fn flavor() -> &'static str {
+    if cfg!(debug_assertions) { "dev" } else { "app" }
+}
+
+fn info_name(flavor: &str) -> String {
+    format!("ptyhost-v{PROTO_VERSION}-{flavor}.json")
+}
+
 pub fn info_path() -> Option<std::path::PathBuf> {
-    // Keyed by the running binary's path: a debug build and the installed release
-    // app each get their OWN daemon. Sharing one file made them fight — every GUI
-    // that couldn't claim the other's daemon spawned a duplicate, and the
-    // single-window-per-folder check forwarded debug launches to a release window
-    // (the debug process then exits "silently").
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    if let Ok(exe) = std::env::current_exe() {
-        exe.hash(&mut h);
+    crate::settings::config_dir().map(|d| d.join(info_name(flavor())))
+}
+
+/// Shut down daemons stranded by past protocol bumps or the old exe-path-hash
+/// naming. Without this sweep an in-app update leaks the previous daemon and its
+/// shells in the background forever — running, invisible, undiscoverable.
+/// Closing a daemon drops its pty masters, so its shells receive SIGHUP and
+/// exit. Everything except the two CURRENT discovery files (this build's flavor
+/// and its sibling — the sibling's daemon may be live) is fair game; the pid is
+/// verified to be an `aether --pty-host` before any kill.
+pub fn cleanup_stale_daemons() {
+    let Some(dir) = crate::settings::config_dir() else { return };
+    let keep = [info_name("dev"), info_name("app")];
+    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("ptyhost") || !name.ends_with(".json") || keep.iter().any(|k| *k == name) {
+            continue;
+        }
+        // Old-format files at the CURRENT protocol version may belong to a live
+        // daemon that a not-yet-updated install is actively using — only reap
+        // those once their daemon has exited (dead pid ⇒ remove the file).
+        // Anything below the current version is unreachable by every current
+        // build: kill the daemon (verified) and remove its file.
+        let current_ver = name
+            .strip_prefix(&format!("ptyhost-v{PROTO_VERSION}-"))
+            .map_or(false, |_| true);
+        let info = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|t| serde_json::from_str::<HostInfo>(&t).ok());
+        match info {
+            Some(info) if current_ver => {
+                if process_alive(info.pid) {
+                    // Same binary as us ⇒ our own install's pre-rename daemon:
+                    // migrate it (kill; its file format is unreachable to us).
+                    // A DIFFERENT binary's live daemon is another install mid-
+                    // update — leave it for that install's own sweep.
+                    if daemon_cmdline(info.pid).map_or(true, |c| !c.contains(&current_exe_str())) {
+                        continue;
+                    }
+                    kill_if_ptyhost(info.pid);
+                }
+            }
+            Some(info) => kill_if_ptyhost(info.pid),
+            None => {}
+        }
+        let _ = std::fs::remove_file(entry.path());
     }
-    // v4: TermInfo gained rows/cols (re-attach size fix); v3 added Msg::Rename.
-    // Incompatible daemons keep their own file, so versions never talk past each other.
-    crate::settings::config_dir().map(|d| d.join(format!("ptyhost-v4-{:08x}.json", h.finish() as u32)))
+}
+
+fn current_exe_str() -> String {
+    std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// The command line of `pid`, if readable.
+fn daemon_cmdline(pid: u32) -> Option<String> {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("wmic")
+            .args(["process", "where", &format!("ProcessId={pid}"), "get", "CommandLine"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    }
+}
+
+/// Liveness probe (any process). Shell-based so it needs no extra crates; this
+/// runs once per stale file at startup, not on a hot path.
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map_or(false, |s| s.success())
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .map_or(false, |o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+    }
+}
+
+/// Kill `pid` only if it is verifiably an `aether --pty-host` process (PID reuse
+/// must never take down an unrelated program).
+fn kill_if_ptyhost(pid: u32) {
+    #[cfg(unix)]
+    {
+        let cmdline = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        if cmdline.contains("--pty-host") {
+            let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+        }
+    }
+    #[cfg(windows)]
+    {
+        let list = std::process::Command::new("wmic")
+            .args(["process", "where", &format!("ProcessId={pid}"), "get", "CommandLine"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        if list.contains("--pty-host") {
+            let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
+        }
+    }
 }
 
 /// Contents of the discovery file: where to connect + the auth token.

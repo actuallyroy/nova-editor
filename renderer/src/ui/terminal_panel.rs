@@ -103,6 +103,9 @@ impl TerminalPanel {
         if self.client.is_some() {
             return;
         }
+        // Sweep daemons stranded by past protocol bumps of this binary (their
+        // shells would otherwise run invisibly forever after an in-app update).
+        crate::ptyhost::cleanup_stale_daemons();
         if let Some((client, terminals)) = Client::connect_or_spawn(&self.cwd.to_string_lossy()) {
             self.client = Some(client);
             self.reattach = terminals;
@@ -485,23 +488,25 @@ impl TerminalPanel {
         self.ensure_connected();
         let existing = std::mem::take(&mut self.reattach);
         if !existing.is_empty() {
-            if panel.is_none() {
-                return;
-            }
+            let Some(panel) = panel else { return };
             if let Some(client) = self.client.as_ref() {
                 // Build each grid at the PTY'S CURRENT size, not the panel's: the
                 // backlog bytes were emitted for those dimensions, so TUI frames
                 // (Claude Code) replay onto the right rows. The per-frame size sync
                 // then resizes pty+grid to the panel, and the SIGWINCH makes the
                 // running program repaint cleanly at the new size (#32).
+                // rows/cols of 0 = an older daemon that doesn't report dims; fall
+                // back to the panel's size.
+                let area = terminal_pane_area(terminal_content(panel), existing.len().max(1));
+                let rect = terminal_pane_rects(area, 1).into_iter().next().unwrap_or(area);
+                let (prow, pcol) = terminal_grid_size(rect, cell_w);
                 for info in existing {
-                    let term = terminal::Terminal::new_bound(
-                        client.conn(),
-                        info.id,
-                        info.rows as usize,
-                        info.cols as usize,
-                        info.title,
-                    );
+                    let (rows, cols) = if info.rows == 0 || info.cols == 0 {
+                        (prow, pcol)
+                    } else {
+                        (info.rows as usize, info.cols as usize)
+                    };
+                    let term = terminal::Terminal::new_bound(client.conn(), info.id, rows, cols, info.title);
                     client.attach(info.id);
                     self.groups.push(terminal::Group::new(terminal::Pane::wrap(term)));
                 }
