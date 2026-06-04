@@ -42,9 +42,12 @@ impl EditorView {
     /// The document byte under `(x, y)`, if it hits the shaped buffer.
     pub fn byte_at(doc: &Document, layout: &Layout, x: f32, y: f32) -> Option<usize> {
         let buf_x = x - (layout.editor_text.x + theme::EDITOR_PAD()) + doc.scroll_x();
-        let buf_y = doc.expand_visual_y(y - (layout.editor_text.y + theme::EDITOR_PAD()) + doc.scroll_y());
-        let hit = doc.buffer.hit(buf_x, buf_y)?;
-        let line = hit.line;
+        // Large docs shape a sliding window: hit-test in window coordinates and
+        // translate the hit line back to a document line.
+        let buf_y = doc.expand_visual_y(y - (layout.editor_text.y + theme::EDITOR_PAD()) + doc.scroll_y())
+            - doc.buf_offset_px();
+        let hit = doc.buffer.hit(buf_x, buf_y.max(0.0))?;
+        let line = hit.line + doc.buf_first_line();
         if line >= doc.rope.len_lines() {
             return None;
         }

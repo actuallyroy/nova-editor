@@ -347,6 +347,11 @@ pub(crate) struct App {
     pub(crate) last_edit: Instant,  // for files.autoSave (afterDelay)
     pub(crate) nav: nav::NavState,  // Go > Back / Forward jump list
     pub(crate) zen_saved: Option<(bool, bool)>, // pre-Zen (sidebar, terminal) visibility
+    pub(crate) right_sidebar_visible: bool,     // secondary sidebar (AI chat)
+    pub(crate) right_split: Splitter,           // its width, resizable from its left edge
+    pub(crate) outline: Option<ui::outline_panel::OutlinePanel>, // created with the first FontSystem
+    pub(crate) outline_open: bool,              // explorer OUTLINE section expanded
+    pub(crate) chat: Option<ui::chat_panel::ChatPanel>, // right-sidebar AI chat (created with fs)
     pub(crate) pending_rename: Option<(String, &'static str, u32, u32)>, // (uri, lang, line, col) for the open rename input
     pub(crate) file_clipboard: Option<(PathBuf, bool)>, // explorer Cut/Copy: (path, is_cut)
     pub(crate) compare_select: Option<PathBuf>, // explorer "Select for Compare" anchor
@@ -375,6 +380,16 @@ impl App {
                 theme::SIDEBAR_MAX_WIDTH(),
                 widgets::Axis::Horizontal,
             ),
+            right_sidebar_visible: false,
+            right_split: Splitter::new_from_end(
+                theme::SIDEBAR_WIDTH(),
+                theme::SIDEBAR_MIN_WIDTH(),
+                theme::SIDEBAR_MAX_WIDTH(),
+                widgets::Axis::Horizontal,
+            ),
+            outline: None,
+            outline_open: false,
+            chat: None,
             palette: PaletteState::new(),
             find: FindBarState::new(),
             ui_cache: UiCache::new(),
@@ -823,6 +838,35 @@ impl App {
         let over_handle = self.sidebar_visible
             && layout.palette.is_none()
             && self.sidebar_split.handle_rect(layout.sidebar).contains(p);
+        let over_right_handle = self.right_sidebar_visible
+            && layout.palette.is_none()
+            && self.right_split.handle_rect(layout.right_sidebar).contains(p);
+        // Explorer OUTLINE section hover (the panel owns its row geometry); the
+        // header gets a pointer cursor too (it's a collapsible toggle).
+        let mut over_outline_row = false;
+        let mut outline_hover_changed = false;
+        let outline_region = match (layout.outline_header_rect(), layout.outline_body_rect()) {
+            (Some(h), Some(b)) if layout.palette.is_none() => {
+                over_outline_row = h.contains(p);
+                Some(widgets::Rect { x: h.x, y: h.y, w: h.w, h: h.h + b.h })
+            }
+            _ => None,
+        };
+        if let Some(region) = outline_region {
+            if let Some(o) = self.outline.as_mut() {
+                outline_hover_changed = o.on_move(p, region);
+                over_outline_row |= o.row_at(p, region).is_some();
+            }
+        }
+        if outline_hover_changed {
+            self.redraw();
+        }
+        // Chat panel cursor (text over the input, default elsewhere in the panel).
+        let chat_cursor = if self.right_sidebar_visible && layout.palette.is_none() {
+            self.chat.as_ref().and_then(|c| c.cursor(p, layout.right_sidebar))
+        } else {
+            None
+        };
         let over_term_handle = layout.palette.is_none()
             && layout
                 .terminal_panel
@@ -916,6 +960,12 @@ impl App {
             c
         } else if self.sidebar_split.is_dragging() || over_handle {
             self.sidebar_split.cursor()
+        } else if self.right_split.is_dragging() || over_right_handle {
+            self.right_split.cursor()
+        } else if over_outline_row {
+            CursorIcon::Pointer
+        } else if let Some(c) = chat_cursor {
+            c
         } else if let Some(c) = find_cursor {
             c
         } else if self.terminal.split.is_dragging() || over_term_handle {
@@ -1077,6 +1127,9 @@ impl App {
             self.palette.active,
             self.terminal.panel_height(),
             self.workspace.active_doc().map_or(false, |d| d.diff.is_some()),
+            if self.right_sidebar_visible { self.right_split.size() } else { 0.0 },
+            (self.sidebar_visible && self.sidebar_view == SidebarView::Explorer)
+                .then_some(self.outline_open),
         )
     }
 
@@ -2163,6 +2216,8 @@ impl App {
             Focus::Search
         } else if self.source_control.as_ref().map_or(false, |s| s.focused()) {
             Focus::SourceControl
+        } else if self.right_sidebar_visible && self.chat.as_ref().map_or(false, |c| c.focused()) {
+            Focus::Chat
         } else {
             Focus::Editor
         }
@@ -3517,6 +3572,7 @@ impl App {
         let prev = theme::ui_zoom();
         if prev > 0.0 {
             self.sidebar_split.scale(zoom / prev);
+            self.right_split.scale(zoom / prev);
         }
         theme::set_ui_zoom(zoom); // bumps the shape epoch
         if let Some(g) = self.gpu.as_mut() {
@@ -4193,6 +4249,38 @@ impl App {
         {
             return;
         }
+        // Right (AI chat) sidebar: resize handle, then the panel's own clicks
+        // (input focus / scrollbar).
+        if self.right_sidebar_visible && layout.palette.is_none() {
+            if self.right_split.press((x, y), layout.right_sidebar) {
+                return;
+            }
+            let handled = self.chat.as_mut().map_or(false, |c| c.on_press((x, y), layout.right_sidebar));
+            if handled {
+                self.redraw();
+                return;
+            }
+        }
+        // Explorer OUTLINE section: header click toggles, body clicks jump.
+        if layout.palette.is_none() {
+            if let Some(hdr) = layout.outline_header_rect() {
+                if hdr.contains((x, y)) {
+                    self.outline_open = !self.outline_open;
+                    self.redraw();
+                    return;
+                }
+                if let Some(body) = layout.outline_body_rect().filter(|b| b.contains((x, y))) {
+                    let region = widgets::Rect { x: hdr.x, y: hdr.y, w: hdr.w, h: hdr.h + body.h };
+                    let line = self.outline.as_mut().and_then(|o| o.on_press((x, y), region));
+                    if let Some(line) = line {
+                        self.nav.mark(&self.workspace);
+                        self.goto_line(line);
+                    }
+                    self.redraw();
+                    return;
+                }
+            }
+        }
 
         // Title bar: window controls or drag.
         if layout.palette.is_none() && layout.title_bar.contains((x, y)) {
@@ -4210,6 +4298,10 @@ impl App {
                         self.redraw();
                     }
                     1 => self.toggle_terminal(),
+                    2 => {
+                        self.right_sidebar_visible = !self.right_sidebar_visible;
+                        self.redraw();
+                    }
                     _ => {}
                 }
                 return;
@@ -4710,8 +4802,31 @@ impl App {
                 }
             }
         }
+        // Outline / chat scrollbar thumb drags.
+        if self.mouse_pressed {
+            if let Some(o) = self.outline.as_mut() {
+                if o.scroll.is_dragging() && o.scroll.drag((x, y)) {
+                    self.redraw();
+                    return;
+                }
+            }
+            if let Some(c) = self.chat.as_mut() {
+                if c.scroll.is_dragging() && c.scroll.drag((x, y)) {
+                    self.redraw();
+                    return;
+                }
+            }
+        }
         if self.sidebar_split.is_dragging() && self.mouse_pressed {
             if self.sidebar_split.drag(x, theme::ACTIVITY_BAR_WIDTH()) {
+                self.redraw();
+            }
+            return;
+        }
+        if self.right_split.is_dragging() && self.mouse_pressed {
+            // Width is measured back from the window's right edge.
+            let origin = self.gpu.as_ref().map_or(0.0, |g| g.config.width as f32);
+            if self.right_split.drag(x, origin) {
                 self.redraw();
             }
             return;
@@ -4826,6 +4941,13 @@ impl App {
             f.end_drag();
         }
         self.sidebar_split.release();
+        self.right_split.release();
+        if let Some(o) = self.outline.as_mut() {
+            o.scroll.release();
+        }
+        if let Some(c) = self.chat.as_mut() {
+            c.scroll.release();
+        }
         self.terminal.split.release();
         self.terminal.release_scrolls();
         self.terminal.selection_release();
@@ -4888,6 +5010,24 @@ impl App {
         if self.terminal.on_scroll(p, &layout, dy) {
             self.redraw();
             return;
+        }
+        // AI chat (right sidebar) scrolls when the cursor is over it.
+        if self.right_sidebar_visible {
+            if let Some(c) = self.chat.as_mut() {
+                if c.on_wheel(p, layout.right_sidebar, dy) {
+                    self.redraw();
+                    return;
+                }
+            }
+        }
+        // Explorer OUTLINE section scrolls when the cursor is over its body.
+        if let Some(body) = layout.outline_body_rect().filter(|b| b.contains(p)) {
+            if let Some(o) = self.outline.as_mut() {
+                let _ = body;
+                o.scroll.on_wheel(0.0, dy);
+                self.redraw();
+                return;
+            }
         }
         // File tree scrolls when the cursor is over the tree region.
         if self.sidebar_visible && self.sidebar_view == SidebarView::Explorer {
@@ -5288,6 +5428,17 @@ impl App {
                     return;
                 }
             }
+            Focus::Chat => {
+                // Route to the chat input; Enter sends, Esc unfocuses.
+                let mut handled = false;
+                if let (Some(c), Some(g)) = (self.chat.as_mut(), self.gpu.as_mut()) {
+                    handled = c.on_key(&event, ctrl, extend, &mut g.font_system, self.clipboard.as_mut());
+                }
+                if handled {
+                    self.redraw();
+                    return;
+                }
+            }
             Focus::Editor => {
                 // Escape closes the find widget when the editor has focus (VSCode parity).
                 if self.find.active && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
@@ -5625,6 +5776,13 @@ impl App {
             self.completion_req = None;
             return;
         };
+        if d.large {
+            // Large-file mode: scanning a multi-MB doc for word candidates on every
+            // keystroke isn't worth it (and there's no LSP for it either).
+            self.completion.close();
+            self.completion_req = None;
+            return;
+        }
         let text = d.text();
         let caret = d.caret_byte();
         let (line, col) = d.head_line_col();
@@ -5672,6 +5830,7 @@ enum Focus {
     Search,    // find-in-files panel (owns its own query/replace boxes)
     SourceControl, // git commit message box
     Terminal,  // integrated terminal
+    Chat,      // AI chat input (right sidebar)
 }
 
 /// Open a URL in the OS default browser. Best-effort, http(s) only (so README

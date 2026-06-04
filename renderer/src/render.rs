@@ -146,6 +146,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             None
         },
         app.workspace.active_doc().map_or(false, |d| d.diff.is_some()),
+        if app.right_sidebar_visible { app.right_split.size() } else { 0.0 },
+        (app.sidebar_visible && app.sidebar_view == SidebarView::Explorer)
+            .then_some(app.outline_open),
     );
 
     // editor.wordWrap — wrap the active document to the editor width (or disable).
@@ -206,6 +209,23 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             scp.update(&mut gpu.font_system, layout.panel_region());
         }
     }
+    // Explorer OUTLINE section: created on first use, rows rebuilt from the
+    // active document (keyed by name/version — cheap when unchanged).
+    if let (Some(hdr), Some(body)) = (layout.outline_header_rect(), layout.outline_body_rect()) {
+        let region = Rect { x: hdr.x, y: hdr.y, w: hdr.w, h: hdr.h + body.h };
+        let open = app.outline_open;
+        let panel = app
+            .outline
+            .get_or_insert_with(|| crate::ui::outline_panel::OutlinePanel::new(&mut gpu.font_system));
+        panel.update(&mut gpu.font_system, region, app.workspace.active_doc(), open);
+    }
+    // Secondary sidebar (AI chat): shapes its message bubbles + input.
+    if app.right_sidebar_visible && layout.right_sidebar.w > 0.0 {
+        let panel = app
+            .chat
+            .get_or_insert_with(|| crate::ui::chat_panel::ChatPanel::new(&mut gpu.font_system));
+        panel.update(&mut gpu.font_system, layout.right_sidebar);
+    }
     if app.detail.open_extension.is_some() {
         let vp = crate::ext_detail::ExtensionDetail::body_viewport(editor_region(&layout));
         let content_h = gpu.ui.ext_detail.body_content_height(&|k| gpu.media.size(k));
@@ -240,6 +260,13 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             layout.editor_text
         };
         d.scroll.set_metrics(vp, (content_w, content_h));
+        // Large-file mode: keep the shaped window covering the viewport (no-op
+        // while the view stays inside; reshapes ~1.5k lines when it drifts out).
+        if d.large {
+            let first = (d.scroll_y() / theme::LINE_HEIGHT()).max(0.0) as usize;
+            let visible = (layout.editor_text.h / theme::LINE_HEIGHT()).ceil() as usize + 2;
+            d.ensure_window(&mut gpu.font_system, first, visible);
+        }
     }
 
     // ---- Update UI buffer texts (only on cache miss) ----
@@ -459,6 +486,14 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     gpu.ui.line_numbers.set_from_diff_side(fs, &diff.rows, true);
                     gpu.ui.line_numbers2.set_from_diff_side(fs, &diff.rows, false);
                 }
+                // Large docs number the shaped window only (the buffer holds a
+                // window of lines, so "from buffer" would always start at 1).
+                None if d.large => gpu.ui.line_numbers.set_range(
+                    fs,
+                    d.buf_first_line(),
+                    d.buf_window_lines(),
+                    d.head_line_col().0,
+                ),
                 None => gpu.ui.line_numbers.set_from_buffer(fs, &d.buffer, d.head_line_col().0),
             }
         }
@@ -681,6 +716,19 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let bx = r.x + r.w - bw - 2.0 * z;
             let by = r.y + r.h - bh - 8.0 * z;
             bg_quads.push(Rect { x: bx, y: by, w: bw, h: bh }.rounded_quad(theme::BADGE_BG(), bh * 0.5));
+        }
+    }
+    // Explorer OUTLINE section chrome: header divider, hover row, scrollbar.
+    if let (Some(hdr), Some(body)) = (layout.outline_header_rect(), layout.outline_body_rect()) {
+        if let Some(o) = app.outline.as_ref() {
+            let region = Rect { x: hdr.x, y: hdr.y, w: hdr.w, h: hdr.h + body.h };
+            o.draw_quads(region, now, &mut bg_quads, &mut fg_quads);
+        }
+    }
+    // Secondary sidebar (AI chat) chrome: bg, input box, role rails, scrollbar.
+    if app.right_sidebar_visible && layout.right_sidebar.w > 0.0 {
+        if let Some(c) = app.chat.as_ref() {
+            c.draw_quads(layout.right_sidebar, now, &mut bg_quads, &mut fg_quads);
         }
     }
     // Sidebar bg
@@ -1412,6 +1460,19 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
     }
+    // Explorer OUTLINE section text: chevron header + symbol rows.
+    if let (Some(hdr), Some(body)) = (layout.outline_header_rect(), layout.outline_body_rect()) {
+        if let Some(o) = app.outline.as_ref() {
+            let region = Rect { x: hdr.x, y: hdr.y, w: hdr.w, h: hdr.h + body.h };
+            o.draw_text(region, &mut areas);
+        }
+    }
+    // Secondary sidebar (AI chat) text: header, messages, input.
+    if app.right_sidebar_visible && layout.right_sidebar.w > 0.0 {
+        if let Some(c) = app.chat.as_ref() {
+            c.draw_text(layout.right_sidebar, &mut areas);
+        }
+    }
 
     // Tab labels — the shared `tabs` buffer holds one label per line; we render
     // it once per tab, shifted up by one line and clipped to that tab's column,
@@ -1521,6 +1582,33 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     }
                 }
             }
+        } else if d.large {
+            // Large-file mode: the buffer holds a shaped window of lines; draw it
+            // shifted to the window's document position (no folds, no wrap).
+            let et = layout.editor_text;
+            let g = layout.gutter;
+            let off = d.buf_offset_px();
+            let clip = TextBounds {
+                left: et.x as i32,
+                top: et.y as i32,
+                right: (et.x + et.w) as i32,
+                bottom: (et.y + et.h) as i32,
+            };
+            areas.push(TextArea {
+                buffer: &d.buffer,
+                left: et.x + theme::EDITOR_PAD() - d.scroll_x(),
+                top: et.y + theme::EDITOR_PAD() - d.scroll_y() + off,
+                scale: 1.0,
+                bounds: clip,
+                default_color: theme::FG_TEXT(),
+                custom_glyphs: &[],
+            });
+            ui.line_numbers.draw_clipped(
+                Rect { x: g.x, y: g.y, w: g.w, h: g.h },
+                g.y + theme::EDITOR_PAD() - d.scroll_y() + off,
+                theme::FG_GUTTER(),
+                &mut areas,
+            );
         } else {
             // Fold-aware rendering: draw the text + gutter as visible line segments
             // (collapsed regions are simply not drawn, and everything below shifts up).

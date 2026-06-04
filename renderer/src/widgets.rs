@@ -960,6 +960,40 @@ impl Gutter {
         self.last_rows = usize::MAX;
     }
 
+    /// Line numbers for a window of a large document: `first..first+count`
+    /// (0-based), one row each — large docs never wrap, so rows are uniform. The
+    /// draw site offsets by the window's pixel position.
+    pub fn set_range(&mut self, fs: &mut FontSystem, first: usize, count: usize, active_line: usize) {
+        let epoch = theme::shape_epoch();
+        if count == self.last_rows && first == self.last_lines && active_line == self.last_active && epoch == self.last_epoch {
+            return;
+        }
+        let mono = Attrs::new().family(Family::Name(theme::MONO_FAMILY()));
+        let dim = mono.color(theme::FG_GUTTER());
+        let active = mono.color(theme::FG_GUTTER_ACTIVE());
+        let spans: Vec<(String, Attrs)> = (first..first + count)
+            .map(|l| {
+                let a = if l == active_line { active } else { dim };
+                (format!("{:>6} \n", l + 1), a)
+            })
+            .collect();
+        self.buffer.set_metrics(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+        self.buffer
+            .set_size(fs, None, Some(count as f32 * theme::LINE_HEIGHT() + 200.0));
+        self.buffer.set_rich_text(
+            fs,
+            spans.iter().map(|(s, a)| (s.as_str(), *a)),
+            mono,
+            Shaping::Basic,
+        );
+        self.buffer.shape_until_scroll(fs, false);
+        // Repurpose the change-detection slots: lines = window start, rows = count.
+        self.last_lines = first;
+        self.last_rows = count;
+        self.last_active = active_line;
+        self.last_epoch = epoch;
+    }
+
     /// Build line numbers aligned to the editor buffer's VISUAL rows: the number
     /// on each logical line's first row, blanks on wrap-continuation rows. This
     /// keeps numbers aligned whether or not word-wrap is on (with wrap off there's
@@ -1595,6 +1629,7 @@ pub struct Splitter {
     max: f32,
     dragging: bool,
     axis: Axis,
+    from_end: bool, // panel anchored to the far edge (right sidebar): handle + drag flip
 }
 
 impl Splitter {
@@ -1605,6 +1640,21 @@ impl Splitter {
             max,
             dragging: false,
             axis,
+            from_end: false,
+        }
+    }
+
+    /// A splitter whose panel is anchored to the FAR edge (right sidebar): the
+    /// handle sits on the region's near (left) edge and the size is measured
+    /// back from `origin` (the window's right edge) while dragging.
+    pub fn new_from_end(size: f32, min: f32, max: f32, axis: Axis) -> Self {
+        Self {
+            size,
+            min,
+            max,
+            dragging: false,
+            axis,
+            from_end: true,
         }
     }
 
@@ -1644,12 +1694,13 @@ impl Splitter {
     }
 
     /// Thin hit strip straddling the active edge of `region`: the right edge for
-    /// a horizontal (width) splitter, the top edge for a vertical (height) one.
+    /// a horizontal (width) splitter (the LEFT edge when `from_end`), the top
+    /// edge for a vertical (height) one.
     pub fn handle_rect(&self, region: Rect) -> Rect {
         let half = theme::SIDEBAR_RESIZE_HANDLE() * 0.5;
         match self.axis {
             Axis::Horizontal => Rect {
-                x: region.x + region.w - half,
+                x: if self.from_end { region.x - half } else { region.x + region.w - half },
                 y: region.y,
                 w: theme::SIDEBAR_RESIZE_HANDLE(),
                 h: region.h,
@@ -1682,6 +1733,7 @@ impl Splitter {
             return false;
         }
         let raw = match self.axis {
+            Axis::Horizontal if self.from_end => origin - cursor, // measured back from the right edge
             Axis::Horizontal => cursor - origin,
             Axis::Vertical => origin - cursor,
         };

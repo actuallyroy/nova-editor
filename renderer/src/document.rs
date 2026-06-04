@@ -91,6 +91,39 @@ pub struct Document {
     semantic: Vec<(usize, usize, Color)>, // Layer-2 LSP semantic tokens (byte range → color)
     expand_stack: Vec<(usize, usize)>, // prior ranges for Expand/Shrink Selection
     pub info: Option<crate::ui::info_page::InfoPage>, // Some ⇒ designed info page (Welcome / Tips / Shortcuts)
+    /// Large-file mode: only a sliding window of lines is shaped into `buffer`
+    /// (shaping a 450k-line file whole takes ~50s). Highlighting, LSP, folding and
+    /// word wrap are disabled; geometry helpers translate window↔document lines.
+    pub large: bool,
+    buf_first: usize, // first document line shaped into the buffer
+    buf_count: usize, // how many lines the buffer window holds
+}
+
+/// Large-file thresholds (lines / bytes) and the shaped-window size.
+pub const LARGE_FILE_LINES: usize = 50_000;
+pub const LARGE_FILE_BYTES: usize = 8 * 1024 * 1024;
+const LARGE_WINDOW_LINES: usize = 1_500;
+
+/// The window's lines as one string (CR stripped — cosmic-text renders a stray
+/// `\r` as an extra line break).
+fn window_string(rope: &Rope, first: usize, count: usize) -> String {
+    let total = rope.len_lines();
+    let first = first.min(total.saturating_sub(1));
+    let end = (first + count).min(total);
+    let lo = rope.line_to_byte(first);
+    let hi = if end >= total { rope.len_bytes() } else { rope.line_to_byte(end) };
+    rope.byte_slice(lo..hi).to_string().replace('\r', "")
+}
+
+/// Fill `buffer` with a plain-text window (`count` lines). Basic shaping — large
+/// files skip rich styling, and logs are overwhelmingly ASCII.
+fn shape_window(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, count: usize) {
+    buffer.set_metrics(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+    buffer.set_wrap(fs, Wrap::None);
+    buffer.set_size(fs, None, Some((count as f32 + 2.0) * theme::LINE_HEIGHT() + 200.0));
+    let mono = Attrs::new().family(Family::Name(theme::MONO_FAMILY()));
+    buffer.set_text(fs, text, mono, Shaping::Basic);
+    buffer.shape_until_scroll(fs, false);
 }
 
 /// Set the buffer's metrics/wrap/size and its (rich) text. `spans` are precomputed
@@ -243,10 +276,21 @@ impl Document {
         } else {
             crate::settings::eol()
         };
+        // Large-file mode (VSCode's largeFileOptimizations): shaping every line of a
+        // 450k-line log takes ~50s, so huge docs render through a sliding window of
+        // shaped lines instead, with highlighting/LSP/folding disabled.
+        let line_count = display.matches('\n').count() + 1;
+        let large = line_count > LARGE_FILE_LINES || display.len() > LARGE_FILE_BYTES;
+        let rope = Rope::from_str(&contents);
         // Layer-1 highlighter: a syntect grammar for this file type (None → plain/markdown).
-        let mut hl = crate::highlight::LineCache::new(&ext);
-        let spans = hl.as_mut().map(|h| h.highlight(&display, 0));
-        apply_buffer_text(&mut buffer, fs, &display, display.matches('\n').count(), lang, &ext, wrap_width, spans, &[]);
+        let mut hl = if large { None } else { crate::highlight::LineCache::new(&ext) };
+        let buf_count = if large { LARGE_WINDOW_LINES.min(rope.len_lines()) } else { 0 };
+        if large {
+            shape_window(&mut buffer, fs, &window_string(&rope, 0, buf_count), buf_count);
+        } else {
+            let spans = hl.as_mut().map(|h| h.highlight(&display, 0));
+            apply_buffer_text(&mut buffer, fs, &display, display.matches('\n').count(), lang, &ext, wrap_width, spans, &[]);
+        }
         let name = match &path {
             Some(p) => p
                 .file_name()
@@ -257,7 +301,7 @@ impl Document {
         Self {
             path,
             name,
-            rope: Rope::from_str(&contents),
+            rope,
             sel: Selection::caret(0),
             scroll: ScrollView::new(ScrollOpts::both()),
             dirty: false,
@@ -290,6 +334,9 @@ impl Document {
             semantic: Vec::new(),
             expand_stack: Vec::new(),
             info: None,
+            large,
+            buf_first: 0,
+            buf_count,
         }
     }
 
@@ -360,6 +407,9 @@ impl Document {
             semantic: Vec::new(),
             expand_stack: Vec::new(),
             info: None,
+            large: false,
+            buf_first: 0,
+            buf_count: 0,
         }
     }
 
@@ -446,6 +496,9 @@ impl Document {
             semantic: Vec::new(),
             expand_stack: Vec::new(),
             info: None,
+            large: false,
+            buf_first: 0,
+            buf_count: 0,
         }
     }
 
@@ -494,6 +547,9 @@ impl Document {
     /// Toggle word-wrap: `Some(width)` wraps the buffer at that pixel width, `None`
     /// disables wrapping. Reshapes only when the value changes.
     pub fn set_wrap(&mut self, fs: &mut FontSystem, width: Option<f32>) {
+        if self.large {
+            return; // large-file mode: wrap stays off (uniform line heights)
+        }
         let changed = match (self.wrap_width, width) {
             (Some(a), Some(b)) => (a - b).abs() > 0.5,
             (None, None) => false,
@@ -541,19 +597,26 @@ impl Document {
         let byte = byte.min(self.rope.len_bytes());
         let line = self.rope.byte_to_line(byte);
         let col_byte = byte - self.rope.line_to_byte(line);
+        // Large docs shape a window: buffer line = doc line - window start, and the
+        // returned y gets the window's pixel offset added back. Lines outside the
+        // window fall through to the uniform-height estimate below.
+        let off = self.buf_offset_px();
+        let Some(local) = line.checked_sub(self.buf_first).filter(|l| !self.large || *l < self.buf_count) else {
+            return (0.0, line as f32 * theme::LINE_HEIGHT(), theme::LINE_HEIGHT());
+        };
         let mut last_top = line as f32 * theme::LINE_HEIGHT();
         let mut last_h = theme::LINE_HEIGHT();
         let mut last_end_x = 0.0f32;
         for run in self.buffer.layout_runs() {
-            if run.line_i != line {
+            if run.line_i != local {
                 continue;
             }
-            last_top = run.line_top;
+            last_top = run.line_top + off;
             last_h = run.line_height;
             let mut run_end = 0.0f32;
             for g in run.glyphs.iter() {
                 if (g.start as usize) >= col_byte {
-                    return (g.x, run.line_top, run.line_height);
+                    return (g.x, run.line_top + off, run.line_height);
                 }
                 run_end = g.x + g.w;
             }
@@ -565,14 +628,18 @@ impl Document {
     /// Buffer-local (top, height) covering all visual rows of a logical line — used
     /// to highlight the current line even when it wraps across several rows.
     pub fn line_visual_bounds(&self, line: usize) -> (f32, f32) {
+        let off = self.buf_offset_px();
+        let Some(local) = line.checked_sub(self.buf_first).filter(|l| !self.large || *l < self.buf_count) else {
+            return (line as f32 * theme::LINE_HEIGHT(), theme::LINE_HEIGHT());
+        };
         let mut top: Option<f32> = None;
         let mut bottom = 0.0f32;
         for run in self.buffer.layout_runs() {
-            if run.line_i == line {
+            if run.line_i == local {
                 if top.is_none() {
-                    top = Some(run.line_top);
+                    top = Some(run.line_top + off);
                 }
-                bottom = run.line_top + run.line_height;
+                bottom = run.line_top + off + run.line_height;
             }
         }
         match top {
@@ -597,6 +664,9 @@ impl Document {
 
     /// The last line of the indentation-based fold starting at `header`, if any.
     pub fn fold_range(&self, header: usize) -> Option<usize> {
+        if self.large {
+            return None; // large-file mode: folding off (uniform line geometry)
+        }
         let total = self.rope.len_lines();
         let base = self.line_indent(header)?;
         let mut end = header;
@@ -717,6 +787,12 @@ impl Document {
     }
 
     pub fn reshape(&mut self, fs: &mut FontSystem) {
+        if self.large {
+            // Large-file mode: reshape only the shaped window (an edit can't change
+            // styling — there is none — so rebuilding the window is enough).
+            self.hl_dirty_from = usize::MAX;
+            return self.reshape_window(fs);
+        }
         let t0 = std::time::Instant::now();
         let text = self.rope.to_string().replace('\r', "");
         let lines = self.rope.len_lines();
@@ -728,6 +804,52 @@ impl Document {
         let spans = self.hl.as_mut().map(|h| h.highlight(&text, dirty));
         apply_buffer_text(&mut self.buffer, fs, &text, lines, self.lang, &self.ext, self.wrap_width, spans, &self.semantic);
         crate::perf::log(&format!("reshape({lines} lines): to_string {:?}, highlight+shape {:?}", t_str, t1.elapsed()));
+    }
+
+    // ---- Large-file shaped window ----
+
+    /// First document line currently shaped into the buffer (0 for normal docs).
+    pub fn buf_first_line(&self) -> usize {
+        self.buf_first
+    }
+
+    /// How many document lines the shaped window holds.
+    pub fn buf_window_lines(&self) -> usize {
+        self.buf_count
+    }
+
+    /// Pixel offset of the shaped window's top from the document's top.
+    pub fn buf_offset_px(&self) -> f32 {
+        self.buf_first as f32 * theme::LINE_HEIGHT()
+    }
+
+    /// Rebuild the shaped window at its current position (clamped to the rope).
+    fn reshape_window(&mut self, fs: &mut FontSystem) {
+        let total = self.rope.len_lines();
+        self.buf_first = self.buf_first.min(total.saturating_sub(1));
+        self.buf_count = LARGE_WINDOW_LINES.min(total - self.buf_first);
+        let text = window_string(&self.rope, self.buf_first, self.buf_count);
+        shape_window(&mut self.buffer, fs, &text, self.buf_count);
+    }
+
+    /// Keep the shaped window covering the viewport: when the visible range drifts
+    /// near (or past) the window's edges, re-center and reshape. Called per frame
+    /// by the renderer for large docs; a no-op while the view stays inside.
+    pub fn ensure_window(&mut self, fs: &mut FontSystem, first_visible: usize, visible: usize) {
+        if !self.large {
+            return;
+        }
+        let total = self.rope.len_lines();
+        let slack = visible.max(50); // re-center before the edge enters the viewport
+        let end = self.buf_first + self.buf_count;
+        let lo_ok = self.buf_first == 0 || first_visible >= self.buf_first + slack;
+        let hi_ok = end >= total || first_visible + visible + slack <= end;
+        if lo_ok && hi_ok && self.buf_count > 0 {
+            return;
+        }
+        let half = LARGE_WINDOW_LINES.saturating_sub(visible) / 2;
+        self.buf_first = first_visible.saturating_sub(half).min(total.saturating_sub(1));
+        self.reshape_window(fs);
     }
 
     /// Force a full re-highlight on the next reshape (e.g. after a theme change).
@@ -2202,6 +2324,57 @@ mod tests {
         d.place(7, false);
         d.goto_bracket();
         assert_eq!(d.sel.head, 13);
+    }
+
+    // Diagnostic timing for huge files (run with --ignored --nocapture). Mirrors a
+    // 450k-line log: open (Document::new), one edit reshape, and the per-frame
+    // metric scans.
+    #[test]
+    #[ignore]
+    fn big_file_timing() {
+        let mut fs = glyphon::FontSystem::new();
+        let line = "2026-06-04 12:00:00 INFO some.module - processed request id=12345 status=ok elapsed=12ms\n";
+        let text: String = line.repeat(450_000);
+        eprintln!("file: {} MB, {} lines", text.len() / 1_048_576, 450_000);
+
+        let t = std::time::Instant::now();
+        let mut d = Document::new(Some(std::path::PathBuf::from("t.log")), text, &mut fs);
+        eprintln!("open (Document::new): {:?}", t.elapsed());
+
+        let t = std::time::Instant::now();
+        let w = d.max_line_width();
+        eprintln!("max_line_width (per frame): {:?} -> {w}", t.elapsed());
+
+        let t = std::time::Instant::now();
+        d.place(100, false);
+        d.insert_str("x", &mut fs);
+        eprintln!("single-keystroke edit (reshape): {:?}", t.elapsed());
+
+        let t = std::time::Instant::now();
+        let text2 = d.text();
+        eprintln!("text() for LSP/completion: {:?} ({} MB)", t.elapsed(), text2.len() / 1_048_576);
+
+        // Window mechanics: scrolling to the middle re-centers the shaped window.
+        assert!(d.large, "450k lines must enter large-file mode");
+        let t = std::time::Instant::now();
+        d.ensure_window(&mut fs, 225_000, 50);
+        eprintln!("window jump to line 225k: {:?}", t.elapsed());
+        assert!(d.buf_first_line() <= 225_000 && 225_000 < d.buf_first_line() + d.buf_window_lines());
+        // Geometry round-trips through the window offset.
+        let b = d.rope.line_to_byte(225_000);
+        let (_, y, _) = d.byte_visual(b);
+        assert_eq!(y, 225_000.0 * theme::LINE_HEIGHT());
+    }
+
+    // Large-file mode invariants that must hold at normal sizes too: small docs
+    // never enter it, and window geometry is the identity for them.
+    #[test]
+    fn small_docs_stay_normal() {
+        let mut fs = glyphon::FontSystem::new();
+        let d = doc("fn main() {}\n", &mut fs);
+        assert!(!d.large);
+        assert_eq!(d.buf_first_line(), 0);
+        assert_eq!(d.buf_offset_px(), 0.0);
     }
 
     #[test]

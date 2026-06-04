@@ -37,6 +37,11 @@ pub struct Layout {
     pub status_bar: Rect,
     pub terminal_panel: Option<Rect>,
     pub palette: Option<PaletteLayout>,
+    /// Secondary (right) sidebar — the AI chat panel. Zero-width when hidden.
+    pub right_sidebar: Rect,
+    /// OUTLINE section body height in the explorer sidebar: None = section
+    /// hidden (other view / sidebar closed), Some(0.0) = collapsed to header.
+    outline_body_h: Option<f32>,
 }
 
 pub struct PaletteLayout {
@@ -59,6 +64,11 @@ impl Layout {
         // True when the active tab is a diff view — the gutter widens to fit the
         // dual old │ new line-number columns.
         diff_gutter: bool,
+        // Secondary (right) sidebar width; 0.0 = hidden. Collapses in Zen Mode.
+        right_width: f32,
+        // Explorer OUTLINE section: None = not showing (other sidebar view),
+        // Some(open) = header visible, body expanded when `open`.
+        explorer_outline: Option<bool>,
     ) -> Self {
         let tb = theme::TITLE_BAR_H();
         let title_bar = Rect { x: 0.0, y: 0.0, w, h: tb };
@@ -80,10 +90,20 @@ impl Layout {
             h: panel_h,
         };
         let editor_left = sidebar.x + sidebar.w;
+        // Secondary (right) sidebar: full content height on the right edge; the
+        // tab strip, editor, and terminal all stop at its left edge.
+        let rw = if zen() { 0.0 } else { right_width.max(0.0) };
+        let right_sidebar = Rect {
+            x: w - rw,
+            y: tb,
+            w: rw,
+            h: panel_h,
+        };
+        let content_right = w - rw;
         let tab_strip = Rect {
             x: editor_left,
             y: tb,
-            w: (w - editor_left).max(0.0),
+            w: (content_right - editor_left).max(0.0),
             h: theme::TAB_HEIGHT(),
         };
         // The find/replace widget floats over the editor's top-right (it doesn't
@@ -102,7 +122,7 @@ impl Layout {
             Some(Rect {
                 x: editor_left,
                 y: editor_y + editor_h,
-                w: (w - editor_left).max(0.0),
+                w: (content_right - editor_left).max(0.0),
                 h: term_h,
             })
         } else {
@@ -125,13 +145,13 @@ impl Layout {
         let mut editor_text = Rect {
             x: gutter.x + gutter.w,
             y: editor_y,
-            w: (w - gutter.x - gutter.w).max(0.0),
+            w: (content_right - gutter.x - gutter.w).max(0.0),
             h: editor_h,
         };
         // Centered Layout: inset the editor column symmetrically (the tab strip and
         // panels keep their full width, like VSCode).
         if centered() {
-            let region_w = w - gutter.x;
+            let region_w = content_right - gutter.x;
             let target = (region_w * 0.66).max((theme::zpx(700.0)).min(region_w));
             let pad = ((region_w - target) * 0.5).max(0.0);
             gutter.x += pad;
@@ -169,6 +189,13 @@ impl Layout {
         } else {
             None
         };
+        // Explorer OUTLINE section body: ~35% of the sidebar when expanded.
+        let outline_body_h = match explorer_outline {
+            Some(_) if sidebar.w <= 0.0 => None,
+            Some(true) => Some((panel_h * 0.35).clamp(theme::zpx(120.0), theme::zpx(420.0))),
+            Some(false) => Some(0.0),
+            None => None,
+        };
         Self {
             title_bar,
             activity_bar,
@@ -179,6 +206,8 @@ impl Layout {
             status_bar,
             terminal_panel,
             palette,
+            right_sidebar,
+            outline_body_h,
         }
     }
 
@@ -292,12 +321,39 @@ impl Layout {
     pub fn tree_region(&self) -> Rect {
         // The Explorer reserves a row below the header for its root ("AETHER-EDITOR") row.
         let top = self.sidebar.y + theme::SIDEBAR_HEADER_H() + theme::TREE_ROW_HEIGHT();
+        // The OUTLINE section (header + optional body) docks at the sidebar bottom.
+        let bottom = self.outline_header_rect().map_or(self.sidebar.y + self.sidebar.h, |h| h.y);
         Rect {
             x: self.sidebar.x,
             y: top,
             w: self.sidebar.w,
-            h: (self.sidebar.y + self.sidebar.h - top).max(0.0),
+            h: (bottom - top).max(0.0),
         }
+    }
+
+    /// The OUTLINE section's collapsible header bar at the explorer's bottom
+    /// (None when the explorer view isn't showing).
+    pub fn outline_header_rect(&self) -> Option<Rect> {
+        let body_h = self.outline_body_h?;
+        let h = theme::zpx(26.0);
+        Some(Rect {
+            x: self.sidebar.x,
+            y: self.sidebar.y + self.sidebar.h - body_h - h,
+            w: self.sidebar.w,
+            h,
+        })
+    }
+
+    /// The OUTLINE section's body (symbol list) under its header; zero-height
+    /// when collapsed.
+    pub fn outline_body_rect(&self) -> Option<Rect> {
+        let body_h = self.outline_body_h?;
+        Some(Rect {
+            x: self.sidebar.x,
+            y: self.sidebar.y + self.sidebar.h - body_h,
+            w: self.sidebar.w,
+            h: body_h,
+        })
     }
 
     /// Content region for sidebar panels WITHOUT a root row (Source Control, Search,

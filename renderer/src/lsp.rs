@@ -1131,6 +1131,9 @@ impl LspManager {
         // when ESLint is installed later. We carry the doc index to mutate it afterwards.
         let mut work: Vec<(usize, Work)> = Vec::new();
         for (i, d) in docs.iter().enumerate() {
+            if d.large {
+                continue; // large-file mode: never ship multi-MB docs to servers
+            }
             let (Some(lang), Some(uri)) = (d.language_id(), d.uri()) else { continue };
             if !server_for_language(lang) {
                 continue;
