@@ -14,6 +14,7 @@ use std::path::PathBuf;
 pub mod editor_view;
 pub mod explorer_panel;
 pub mod find_widget;
+pub mod info_page;
 pub mod ext_detail_view;
 pub mod extensions_panel;
 pub mod search_panel;

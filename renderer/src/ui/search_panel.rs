@@ -126,6 +126,11 @@ impl SearchPanel {
 
     /// Drop stale results + cancel any in-flight search (used when the workspace
     /// root changes via Open Folder).
+    /// Expand the replace row and focus the query (Edit > Replace in Files).
+    pub fn show_replace(&mut self) {
+        self.replace_active = true;
+    }
+
     pub fn reset(&mut self) {
         self.results.clear();
         self.collapsed.clear();

@@ -17,6 +17,21 @@ pub enum MenuCmd {
     CheckUpdate,  // check GitHub for a newer release
     About,        // show version info
     NewWindow,    // open a new app window
+    OpenRecent,   // quick-pick of recent folders
+    AutoSave,     // toggle files.autoSave (afterDelay)
+    RevertFile,   // reload the active doc from disk
+    CloseFolder,  // back to a folder-less window
+    ZenMode,      // distraction-free: fullscreen, no chrome
+    CenteredLayout,
+    Problems,     // quick-pick of all diagnostics
+    OutputLog,    // read-only tab with language-server logs
+    ReplaceInFiles,
+    GotoWsSymbol, // palette in `#` mode
+    RunActiveFile,
+    RunSelectedText,
+    Welcome,        // Help > Welcome tab
+    ShortcutsRef,   // keyboard-shortcuts reference tab
+    Tips,           // tips & tricks tab
     OpenFileDlg,  // OS file-picker → open the chosen file
     SaveAs,       // save the active doc under a new path
     SaveAll,      // save every dirty doc
@@ -76,7 +91,7 @@ const FILE: &[Entry] = &[
     SEP,
     e("Open File…", OpenFileDlg),
     k("Open Folder…", Cmd(OpenFolder), "Ctrl+O"),
-    stub("Open Recent"),
+    e("Open Recent", OpenRecent),
     SEP,
     stub("Add Folder to Workspace…"),
     stub("Save Workspace As…"),
@@ -85,14 +100,14 @@ const FILE: &[Entry] = &[
     e("Save As…", SaveAs),
     e("Save All", SaveAll),
     SEP,
-    stub("Auto Save"),
+    e("Auto Save", AutoSave),
     e("Settings", Cmd(OpenSettings)),
     e("Color Theme", Cmd(ColorTheme)),
-    stub("Keyboard Shortcuts"),
+    e("Keyboard Shortcuts", ShortcutsRef),
     SEP,
-    stub("Revert File"),
+    e("Revert File", RevertFile),
     k("Close Editor", Cmd(Close), "Ctrl+W"),
-    stub("Close Folder"),
+    e("Close Folder", CloseFolder),
     SEP,
     e("Exit", Exit),
 ];
@@ -109,22 +124,22 @@ const EDIT: &[Entry] = &[
     e("Replace", Replace),
     SEP,
     e("Find in Files", FindInFiles),
-    stub("Replace in Files"),
+    e("Replace in Files", ReplaceInFiles),
     SEP,
-    stubk("Toggle Line Comment", "Ctrl+/"),
-    stub("Toggle Block Comment"),
+    k("Toggle Line Comment", Cmd(ToggleLineComment), "Ctrl+/"),
+    k("Toggle Block Comment", Cmd(ToggleBlockComment), "Shift+Alt+A"),
 ];
 
 const SELECTION: &[Entry] = &[
     k("Select All", Cmd(SelectAll), "Ctrl+A"),
-    stub("Expand Selection"),
-    stub("Shrink Selection"),
+    k("Expand Selection", Cmd(ExpandSelection), "Shift+Alt+Right"),
+    k("Shrink Selection", Cmd(ShrinkSelection), "Shift+Alt+Left"),
     SEP,
-    stub("Copy Line Up"),
-    stub("Copy Line Down"),
-    stub("Move Line Up"),
-    stub("Move Line Down"),
-    stub("Duplicate Selection"),
+    k("Copy Line Up", Cmd(CopyLineUp), "Shift+Alt+Up"),
+    k("Copy Line Down", Cmd(CopyLineDown), "Shift+Alt+Down"),
+    k("Move Line Up", Cmd(MoveLineUp), "Alt+Up"),
+    k("Move Line Down", Cmd(MoveLineDown), "Alt+Down"),
+    e("Duplicate Selection", Cmd(DuplicateSelection)),
     SEP,
     stub("Add Cursor Above"),
     stub("Add Cursor Below"),
@@ -137,8 +152,8 @@ const VIEW: &[Entry] = &[
     k("Command Palette…", Palette, "Ctrl+Shift+P"),
     SEP,
     e("Full Screen", FullScreen),
-    stub("Zen Mode"),
-    stub("Centered Layout"),
+    e("Zen Mode", ZenMode),
+    e("Centered Layout", CenteredLayout),
     SEP,
     e("Explorer", ShowExplorer),
     e("Search", ShowSearch),
@@ -146,8 +161,8 @@ const VIEW: &[Entry] = &[
     stub("Run and Debug"),
     e("Extensions", ShowExtensions),
     SEP,
-    stub("Problems"),
-    stub("Output"),
+    k("Problems", Problems, "Ctrl+Shift+M"),
+    e("Output", OutputLog),
     stub("Debug Console"),
     k("Terminal", Cmd(ToggleTerminal), "Ctrl+`"),
     SEP,
@@ -161,27 +176,28 @@ const VIEW: &[Entry] = &[
 ];
 
 const GO: &[Entry] = &[
-    stub("Back"),
-    stub("Forward"),
-    stub("Last Edit Location"),
+    k("Back", Cmd(NavBack), "Alt+Left"),
+    k("Forward", Cmd(NavForward), "Alt+Right"),
+    e("Last Edit Location", Cmd(LastEditLocation)),
     SEP,
-    stub("Switch Editor"),
+    k("Next Editor", Cmd(NextEditor), "Ctrl+PgDn"),
+    k("Previous Editor", Cmd(PrevEditor), "Ctrl+PgUp"),
     stub("Switch Group"),
     SEP,
     k("Go to File…", QuickOpen, "Ctrl+P"),
-    stub("Go to Symbol in Workspace…"),
+    k("Go to Symbol in Workspace…", GotoWsSymbol, "Ctrl+T"),
     e("Go to Symbol in Editor…", GotoSymbol),
-    stubk("Go to Definition", "F12"),
-    stub("Go to Declaration"),
-    stub("Go to Type Definition"),
-    stub("Go to Implementations"),
-    stub("Go to References"),
+    k("Go to Definition", Cmd(GotoDefinition), "F12"),
+    e("Go to Declaration", Cmd(GotoDeclaration)),
+    e("Go to Type Definition", Cmd(GotoTypeDefinition)),
+    e("Go to Implementations", Cmd(GotoImplementations)),
+    k("Go to References", Cmd(GotoReferences), "Shift+F12"),
     SEP,
     e("Go to Line/Column…", GotoLine),
-    stub("Go to Bracket"),
+    k("Go to Bracket", Cmd(GotoBracket), "Ctrl+Shift+\\"),
     SEP,
-    stubk("Next Problem", "F8"),
-    stub("Previous Problem"),
+    k("Next Problem", Cmd(NextProblem), "F8"),
+    k("Previous Problem", Cmd(PrevProblem), "Shift+F8"),
 ];
 
 const RUN: &[Entry] = &[
@@ -213,8 +229,8 @@ const TERMINAL: &[Entry] = &[
     SEP,
     stub("Run Task…"),
     stub("Run Build Task…"),
-    stub("Run Active File"),
-    stub("Run Selected Text"),
+    e("Run Active File", RunActiveFile),
+    e("Run Selected Text", RunSelectedText),
     SEP,
     stub("Show Running Tasks"),
     stub("Restart Running Task"),
@@ -224,13 +240,13 @@ const TERMINAL: &[Entry] = &[
 ];
 
 const HELP: &[Entry] = &[
-    stub("Welcome"),
+    e("Welcome", Welcome),
     k("Show All Commands", Palette, "Ctrl+Shift+P"),
     e("Documentation", OpenDocs),
     e("Release Notes", OpenReleases),
     SEP,
-    stub("Keyboard Shortcuts Reference"),
-    stub("Tips and Tricks"),
+    e("Keyboard Shortcuts Reference", ShortcutsRef),
+    e("Tips and Tricks", Tips),
     SEP,
     e("Report Issue / Feedback…", Feedback),
     SEP,

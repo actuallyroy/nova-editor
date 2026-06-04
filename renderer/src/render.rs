@@ -210,6 +210,20 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let vp = crate::ext_detail::ExtensionDetail::body_viewport(editor_region(&layout));
         let content_h = gpu.ui.ext_detail.body_content_height(&|k| gpu.media.size(k));
         app.detail.ext_detail_scroll.set_metrics(vp, (vp.w, content_h));
+    }
+    // Info tabs (Welcome / Tips / Shortcuts): reshape on zoom/width change and size
+    // the scroll viewport from the page's height. Regular documents take the
+    // editor-metrics branch below instead.
+    if app.workspace.active_doc().map_or(false, |d| d.info.is_some()) {
+        if let Some(d) = app.workspace.active_doc_mut() {
+            if let Some(page) = d.info.as_mut() {
+                let region = editor_region(&layout);
+                let body = crate::ui::info_page::InfoPage::body(region);
+                page.shape(&mut gpu.font_system, body.w);
+                let ch = page.content_height();
+                d.scroll.set_metrics(region, (region.w, ch + theme::zpx(64.0)));
+            }
+        }
     } else if let Some(d) = app.workspace.active_doc_mut() {
         // Editor: size the document's scroll viewport (offset clamps here, thumbs
         // position from these metrics). Content height uses logical lines + padding.
@@ -608,6 +622,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // edges, so every underlying overlay quad (scrollbars, detail icon, link underlines)
     // must be suppressed while one is open — otherwise it bleeds through around the modal.
     let modal_open = layout.palette.is_some() || app.dialog.is_some() || app.feedback_form.is_some();
+
+    // Info-tab page chrome (zebra rows, keycap pills, section rules, link
+    // underlines) — under the text, in the editor region.
+    if app.detail.open_extension.is_none() {
+        if let Some(d) = app.workspace.active_doc() {
+            if let Some(page) = d.info.as_ref() {
+                let body = crate::ui::info_page::InfoPage::body(editor_region(&layout));
+                page.quads(body, d.scroll_y(), &mut bg_quads);
+            }
+        }
+    }
 
     // Title bar bg + window-control hover (hover rect == the button rect).
     bg_quads.push(layout.title_bar.quad(theme::TITLE_BAR_BG()));
@@ -1446,6 +1471,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
         if d.image.is_some() {
             // Image tab: the picture is drawn in the media pass below; no text/gutter.
+        } else if let Some(page) = d.info.as_ref() {
+            // Info tab: the hand-designed page draws its own text in a centered
+            // reading column (its quads are added in the quad-build phase above).
+            let body = crate::ui::info_page::InfoPage::body(editor_region(&layout));
+            page.draw(body, d.scroll_y(), &mut areas);
         } else if let Some(right) = d.diff_right.as_ref() {
             // Side-by-side diff: two gutters + two text panes over the full region.
             let full = editor_region(&layout);

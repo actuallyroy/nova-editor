@@ -24,6 +24,7 @@ mod lsp;
 mod markdown;
 mod marketplace;
 mod menus;
+mod nav;
 #[cfg(target_os = "macos")]
 mod macos_menu;
 mod perf;
@@ -336,6 +337,9 @@ pub(crate) struct App {
     pub(crate) term_blink_on: bool,    // blink phase for the terminal block cursor
     pub(crate) term_last_blink: Instant,
     pub(crate) last_edit: Instant,  // for files.autoSave (afterDelay)
+    pub(crate) nav: nav::NavState,  // Go > Back / Forward jump list
+    pub(crate) zen_saved: Option<(bool, bool)>, // pre-Zen (sidebar, terminal) visibility
+    pub(crate) lsp_log: std::collections::VecDeque<String>, // ring buffer for the Output tab
     pub(crate) anim_start: Instant, // monotonic clock for GIF playback
     pub(crate) cursor_icon: CursorIcon,
 }
@@ -424,6 +428,9 @@ impl App {
             term_blink_on: true,
             term_last_blink: Instant::now(),
             last_edit: Instant::now(),
+            nav: nav::NavState::default(),
+            zen_saved: None,
+            lsp_log: std::collections::VecDeque::new(),
             anim_start: Instant::now(),
             cursor_icon: CursorIcon::Default,
         }
@@ -665,6 +672,18 @@ impl App {
             self.detail.hovered_page_install = new_page_install;
             changed = true;
         }
+
+        // Hovering a link row in an info page → pointer cursor.
+        let over_md_link = if self.detail.open_extension.is_none() {
+            self.workspace.active_doc().map_or(false, |d| {
+                d.info.as_ref().map_or(false, |page| {
+                    let body = ui::info_page::InfoPage::body(render::editor_region(&layout));
+                    page.links(body, d.scroll_y()).iter().any(|(r, _)| r.contains(p))
+                })
+            })
+        } else {
+            false
+        };
 
         // Hovering a README link → pointer cursor.
         let over_detail_link = if self.detail.open_extension.is_some() {
@@ -963,6 +982,13 @@ impl App {
             } else if over_diff_header || over_fold_chevron {
                 // Combined-diff file header / gutter fold chevron: clickable.
                 CursorIcon::Pointer
+            } else if over_md_link {
+                CursorIcon::Pointer
+            } else if layout.editor_text.contains(p)
+                && self.workspace.active_doc().map_or(false, |d| d.info.is_some())
+            {
+                // Designed info page: regular arrow, not an I-beam.
+                CursorIcon::Default
             } else if layout.editor_text.contains(p) {
                 // Editor text area: I-beam (not a component).
                 CursorIcon::Text
@@ -1184,14 +1210,14 @@ impl App {
             && render::editor_region(&layout).contains((x, y))
         {
             let items = vec![
-                CtxEntry { label: "Go to Definition".into(), hint: "F12", action: CtxAction::Stub("Go to Definition") },
-                CtxEntry::stub("Go to Declaration"),
-                CtxEntry::stub("Go to Type Definition"),
-                CtxEntry::stub("Go to Implementations"),
-                CtxEntry { label: "Go to References".into(), hint: "Shift+F12", action: CtxAction::Stub("Go to References") },
+                CtxEntry { label: "Go to Definition".into(), hint: "F12", action: CtxAction::Command(Command::GotoDefinition) },
+                CtxEntry { label: "Go to Declaration".into(), hint: "", action: CtxAction::Command(Command::GotoDeclaration) },
+                CtxEntry { label: "Go to Type Definition".into(), hint: "", action: CtxAction::Command(Command::GotoTypeDefinition) },
+                CtxEntry { label: "Go to Implementations".into(), hint: "", action: CtxAction::Command(Command::GotoImplementations) },
+                CtxEntry { label: "Go to References".into(), hint: "Shift+F12", action: CtxAction::Command(Command::GotoReferences) },
                 CtxEntry::sep(),
                 CtxEntry::stub("Peek Definition"),
-                CtxEntry::stub("Find All References"),
+                CtxEntry { label: "Find All References".into(), hint: "", action: CtxAction::Command(Command::GotoReferences) },
                 CtxEntry::stub("Show Call Hierarchy"),
                 CtxEntry::sep(),
                 CtxEntry { label: "Rename Symbol".into(), hint: "F2", action: CtxAction::Stub("Rename Symbol") },
@@ -1407,9 +1433,26 @@ impl App {
     /// Open the dropdown for top-level menu `idx`, loading its entries into the
     /// shared dropdown widget. Closes any open file-explorer context menu.
     fn open_app_menu(&mut self, idx: usize) {
+        // Toggle rows show a live checkmark for their current state.
+        let labels: Vec<String> = menus::entries(idx)
+            .iter()
+            .map(|e| {
+                let on = match e.cmd {
+                    menus::MenuCmd::AutoSave => settings::auto_save(),
+                    menus::MenuCmd::ZenMode => layout::zen(),
+                    menus::MenuCmd::CenteredLayout => layout::centered(),
+                    menus::MenuCmd::FullScreen => {
+                        self.gpu.as_ref().map_or(false, |g| g.window.fullscreen().is_some())
+                    }
+                    _ => false,
+                };
+                if on { format!("✓ {}", e.label) } else { e.label.to_string() }
+            })
+            .collect();
         let rows: Vec<(&str, &str, bool)> = menus::entries(idx)
             .iter()
-            .map(|e| (e.label, e.hint, matches!(e.cmd, menus::MenuCmd::Separator)))
+            .zip(&labels)
+            .map(|(e, l)| (l.as_str(), e.hint, matches!(e.cmd, menus::MenuCmd::Separator)))
             .collect();
         if let Some(g) = self.gpu.as_mut() {
             g.ui.menu_dropdown.set_entries(&mut g.font_system, &rows);
@@ -1469,8 +1512,35 @@ impl App {
                 ));
             }
             menus::MenuCmd::NewWindow => self.open_new_window(),
+            menus::MenuCmd::OpenRecent => self.open_recent_picker(),
+            menus::MenuCmd::AutoSave => {
+                settings::set_auto_save(!settings::auto_save());
+            }
+            menus::MenuCmd::RevertFile => self.revert_file(),
+            menus::MenuCmd::CloseFolder => self.close_folder(),
+            menus::MenuCmd::ZenMode => self.toggle_zen(),
+            menus::MenuCmd::CenteredLayout => {
+                layout::set_centered(!layout::centered());
+            }
+            menus::MenuCmd::Problems => self.open_problems_picker(),
+            menus::MenuCmd::OutputLog => self.open_output_tab(),
+            menus::MenuCmd::Welcome => {
+                let page = ui::info_page::welcome(&state::State::load().recent);
+                self.open_info_tab(page);
+            }
+            menus::MenuCmd::ShortcutsRef => self.open_info_tab(ui::info_page::shortcuts()),
+            menus::MenuCmd::Tips => self.open_info_tab(ui::info_page::tips()),
+            menus::MenuCmd::RunActiveFile => self.run_active_file(),
+            menus::MenuCmd::RunSelectedText => self.run_selected_text(),
+            menus::MenuCmd::ReplaceInFiles => {
+                self.show_sidebar_view(SidebarView::Search);
+                if let Some(sp) = self.search.as_mut() {
+                    sp.show_replace();
+                }
+            }
             menus::MenuCmd::QuickOpen => self.open_quick_open(),
             menus::MenuCmd::GotoSymbol => self.open_palette_with("@"),
+            menus::MenuCmd::GotoWsSymbol => self.open_palette_with("#"),
             menus::MenuCmd::GotoLine => self.open_palette_with(":"),
             menus::MenuCmd::OpenFileDlg => {
                 let start = self.workspace.tree.root.clone();
@@ -2362,6 +2432,15 @@ impl App {
     /// Commit a quick-pick selection.
     fn exec_pick(&mut self, kind: commands::PickKind, label: &str) {
         match kind {
+            commands::PickKind::OpenRecent => {
+                let p = PathBuf::from(label);
+                if p.is_dir() {
+                    self.open_folder(p);
+                } else {
+                    self.show_info_dialog("That folder no longer exists.");
+                }
+            }
+            commands::PickKind::Problem | commands::PickKind::Location => {} // handled at the commit site (needs the full item)
             commands::PickKind::SetColorTheme => {
                 self.apply_theme_by_name(label);
                 settings::set_color_theme(label); // persist across restarts
@@ -2453,6 +2532,7 @@ impl App {
             Some('@') => (commands::PaletteMode::Symbols, raw.trim_start_matches(['@', ':']).to_string()),
             Some(':') => (commands::PaletteMode::GoToLine, raw[1..].to_string()),
             Some('%') => (commands::PaletteMode::TextSearch, raw[1..].to_string()),
+            Some('#') => (commands::PaletteMode::WorkspaceSymbols, raw[1..].to_string()),
             _ => (commands::PaletteMode::Files, raw.clone()),
         };
         // `%` text search: live results stream into the palette list itself.
@@ -2474,6 +2554,26 @@ impl App {
                 q,
                 crate::search::SearchOpts::default(),
             );
+            return;
+        }
+        // `#` workspace symbols: each keystroke re-queries the language server; the
+        // response replaces the list when it lands (stale ids are dropped).
+        if mode == commands::PaletteMode::WorkspaceSymbols {
+            let q = sub.trim().to_string();
+            if self.palette.mode != mode {
+                self.palette.set_source(mode, Vec::new());
+            }
+            if q.is_empty() {
+                self.palette.set_source(mode, vec![commands::PickItem::new("Search workspace symbols…", "")]);
+                return;
+            }
+            let lang = self.workspace.active_doc().and_then(|d| d.language_id());
+            if !self.lsp.request_workspace_symbols(lang, &q) {
+                self.palette.set_source(
+                    mode,
+                    vec![commands::PickItem::new("No language server running for workspace symbols.", "")],
+                );
+            }
             return;
         }
         // Go-to-line: show a single hint row reflecting the typed number.
@@ -2501,6 +2601,7 @@ impl App {
                 }
                 commands::PaletteMode::GoToLine => self.palette.set_source(mode, Vec::new()),
                 commands::PaletteMode::TextSearch => {} // handled by the early return above
+                commands::PaletteMode::WorkspaceSymbols => {} // handled by the early return above
                 commands::PaletteMode::QuickPick(_) => {}
             }
         }
@@ -2522,14 +2623,27 @@ impl App {
             }
             commands::PaletteMode::QuickPick(_) => {
                 if let Some((kind, label)) = self.palette.selected_pick() {
+                    let item = self.palette.selected_item().cloned();
                     self.palette.close();
-                    self.exec_pick(kind, &label);
+                    if matches!(kind, commands::PickKind::Problem | commands::PickKind::Location) {
+                        // detail = "rel/path:line" — jump straight to the diagnostic.
+                        if let Some(it) = item {
+                            if let Some((rel, _)) = it.detail.rsplit_once(':') {
+                                self.nav.mark(&self.workspace);
+                                let path = self.cwd.join(rel);
+                                self.open_file_at(path, it.line.unwrap_or(1), 0);
+                            }
+                        }
+                    } else {
+                        self.exec_pick(kind, &label);
+                    }
                 }
                 true
             }
             commands::PaletteMode::Files => {
                 if let Some(rel) = self.palette.selected_item().map(|it| it.label.clone()) {
                     self.palette.close();
+                    self.nav.mark(&self.workspace);
                     let path = self.cwd.join(&rel);
                     self.open_file_at(path, 1, 0);
                 }
@@ -2538,6 +2652,7 @@ impl App {
             commands::PaletteMode::Symbols => {
                 if let Some(line) = self.palette.selected_item().and_then(|it| it.line) {
                     self.palette.close();
+                    self.nav.mark(&self.workspace);
                     self.goto_line(line);
                 }
                 true
@@ -2551,8 +2666,21 @@ impl App {
                     .map(|it| (it.detail.clone(), it.line.unwrap_or(1)))
                 {
                     self.palette.close();
+                    self.nav.mark(&self.workspace);
                     let path = self.cwd.join(rel);
                     self.open_file_at(path, line, 0);
+                }
+                true
+            }
+            commands::PaletteMode::WorkspaceSymbols => {
+                // detail = "rel/path:line" (like Problems) — jump to the symbol.
+                if let Some(it) = self.palette.selected_item().cloned().filter(|it| it.line.is_some()) {
+                    self.palette.close();
+                    if let Some((rel, _)) = it.detail.rsplit_once(':') {
+                        self.nav.mark(&self.workspace);
+                        let path = self.cwd.join(rel);
+                        self.open_file_at(path, it.line.unwrap_or(1), 0);
+                    }
                 }
                 true
             }
@@ -2564,6 +2692,7 @@ impl App {
                     .unwrap_or(0);
                 self.palette.close();
                 if n > 0 {
+                    self.nav.mark(&self.workspace);
                     self.goto_line(n);
                 }
                 true
@@ -2679,8 +2808,173 @@ impl App {
                 }
             }
             Command::ColorTheme => self.open_theme_picker(None),
+            Command::ToggleLineComment => self.doc_edit(|d, fs| d.toggle_line_comment(fs)),
+            Command::ToggleBlockComment => self.doc_edit(|d, fs| d.toggle_block_comment(fs)),
+            Command::MoveLineUp => self.doc_edit(|d, fs| d.move_lines(false, fs)),
+            Command::MoveLineDown => self.doc_edit(|d, fs| d.move_lines(true, fs)),
+            Command::CopyLineUp => self.doc_edit(|d, fs| d.copy_lines(false, fs)),
+            Command::CopyLineDown => self.doc_edit(|d, fs| d.copy_lines(true, fs)),
+            Command::DuplicateSelection => self.doc_edit(|d, fs| d.duplicate_selection(fs)),
+            Command::ExpandSelection => self.doc_edit(|d, _| d.expand_selection()),
+            Command::ShrinkSelection => self.doc_edit(|d, _| d.shrink_selection()),
+            Command::GotoBracket => self.doc_edit(|d, _| d.goto_bracket()),
+            Command::NavBack => {
+                if let Some(loc) = self.nav.back(&self.workspace) {
+                    self.nav_go(loc);
+                }
+            }
+            Command::NavForward => {
+                if let Some(loc) = self.nav.forward(&self.workspace) {
+                    self.nav_go(loc);
+                }
+            }
+            Command::LastEditLocation => {
+                if let Some(loc) = self.nav.last_edit.clone() {
+                    self.nav.mark(&self.workspace);
+                    self.nav_go(loc);
+                }
+            }
+            Command::NextProblem => self.cycle_problem(true),
+            Command::PrevProblem => self.cycle_problem(false),
+            Command::NextEditor => self.cycle_editor(1),
+            Command::PrevEditor => self.cycle_editor(-1),
+            Command::GotoDefinition => self.lsp_goto(lsp::LocKind::Definition),
+            Command::GotoDeclaration => self.lsp_goto(lsp::LocKind::Declaration),
+            Command::GotoTypeDefinition => self.lsp_goto(lsp::LocKind::TypeDefinition),
+            Command::GotoImplementations => self.lsp_goto(lsp::LocKind::Implementation),
+            Command::GotoReferences => self.lsp_goto(lsp::LocKind::References),
         }
         self.redraw();
+    }
+
+    /// Fire a Go-to / references request for the caret position. The response
+    /// arrives as `WorkerMsg::LspLocations` and lands in `apply_locations`.
+    fn lsp_goto(&mut self, kind: lsp::LocKind) {
+        let Some(d) = self.workspace.active_doc() else { return };
+        let (Some(uri), Some(lang)) = (d.uri(), d.language_id()) else {
+            return self.show_info_dialog("No language server for this file type.");
+        };
+        let (line, col) = d.lsp_pos(d.caret_byte());
+        if !self.lsp.request_locations(lang, &uri, line, col, kind) {
+            self.show_info_dialog("The language server isn't running yet.");
+        }
+    }
+
+    /// Handle a definition/references/symbol response: jump straight to a single
+    /// target, open a picker for several, and feed `#` palette queries.
+    fn apply_locations(&mut self, kind: lsp::LocKind, locs: Vec<lsp::LspLocation>) {
+        // Palette `#` mode: replace the list with the latest symbol results.
+        if kind == lsp::LocKind::WorkspaceSymbol {
+            if self.palette.active && self.palette.mode == commands::PaletteMode::WorkspaceSymbols {
+                let items = locs.iter().map(|l| self.loc_item(l)).collect();
+                self.palette.set_source(commands::PaletteMode::WorkspaceSymbols, items);
+                self.redraw();
+            }
+            return;
+        }
+        match (locs.len(), kind) {
+            (0, _) => self.show_info_dialog(&format!("No {} found.", kind.label())),
+            (1, k) if k != lsp::LocKind::References => {
+                let l = &locs[0];
+                self.nav.mark(&self.workspace);
+                if let Some(p) = lsp::uri_to_path(&l.uri) {
+                    self.open_file_at(p, l.line as usize + 1, l.character as usize);
+                }
+            }
+            _ => {
+                // Several targets (or any references): pick from a palette list.
+                let items: Vec<commands::PickItem> = locs.iter().map(|l| self.loc_item(l)).collect();
+                self.palette.open_quick_pick(commands::PickKind::Location, items);
+                if let Some(g) = self.gpu.as_mut() {
+                    g.ui.palette_input.clear(&mut g.font_system);
+                    g.ui.palette_input.focus(true);
+                }
+            }
+        }
+        self.redraw();
+    }
+
+    /// A palette row for one LSP location: `symbol-or-file  path:line`.
+    fn loc_item(&self, l: &lsp::LspLocation) -> commands::PickItem {
+        let path = lsp::uri_to_path(&l.uri).unwrap_or_default();
+        let rel = path.strip_prefix(&self.cwd).unwrap_or(&path).to_string_lossy().into_owned();
+        let label = l.name.clone().unwrap_or_else(|| {
+            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| rel.clone())
+        });
+        commands::PickItem {
+            label,
+            detail: format!("{rel}:{}", l.line + 1),
+            line: Some(l.line as usize + 1),
+        }
+    }
+
+    /// Jump to a recorded navigation location: re-activate its tab (re-opening the
+    /// file if it was closed) and center its line.
+    fn nav_go(&mut self, loc: nav::NavLoc) {
+        let found = self.workspace.documents.iter().position(|d| {
+            (loc.path.is_some() && d.path == loc.path) || (loc.path.is_none() && d.name == loc.name)
+        });
+        match (found, &loc.path) {
+            (Some(i), _) => self.workspace.active = Some(i),
+            (None, Some(p)) => {
+                let p = p.clone();
+                if let Some(gpu) = self.gpu.as_mut() {
+                    if self.workspace.open_file(&p, &mut gpu.font_system).is_err() {
+                        return; // file gone — drop the entry silently
+                    }
+                }
+            }
+            (None, None) => return, // pathless tab (diff/untitled) was closed
+        }
+        self.nav.note_switch(&self.workspace);
+        self.goto_line(loc.line + 1);
+    }
+
+    /// Jump to the next/previous diagnostic in the active document (F8 / Shift+F8),
+    /// wrapping around.
+    fn cycle_problem(&mut self, next: bool) {
+        let editor_h = self.layout().editor_text.h;
+        let Some(d) = self.workspace.active_doc_mut() else { return };
+        if d.diagnostics.is_empty() {
+            return;
+        }
+        let mut starts: Vec<usize> = d.diagnostics.iter().map(|g| d.lsp_byte(g.start_line, g.start_char)).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        let caret = d.caret_byte();
+        let target = if next {
+            *starts.iter().find(|&&b| b > caret).unwrap_or(&starts[0])
+        } else {
+            *starts.iter().rev().find(|&&b| b < caret).unwrap_or(starts.last().unwrap())
+        };
+        let l = d.rope.byte_to_line(target);
+        if d.is_line_hidden(l) {
+            d.reveal_line(l);
+        }
+        d.place(target, false);
+        let y = l as f32 * theme::LINE_HEIGHT() - (editor_h - theme::LINE_HEIGHT()) * 0.5;
+        d.scroll.scroll_to_y(y.max(0.0));
+    }
+
+    /// Cycle the active editor tab (Ctrl+PageDown / Ctrl+PageUp).
+    fn cycle_editor(&mut self, dir: i32) {
+        let n = self.workspace.documents.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.workspace.active.unwrap_or(0) as i32;
+        self.workspace.active = Some(((cur + dir).rem_euclid(n as i32)) as usize);
+    }
+
+    /// Run an editing op on the active document (palette / menu entry path) and
+    /// keep the caret in view.
+    fn doc_edit(&mut self, f: impl FnOnce(&mut Document, &mut glyphon::FontSystem)) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            if let Some(d) = self.workspace.active_doc_mut() {
+                f(d, &mut gpu.font_system);
+            }
+        }
+        self.ensure_cursor_visible();
     }
 
     /// Switch the workspace to `folder`: re-root the file tree (and the find-in-files
@@ -2708,17 +3002,236 @@ impl App {
         self.redraw();
     }
 
+    /// Switch this window to the folder-less state (File > Close Folder). Open
+    /// editors are kept; the explorer empties out.
+    fn open_folder_less(&mut self) {
+        self.cwd = PathBuf::new();
+        self.terminal.set_cwd(PathBuf::new());
+        if let Some(scp) = self.source_control.as_mut() {
+            scp.set_root(PathBuf::new());
+        }
+        self.workspace.tree = crate::workspace::FileTree::new(PathBuf::new());
+        self.sidebar_view = SidebarView::Explorer;
+        if let Some(sp) = self.search.as_mut() {
+            sp.reset();
+        }
+        self.refresh_source_control();
+        self.persist_state(); // keeps the last real folder (guarded inside)
+        self.redraw();
+    }
+
+    /// Run a shell command in the integrated terminal (Terminal > Run Active File /
+    /// Run Selected Text): opens the panel if needed, pastes, and presses Enter.
+    fn run_in_terminal(&mut self, text: &str) {
+        if !self.terminal.visible {
+            self.toggle_terminal(); // also spawns the first shell when none exists
+        }
+        self.terminal.paste_focused(text);
+        self.terminal.write_focused(b"\r"); // execute (paste may be bracketed)
+        self.redraw();
+    }
+
+    /// Terminal > Run Active File: run the file with its language's interpreter.
+    fn run_active_file(&mut self) {
+        let Some(path) = self.workspace.active_doc().and_then(|d| d.path.clone()) else {
+            return self.show_info_dialog("The active tab has no file on disk.");
+        };
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let quoted = shell_quoted(&path);
+        let cmd = match ext.as_str() {
+            "py" => format!("python3 {quoted}"),
+            "js" | "mjs" | "cjs" => format!("node {quoted}"),
+            "ts" => format!("npx tsx {quoted}"),
+            "sh" | "bash" => format!("bash {quoted}"),
+            "zsh" => format!("zsh {quoted}"),
+            "rb" => format!("ruby {quoted}"),
+            "pl" => format!("perl {quoted}"),
+            "lua" => format!("lua {quoted}"),
+            "php" => format!("php {quoted}"),
+            "swift" => format!("swift {quoted}"),
+            "r" => format!("Rscript {quoted}"),
+            "go" => format!("go run {quoted}"),
+            "rs" => "cargo run".to_string(), // workspace-aware; rustc one-offs are rare
+            _ => {
+                return self.show_info_dialog(&format!(
+                    "Don't know how to run .{ext} files in the terminal."
+                ));
+            }
+        };
+        self.run_in_terminal(&cmd);
+    }
+
+    /// Terminal > Run Selected Text: send the editor selection to the shell.
+    fn run_selected_text(&mut self) {
+        let Some(text) = self.workspace.active_doc().and_then(|d| d.selected_text()) else {
+            return self.show_info_dialog("Select some text in the editor first.");
+        };
+        self.run_in_terminal(text.trim_end());
+    }
+
+    /// View > Zen Mode: fullscreen with all chrome hidden; restores the previous
+    /// sidebar/terminal visibility on exit.
+    fn toggle_zen(&mut self) {
+        let on = !layout::zen();
+        layout::set_zen(on);
+        if on {
+            self.zen_saved = Some((self.sidebar_visible, self.terminal.visible));
+            self.sidebar_visible = false;
+            if self.terminal.visible {
+                self.toggle_terminal();
+            }
+            if let Some(g) = self.gpu.as_ref() {
+                g.window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            }
+        } else {
+            if let Some((sb, term)) = self.zen_saved.take() {
+                self.sidebar_visible = sb;
+                if term && !self.terminal.visible {
+                    self.toggle_terminal();
+                }
+            }
+            if let Some(g) = self.gpu.as_ref() {
+                g.window.set_fullscreen(None);
+            }
+        }
+        self.redraw();
+    }
+
+    /// View > Problems: quick-pick of every diagnostic across open documents.
+    fn open_problems_picker(&mut self) {
+        let mut items: Vec<commands::PickItem> = Vec::new();
+        for d in &self.workspace.documents {
+            let rel = match d.path.as_ref() {
+                Some(p) => p.strip_prefix(&self.cwd).unwrap_or(p).to_string_lossy().into_owned(),
+                None => continue,
+            };
+            for g in &d.diagnostics {
+                let sev = match g.severity {
+                    crate::lsp::Severity::Error => "error",
+                    crate::lsp::Severity::Warning => "warning",
+                    _ => "info",
+                };
+                let msg = g.message.lines().next().unwrap_or("").trim();
+                let mut label = format!("{sev}: {msg}");
+                label.truncate(label.char_indices().map(|(i, _)| i).nth(100).unwrap_or(label.len()));
+                items.push(commands::PickItem {
+                    label,
+                    detail: format!("{rel}:{}", g.start_line + 1),
+                    line: Some(g.start_line as usize + 1),
+                });
+            }
+        }
+        if items.is_empty() {
+            return self.show_info_dialog("No problems detected in open files.");
+        }
+        self.palette.open_quick_pick(commands::PickKind::Problem, items);
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.palette_input.clear(&mut g.font_system);
+            g.ui.palette_input.focus(true);
+        }
+        self.redraw();
+    }
+
+    /// View > Output: a read-only tab streaming the language servers' log lines.
+    fn open_output_tab(&mut self) {
+        let text = self.output_text();
+        if let Some(i) = self.workspace.documents.iter().position(|d| d.read_only && d.name == "Output") {
+            self.workspace.active = Some(i);
+            if let Some(gpu) = self.gpu.as_mut() {
+                if let Some(d) = self.workspace.documents.get_mut(i) {
+                    d.set_text_external(&text, &mut gpu.font_system);
+                }
+            }
+        } else if let Some(gpu) = self.gpu.as_mut() {
+            let mut d = Document::new(None, text, &mut gpu.font_system);
+            d.name = "Output".into();
+            d.read_only = true;
+            self.workspace.documents.push(d);
+            self.workspace.active = Some(self.workspace.documents.len() - 1);
+        }
+        self.redraw();
+    }
+
+    /// Open (or refocus) a designed informational tab (Welcome / Shortcuts / Tips).
+    fn open_info_tab(&mut self, page: ui::info_page::InfoPage) {
+        if let Some(i) = self.workspace.documents.iter().position(|d| d.read_only && d.name == page.title) {
+            self.workspace.active = Some(i);
+        } else if let Some(gpu) = self.gpu.as_mut() {
+            let d = Document::new_info(page, &mut gpu.font_system);
+            self.workspace.documents.push(d);
+            self.workspace.active = Some(self.workspace.documents.len() - 1);
+        }
+        self.redraw();
+    }
+
+    fn output_text(&self) -> String {
+        if self.lsp_log.is_empty() {
+            "(no language-server output yet)".to_string()
+        } else {
+            self.lsp_log.iter().cloned().collect::<Vec<_>>().join("\n")
+        }
+    }
+
     /// Persist machine-managed session state (zoom + last workspace) to
     /// `~/.aether/state.json` so the next launch restores it.
     fn persist_state(&self) {
         // A folder-less window (File → New Window) must not clobber the remembered
         // workspace — keep whatever the last real folder was.
-        let last_workspace = if self.cwd.as_os_str().is_empty() {
-            state::State::load().last_workspace
-        } else {
-            Some(self.cwd.clone())
+        let mut st = state::State::load();
+        if !self.cwd.as_os_str().is_empty() {
+            st.last_workspace = Some(self.cwd.clone());
+            st.touch_recent(&self.cwd);
+        }
+        st.zoom = Some(theme::ui_zoom());
+        st.save();
+    }
+
+    /// File > Open Recent — quick-pick of recently-opened folders.
+    fn open_recent_picker(&mut self) {
+        let recents = state::State::load().recent;
+        let items: Vec<commands::PickItem> = recents
+            .iter()
+            .filter(|p| p.is_dir())
+            .map(|p| {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                commands::PickItem::new(p.to_string_lossy().into_owned(), name)
+            })
+            .collect();
+        if items.is_empty() {
+            return self.show_info_dialog("No recent folders yet.");
+        }
+        self.palette.open_quick_pick(commands::PickKind::OpenRecent, items);
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.palette_input.clear(&mut g.font_system);
+            g.ui.palette_input.focus(true);
+        }
+        self.redraw();
+    }
+
+    /// File > Revert File — reload the active document from disk, discarding
+    /// unsaved changes (one undoable step, like VSCode).
+    fn revert_file(&mut self) {
+        let Some(path) = self.workspace.active_doc().and_then(|d| d.path.clone()) else {
+            return;
         };
-        state::State { zoom: Some(theme::ui_zoom()), last_workspace }.save();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return self.show_info_dialog("Couldn't read the file from disk.");
+        };
+        if let Some(gpu) = self.gpu.as_mut() {
+            if let Some(d) = self.workspace.active_doc_mut() {
+                d.set_text_external(&text, &mut gpu.font_system);
+            }
+        }
+        self.redraw();
+    }
+
+    /// File > Close Folder — back to a folder-less window (open editors are kept,
+    /// like VSCode; terminals are released to the daemon as orphans).
+    fn close_folder(&mut self) {
+        if self.cwd.as_os_str().is_empty() {
+            return;
+        }
+        self.open_folder_less();
     }
 
     // Integrated-terminal actions live on `ui::terminal_panel::TerminalPanel`; these
@@ -3324,6 +3837,31 @@ impl App {
                     self.redraw();
                     return;
                 }
+            }
+        }
+
+        // Info tab (Welcome / Tips / …): a click in the page fires the link row
+        // under it; everything else is inert (no caret in a designed page).
+        if self.detail.open_extension.is_none()
+            && self.workspace.active_doc().map_or(false, |d| d.info.is_some())
+        {
+            let region = render::editor_region(&layout);
+            if region.contains((x, y)) {
+                let body = ui::info_page::InfoPage::body(region);
+                let action = self.workspace.active_doc().and_then(|d| {
+                    d.info.as_ref().and_then(|page| {
+                        page.links(body, d.scroll_y())
+                            .into_iter()
+                            .find(|(r, _)| r.contains((x, y)))
+                            .map(|(_, a)| a)
+                    })
+                });
+                match action {
+                    Some(ui::info_page::Action::Url(url)) => open_url(&url),
+                    Some(ui::info_page::Action::OpenFolder(p)) => self.open_folder(p),
+                    None => {}
+                }
+                return;
             }
         }
 
@@ -4496,6 +5034,37 @@ impl App {
                     self.close_find();
                     return;
                 }
+                // F12 / Shift+F12: go to definition / references.
+                if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::F12)) {
+                    self.exec_command(if self.mods.shift_key() {
+                        Command::GotoReferences
+                    } else {
+                        Command::GotoDefinition
+                    });
+                    return;
+                }
+                // F8 / Shift+F8: cycle through the document's problems.
+                if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::F8)) {
+                    self.exec_command(if self.mods.shift_key() {
+                        Command::PrevProblem
+                    } else {
+                        Command::NextProblem
+                    });
+                    return;
+                }
+                // Alt+Left / Alt+Right (no shift): navigate Back / Forward.
+                if self.mods.alt_key() && !self.mods.shift_key() {
+                    if let Key::Named(k @ (NamedKey::ArrowLeft | NamedKey::ArrowRight)) =
+                        event.logical_key.as_ref()
+                    {
+                        self.exec_command(if k == NamedKey::ArrowLeft {
+                            Command::NavBack
+                        } else {
+                            Command::NavForward
+                        });
+                        return;
+                    }
+                }
             }
         }
 
@@ -4518,6 +5087,30 @@ impl App {
                     }
                     KeyCode::KeyA => {
                         self.exec_command(Command::SelectAll);
+                        return;
+                    }
+                    KeyCode::Slash => {
+                        self.exec_command(Command::ToggleLineComment);
+                        return;
+                    }
+                    KeyCode::KeyM if shift => {
+                        self.open_problems_picker();
+                        return;
+                    }
+                    KeyCode::KeyT => {
+                        self.open_palette_with("#"); // workspace symbols
+                        return;
+                    }
+                    KeyCode::PageDown => {
+                        self.exec_command(Command::NextEditor);
+                        return;
+                    }
+                    KeyCode::PageUp => {
+                        self.exec_command(Command::PrevEditor);
+                        return;
+                    }
+                    KeyCode::Backslash if shift => {
+                        self.exec_command(Command::GotoBracket);
                         return;
                     }
                     KeyCode::Equal => {
@@ -4621,6 +5214,46 @@ impl App {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Alt-modified editor ops (VSCode): Alt+Up/Down move lines, Shift+Alt copies
+        // them, Shift+Alt+A toggles a block comment, Shift+Alt+Right/Left expand and
+        // shrink the selection. Physical keys — Alt remaps logical characters.
+        if self.mods.alt_key() {
+            use winit::keyboard::{KeyCode, PhysicalKey};
+            if let PhysicalKey::Code(code) = event.physical_key {
+                let done = match code {
+                    KeyCode::ArrowUp | KeyCode::ArrowDown => {
+                        let down = code == KeyCode::ArrowDown;
+                        if extend {
+                            d.copy_lines(down, &mut gpu.font_system);
+                        } else {
+                            d.move_lines(down, &mut gpu.font_system);
+                        }
+                        true
+                    }
+                    KeyCode::KeyA if extend => {
+                        d.toggle_block_comment(&mut gpu.font_system);
+                        true
+                    }
+                    KeyCode::ArrowRight if extend => {
+                        d.expand_selection();
+                        true
+                    }
+                    KeyCode::ArrowLeft if extend => {
+                        d.shrink_selection();
+                        true
+                    }
+                    _ => false,
+                };
+                if done {
+                    self.completion.close();
+                    self.last_edit = Instant::now();
+                    self.ensure_cursor_visible();
+                    self.redraw();
+                    return;
+                }
             }
         }
 
@@ -5068,6 +5701,11 @@ impl ApplicationHandler for App {
                     self.lsp.apply_diagnostic_report(&mut self.workspace.documents, id, diags);
                     self.redraw();
                 }
+                WorkerMsg::LspLocations { id, locs } => {
+                    if let Some(kind) = self.lsp.take_locations(id) {
+                        self.apply_locations(kind, locs);
+                    }
+                }
                 WorkerMsg::LspSemanticRefresh { server } => {
                     self.lsp.refresh_semantic(&self.workspace.documents, server);
                 }
@@ -5084,7 +5722,23 @@ impl ApplicationHandler for App {
                     }
                 }
                 WorkerMsg::LspExited { server } => self.lsp.drop_server(server),
-                WorkerMsg::LspLog { server, message } => eprintln!("[lsp:{server}] {message}"),
+                WorkerMsg::LspLog { server, message } => {
+                    eprintln!("[lsp:{server}] {message}");
+                    self.lsp_log.push_back(format!("[{server}] {message}"));
+                    while self.lsp_log.len() > 1000 {
+                        self.lsp_log.pop_front();
+                    }
+                    // Live-update an open Output tab.
+                    if let Some(i) = self.workspace.documents.iter().position(|d| d.read_only && d.name == "Output") {
+                        let text = self.output_text();
+                        if let Some(gpu) = self.gpu.as_mut() {
+                            if let Some(d) = self.workspace.documents.get_mut(i) {
+                                d.set_text_external(&text, &mut gpu.font_system);
+                            }
+                        }
+                        self.redraw();
+                    }
+                }
                 WorkerMsg::FeedbackDone { result } => match result {
                     Ok(url) if url.starts_with("http") => open_url(&url),
                     Ok(_) => self.show_info_dialog("Thanks! Your feedback was submitted."),
@@ -5125,6 +5779,9 @@ impl ApplicationHandler for App {
 
         // Language-server document sync (open + debounced didChange).
         self.sync_lsp();
+
+        // Navigation history: record tab switches / edits for Go > Back / Last Edit.
+        self.nav.tick(&self.workspace);
 
         // files.autoSave (afterDelay): save dirty docs ~1s after the last edit.
         if settings::auto_save() && now.duration_since(self.last_edit) > Duration::from_millis(1000) {

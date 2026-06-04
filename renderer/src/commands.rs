@@ -15,6 +15,28 @@ pub enum Command {
     ToggleTerminal,
     OpenFolder,
     ColorTheme,
+    ToggleLineComment,
+    ToggleBlockComment,
+    MoveLineUp,
+    MoveLineDown,
+    CopyLineUp,
+    CopyLineDown,
+    DuplicateSelection,
+    ExpandSelection,
+    ShrinkSelection,
+    GotoBracket,
+    NavBack,
+    NavForward,
+    LastEditLocation,
+    NextProblem,
+    PrevProblem,
+    NextEditor,
+    PrevEditor,
+    GotoDefinition,
+    GotoDeclaration,
+    GotoTypeDefinition,
+    GotoImplementations,
+    GotoReferences,
 }   
 
 pub const COMMANDS: &[(Command, &str, &str)] = &[
@@ -31,6 +53,28 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::OpenDefaultSettings, "Preferences: Open Default Settings (JSON)", ""),
     (Command::ColorTheme, "Preferences: Color Theme", ""),
     (Command::ToggleTerminal, "View: Toggle Terminal", "Ctrl+`"),
+    (Command::ToggleLineComment, "Edit: Toggle Line Comment", "Ctrl+/"),
+    (Command::ToggleBlockComment, "Edit: Toggle Block Comment", "Shift+Alt+A"),
+    (Command::MoveLineUp, "Edit: Move Line Up", "Alt+Up"),
+    (Command::MoveLineDown, "Edit: Move Line Down", "Alt+Down"),
+    (Command::CopyLineUp, "Edit: Copy Line Up", "Shift+Alt+Up"),
+    (Command::CopyLineDown, "Edit: Copy Line Down", "Shift+Alt+Down"),
+    (Command::DuplicateSelection, "Edit: Duplicate Selection", ""),
+    (Command::ExpandSelection, "Edit: Expand Selection", "Shift+Alt+Right"),
+    (Command::ShrinkSelection, "Edit: Shrink Selection", "Shift+Alt+Left"),
+    (Command::GotoBracket, "Go: Go to Bracket", "Ctrl+Shift+\\"),
+    (Command::NavBack, "Go: Back", "Alt+Left"),
+    (Command::NavForward, "Go: Forward", "Alt+Right"),
+    (Command::LastEditLocation, "Go: Last Edit Location", ""),
+    (Command::NextProblem, "Go: Next Problem", "F8"),
+    (Command::PrevProblem, "Go: Previous Problem", "Shift+F8"),
+    (Command::NextEditor, "View: Next Editor", "Ctrl+PageDown"),
+    (Command::PrevEditor, "View: Previous Editor", "Ctrl+PageUp"),
+    (Command::GotoDefinition, "Go: Go to Definition", "F12"),
+    (Command::GotoDeclaration, "Go: Go to Declaration", ""),
+    (Command::GotoTypeDefinition, "Go: Go to Type Definition", ""),
+    (Command::GotoImplementations, "Go: Go to Implementations", ""),
+    (Command::GotoReferences, "Go: Go to References", "Shift+F12"),
 ];
 
 /// What a quick-pick selection does. Each variant carries no data here; the chosen
@@ -38,6 +82,9 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PickKind {
     SetColorTheme,
+    OpenRecent,
+    Problem,
+    Location, // jump targets from an LSP definition/references response
 }
 
 /// One row in a quick-pick list (dynamic, unlike the fixed `COMMANDS`).
@@ -67,6 +114,7 @@ pub enum PaletteMode {
     Symbols,          // `@` — go to symbol in the active file
     GoToLine,         // `:` — go to line
     TextSearch,       // `%` — find text across the workspace (opens the Search panel)
+    WorkspaceSymbols, // `#` — language-server workspace/symbol query
     QuickPick(PickKind),
 }
 

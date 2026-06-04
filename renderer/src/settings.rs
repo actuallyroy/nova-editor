@@ -393,6 +393,42 @@ pub fn user_settings_path() -> Option<PathBuf> {
 
 /// Persist `workbench.colorTheme` into the user settings file, preserving comments
 /// and other keys (line-based: rewrite the existing line, else insert one). Best-effort.
+/// Persist `files.autoSave` into the user settings (File > Auto Save toggle) and
+/// apply it to the live store.
+pub fn set_auto_save(on: bool) {
+    let value = if on { "afterDelay" } else { "off" };
+    set_user_setting("files.autoSave", &format!("\"{value}\""));
+    store().write().unwrap().files_auto_save = on;
+}
+
+/// Rewrite (or insert) one `"key": value` line in the user settings.json,
+/// preserving the rest of the hand-authored document untouched.
+fn set_user_setting(key: &str, value_json: &str) {
+    let Some(path) = user_settings_path() else { return };
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let needle = format!("\"{key}\"");
+    let mut found = false;
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|l| {
+            if l.contains(&needle) {
+                found = true;
+                let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
+                let comma = if l.trim_end().ends_with(',') { "," } else { "" };
+                format!("{indent}\"{key}\": {value_json}{comma}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        if let Some(pos) = lines.iter().position(|l| l.contains('{')) {
+            lines.insert(pos + 1, format!("  \"{key}\": {value_json},"));
+        }
+    }
+    let _ = std::fs::write(&path, lines.join("\n"));
+}
+
 pub fn set_color_theme(label: &str) {
     let Some(path) = user_settings_path() else { return };
     let text = std::fs::read_to_string(&path).unwrap_or_default();

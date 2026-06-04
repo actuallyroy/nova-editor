@@ -89,6 +89,8 @@ pub struct Document {
     hl: Option<crate::highlight::LineCache>, // syntect incremental highlighter (None = no grammar)
     hl_dirty_from: usize,                // lowest line changed since the last highlight (usize::MAX = none)
     semantic: Vec<(usize, usize, Color)>, // Layer-2 LSP semantic tokens (byte range → color)
+    expand_stack: Vec<(usize, usize)>, // prior ranges for Expand/Shrink Selection
+    pub info: Option<crate::ui::info_page::InfoPage>, // Some ⇒ designed info page (Welcome / Tips / Shortcuts)
 }
 
 /// Set the buffer's metrics/wrap/size and its (rich) text. `spans` are precomputed
@@ -286,7 +288,19 @@ impl Document {
             hl,
             hl_dirty_from: usize::MAX,
             semantic: Vec::new(),
+            expand_stack: Vec::new(),
+            info: None,
         }
+    }
+
+    /// A read-only tab that renders a hand-designed info page (Welcome / Tips /
+    /// Keyboard Shortcuts) instead of text. The page owns its layout + geometry.
+    pub fn new_info(page: crate::ui::info_page::InfoPage, fs: &mut FontSystem) -> Self {
+        let mut d = Document::new(None, String::new(), fs);
+        d.name = page.title.clone();
+        d.read_only = true;
+        d.info = Some(page);
+        d
     }
 
     /// An editable "Feedback" tab. The user types a report and presses Ctrl+Enter
@@ -344,6 +358,8 @@ impl Document {
             hl: None,
             hl_dirty_from: usize::MAX,
             semantic: Vec::new(),
+            expand_stack: Vec::new(),
+            info: None,
         }
     }
 
@@ -428,6 +444,8 @@ impl Document {
             hl: None,
             hl_dirty_from: usize::MAX,
             semantic: Vec::new(),
+            expand_stack: Vec::new(),
+            info: None,
         }
     }
 
@@ -881,6 +899,8 @@ impl Document {
         self.future.clear();
         self.sel = sel_after;
         self.dirty = true;
+        // The expand/shrink stack holds byte ranges; edits invalidate them.
+        self.expand_stack.clear();
         // Folds are keyed by line number; an edit can shift lines, so drop them
         // rather than hide the wrong range. (Cheap to re-fold.)
         if !self.folds.is_empty() {
@@ -925,6 +945,21 @@ impl Document {
             byte += c.len_utf8();
         }
         line_start + byte
+    }
+
+    /// LSP position `(line, utf16_col)` for an absolute byte offset — the inverse
+    /// of `lsp_byte` (definition/references requests send the caret this way).
+    pub fn lsp_pos(&self, byte: usize) -> (u32, u32) {
+        let b = byte.min(self.rope.len_bytes());
+        let line = self.rope.byte_to_line(b);
+        let line_start = self.rope.line_to_byte(line);
+        let col: usize = self
+            .rope
+            .byte_slice(line_start..b)
+            .chars()
+            .map(|c| c.len_utf16())
+            .sum();
+        (line as u32, col as u32)
     }
 
     /// The diagnostic message under a buffer-relative point (for hover tooltips),
@@ -1414,6 +1449,477 @@ impl Document {
         Some(self.rope.slice(lo_char..hi_char).to_string())
     }
 
+    // ---- Line & selection operations (Edit / Selection menus) ----
+
+    fn slice_str(&self, lo: usize, hi: usize) -> String {
+        self.rope.slice(self.rope.byte_to_char(lo)..self.rope.byte_to_char(hi)).to_string()
+    }
+
+    /// `(first_line, last_line)` covered by the selection. A selection ending at
+    /// column 0 of a line doesn't include that line (VSCode).
+    fn sel_lines(&self) -> (usize, usize) {
+        let (lo, hi) = self.sel.range();
+        let fl = self.rope.byte_to_line(lo);
+        let mut ll = self.rope.byte_to_line(hi.min(self.rope.len_bytes()));
+        if ll > fl && hi == self.rope.line_to_byte(ll) {
+            ll -= 1;
+        }
+        (fl, ll)
+    }
+
+    /// Byte span of full lines `fl..=ll` (start of `fl` .. start of `ll+1`, i.e.
+    /// including the trailing newline when there is one).
+    fn line_span(&self, fl: usize, ll: usize) -> (usize, usize) {
+        let bs = self.rope.line_to_byte(fl);
+        let be = if ll + 1 >= self.rope.len_lines() {
+            self.rope.len_bytes()
+        } else {
+            self.rope.line_to_byte(ll + 1)
+        };
+        (bs, be)
+    }
+
+    /// Move the selected lines up or down by one line, as one undo step. The
+    /// selection rides along with the moved text (VSCode Alt+Up/Down).
+    pub fn move_lines(&mut self, down: bool, fs: &mut FontSystem) {
+        if self.read_only {
+            return;
+        }
+        let (fl, ll) = self.sel_lines();
+        let (bs, be) = self.line_span(fl, ll);
+        let len = self.rope.len_bytes();
+        let sel = self.sel;
+        self.break_undo_group();
+        if down {
+            if be >= len {
+                return; // already at the bottom
+            }
+            let (_, ne) = self.line_span(ll + 1, ll + 1);
+            let next = self.slice_str(be, ne);
+            let (del_at, del, ins) = if next.ends_with('\n') {
+                (be, next.clone(), next)
+            } else {
+                // The next line is the unterminated last line: move the block's own
+                // trailing newline with it so the file still ends without one. The
+                // deletion sits at/after the block's end, so selection bytes inside
+                // the block only shift by the insert below.
+                (be - 1, format!("\n{next}"), format!("{next}\n"))
+            };
+            self.push_and_apply(EditOp::Delete(del), del_at, Selection::caret(del_at));
+            self.force_join = true;
+            let d = ins.len();
+            let after = Selection {
+                anchor: sel.anchor + d,
+                head: sel.head + d,
+                desired_col: None,
+            };
+            self.push_and_apply(EditOp::Insert(ins), bs, after);
+        } else {
+            if fl == 0 {
+                return; // already at the top
+            }
+            let ps = self.rope.line_to_byte(fl - 1);
+            let prev = self.slice_str(ps, bs); // always ends with '\n'
+            let pl = prev.len();
+            self.push_and_apply(EditOp::Delete(prev.clone()), ps, Selection::caret(ps));
+            self.force_join = true;
+            let block_ends_nl = be > bs && self.rope.byte(be - pl - 1) == b'\n';
+            let (ins_at, ins) = if block_ends_nl {
+                (be - pl, prev)
+            } else {
+                // Block is the unterminated tail: re-attach the moved line below it
+                // with a leading newline instead of its trailing one.
+                (be - pl, format!("\n{}", &prev[..pl - 1]))
+            };
+            let after = Selection {
+                anchor: sel.anchor.saturating_sub(pl),
+                head: sel.head.saturating_sub(pl),
+                desired_col: None,
+            };
+            self.push_and_apply(EditOp::Insert(ins), ins_at, after);
+        }
+        self.reshape(fs);
+    }
+
+    /// Duplicate the selected lines above/below (VSCode Copy Line Up/Down). The
+    /// caret stays on the upper copy for "up" and rides to the lower copy for "down".
+    pub fn copy_lines(&mut self, down: bool, fs: &mut FontSystem) {
+        if self.read_only {
+            return;
+        }
+        let (fl, ll) = self.sel_lines();
+        let (bs, be) = self.line_span(fl, ll);
+        let block = self.slice_str(bs, be);
+        let ins = if block.ends_with('\n') { block } else { format!("{block}\n") };
+        let sel = self.sel;
+        let d = ins.len();
+        let after = if down {
+            Selection { anchor: sel.anchor + d, head: sel.head + d, desired_col: None }
+        } else {
+            sel
+        };
+        self.break_undo_group();
+        self.push_and_apply(EditOp::Insert(ins), bs, after);
+        self.reshape(fs);
+    }
+
+    /// Duplicate the selection after itself (selection moves to the copy); with no
+    /// selection, behaves like Copy Line Down.
+    pub fn duplicate_selection(&mut self, fs: &mut FontSystem) {
+        if self.read_only {
+            return;
+        }
+        if self.sel.is_empty() {
+            return self.copy_lines(true, fs);
+        }
+        let (lo, hi) = self.sel.range();
+        let text = self.slice_str(lo, hi);
+        let d = text.len();
+        self.break_undo_group();
+        self.push_and_apply(
+            EditOp::Insert(text),
+            hi,
+            Selection { anchor: hi, head: hi + d, desired_col: None },
+        );
+        self.reshape(fs);
+    }
+
+    /// Toggle the language's line comment on every selected line, as one undo step.
+    /// Adds at the block's minimum indent; removes a trailing space after the token.
+    /// Languages without a line token (HTML/CSS) fall back to a block comment.
+    pub fn toggle_line_comment(&mut self, fs: &mut FontSystem) {
+        if self.read_only {
+            return;
+        }
+        let Some((line_tok, _)) = comment_tokens(&self.ext) else { return };
+        let Some(tok) = line_tok else {
+            return self.toggle_block_comment(fs);
+        };
+        let (fl, ll) = self.sel_lines();
+        // Removing only when every non-blank line is commented (VSCode).
+        let mut all = true;
+        let mut any = false;
+        let mut min_indent = usize::MAX;
+        for l in fl..=ll {
+            let line = self.rope.line(l).to_string();
+            let content = line.trim_end_matches(['\n', '\r']);
+            let t = content.trim_start();
+            if t.is_empty() {
+                continue;
+            }
+            any = true;
+            min_indent = min_indent.min(content.len() - t.len());
+            if !t.starts_with(tok) {
+                all = false;
+            }
+        }
+        if !any {
+            return;
+        }
+        let removing = all;
+        // Selection endpoints as (line, col) so they survive the byte shifts.
+        let pos = |b: usize| {
+            let l = self.rope.byte_to_line(b.min(self.rope.len_bytes()));
+            (l, b - self.rope.line_to_byte(l))
+        };
+        let (mut a, mut h) = (pos(self.sel.anchor), pos(self.sel.head));
+        self.break_undo_group();
+        let mut first = true;
+        for l in (fl..=ll).rev() {
+            let ls = self.rope.line_to_byte(l);
+            let line = self.rope.line(l).to_string();
+            let content = line.trim_end_matches(['\n', '\r']);
+            let t = content.trim_start();
+            if t.is_empty() {
+                continue;
+            }
+            let indent = content.len() - t.len();
+            let keep = self.sel;
+            if removing {
+                let mut del = tok.len();
+                if t[tok.len()..].starts_with(' ') {
+                    del += 1;
+                }
+                let text = content[indent..indent + del].to_string();
+                if !first {
+                    self.force_join = true;
+                }
+                self.push_and_apply(EditOp::Delete(text), ls + indent, keep);
+                for p in [&mut a, &mut h] {
+                    if p.0 == l && p.1 > indent {
+                        p.1 = p.1.saturating_sub(del).max(indent);
+                    }
+                }
+            } else {
+                let text = format!("{tok} ");
+                let d = text.len();
+                if !first {
+                    self.force_join = true;
+                }
+                self.push_and_apply(EditOp::Insert(text), ls + min_indent, keep);
+                for p in [&mut a, &mut h] {
+                    if p.0 == l && p.1 >= min_indent {
+                        p.1 += d;
+                    }
+                }
+            }
+            first = false;
+        }
+        let back = |(l, c): (usize, usize)| {
+            let ls = self.rope.line_to_byte(l);
+            let ll = self.rope.line(l).len_bytes();
+            ls + c.min(ll)
+        };
+        self.sel = Selection { anchor: back(a), head: back(h), desired_col: None };
+        self.reshape(fs);
+    }
+
+    /// Wrap the selection in (or strip) the language's block comment, one undo step.
+    /// An empty selection wraps the caret's whole line.
+    pub fn toggle_block_comment(&mut self, fs: &mut FontSystem) {
+        if self.read_only {
+            return;
+        }
+        let Some((_, block)) = comment_tokens(&self.ext) else { return };
+        let Some((open, close)) = block else { return };
+        if self.sel.is_empty() {
+            // Wrap the caret's line content (sans indent / newline).
+            let l = self.rope.byte_to_line(self.sel.head.min(self.rope.len_bytes()));
+            let ls = self.rope.line_to_byte(l);
+            let line = self.rope.line(l).to_string();
+            let content = line.trim_end_matches(['\n', '\r']);
+            let indent = content.len() - content.trim_start().len();
+            self.sel = Selection {
+                anchor: ls + indent,
+                head: ls + content.len(),
+                desired_col: None,
+            };
+            if self.sel.is_empty() {
+                return; // blank line: nothing to wrap
+            }
+        }
+        let (lo, hi) = self.sel.range();
+        let text = self.slice_str(lo, hi);
+        let inner = text.trim();
+        self.break_undo_group();
+        if inner.starts_with(open) && inner.ends_with(close) && inner.len() >= open.len() + close.len() {
+            // Strip: delete the close token (plus one leading space) first so the
+            // open token's offsets stay valid, then the open token.
+            let os = lo + (text.len() - text.trim_start().len());
+            let ce = lo + text.trim_end().len();
+            let mut cs = ce - close.len();
+            if self.slice_str(cs - 1, cs) == " " {
+                cs -= 1;
+            }
+            let mut oe = os + open.len();
+            if self.slice_str(oe, oe + 1) == " " {
+                oe += 1;
+            }
+            self.push_and_apply(EditOp::Delete(self.slice_str(cs, ce)), cs, self.sel);
+            self.force_join = true;
+            self.push_and_apply(EditOp::Delete(self.slice_str(os, oe)), os, self.sel);
+            let d = oe - os;
+            self.sel = Selection { anchor: lo, head: cs - d, desired_col: None };
+        } else {
+            let close_t = format!(" {close}");
+            let open_t = format!("{open} ");
+            self.push_and_apply(EditOp::Insert(close_t), hi, self.sel);
+            self.force_join = true;
+            let d = open_t.len();
+            self.push_and_apply(
+                EditOp::Insert(open_t),
+                lo,
+                Selection { anchor: lo + d, head: hi + d, desired_col: None },
+            );
+        }
+        self.reshape(fs);
+    }
+
+    /// Innermost bracket pair strictly enclosing `[lo, hi)`. Returns the pair's
+    /// (open_byte, close_byte). Naive scan (ignores brackets inside strings).
+    fn enclosing_bracket(&self, lo: usize, hi: usize) -> Option<(usize, usize)> {
+        let pairs: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}')];
+        let lo_c = self.rope.byte_to_char(lo);
+        // Walk backwards from lo to the nearest unmatched open bracket.
+        let mut depth = [0i32; 3];
+        let mut idx = lo_c;
+        let mut open: Option<(usize, usize)> = None; // (pair idx, char idx)
+        while idx > 0 {
+            idx -= 1;
+            let c = self.rope.char(idx);
+            for (pi, (o, cl)) in pairs.iter().enumerate() {
+                if c == *cl {
+                    depth[pi] += 1;
+                } else if c == *o {
+                    if depth[pi] == 0 {
+                        open = Some((pi, idx));
+                    } else {
+                        depth[pi] -= 1;
+                    }
+                }
+            }
+            if open.is_some() {
+                break;
+            }
+        }
+        let (pi, oc) = open?;
+        // Walk forwards from the open bracket to its matching close.
+        let (o, cl) = pairs[pi];
+        let mut d = 0i32;
+        let total = self.rope.len_chars();
+        let mut j = oc;
+        while j + 1 < total {
+            j += 1;
+            let c = self.rope.char(j);
+            if c == o {
+                d += 1;
+            } else if c == cl {
+                if d == 0 {
+                    let ob = self.rope.char_to_byte(oc);
+                    let cb = self.rope.char_to_byte(j);
+                    if cb >= hi {
+                        return Some((ob, cb));
+                    }
+                    return None; // pair closes before the range ends — not enclosing
+                }
+                d -= 1;
+            }
+        }
+        None
+    }
+
+    /// Grow the selection: word → bracket contents → brackets included → outer
+    /// brackets → full lines → whole document. Each step is undone by
+    /// `shrink_selection`.
+    pub fn expand_selection(&mut self) {
+        let cur = self.sel.range();
+        if self.sel.is_empty() {
+            self.expand_stack.push(cur);
+            self.select_word(self.sel.head);
+            return;
+        }
+        let (lo, hi) = cur;
+        if let Some((ob, cb)) = self.enclosing_bracket(lo, hi) {
+            let content = (ob + 1, cb);
+            let next = if cur != content && content.0 <= lo && content.1 >= hi {
+                content
+            } else {
+                (ob, cb + 1) // already the contents → include the brackets
+            };
+            if next != cur {
+                self.expand_stack.push(cur);
+                self.sel = Selection { anchor: next.0, head: next.1, desired_col: None };
+                return;
+            }
+        }
+        let (fl, ll) = self.sel_lines();
+        let (bs, be) = self.line_span(fl, ll);
+        if (bs, be) != cur {
+            self.expand_stack.push(cur);
+            self.sel = Selection { anchor: bs, head: be, desired_col: None };
+            return;
+        }
+        let all = (0, self.rope.len_bytes());
+        if all != cur {
+            self.expand_stack.push(cur);
+            self.sel = Selection { anchor: all.0, head: all.1, desired_col: None };
+        }
+    }
+
+    /// Undo one `expand_selection` step.
+    pub fn shrink_selection(&mut self) {
+        if let Some((a, h)) = self.expand_stack.pop() {
+            let max = self.rope.len_bytes();
+            self.sel = Selection { anchor: a.min(max), head: h.min(max), desired_col: None };
+        }
+    }
+
+    /// Jump to the bracket matching the one at/under the caret; if the caret isn't
+    /// on a bracket, jump to the close of the nearest enclosing pair (VSCode).
+    pub fn goto_bracket(&mut self) {
+        let pairs: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}')];
+        let head = self.sel.head.min(self.rope.len_bytes());
+        let hc = self.rope.byte_to_char(head);
+        let total = self.rope.len_chars();
+        // The bracket "at" the caret: the char after it, else the char before.
+        let cand = [(hc, false), (hc.saturating_sub(1), true)];
+        for (ci, before) in cand {
+            if ci >= total || (before && hc == 0) {
+                continue;
+            }
+            let c = self.rope.char(ci);
+            if let Some((pi, is_open)) = pairs
+                .iter()
+                .enumerate()
+                .find_map(|(i, (o, cl))| {
+                    (c == *o).then_some((i, true)).or((c == *cl).then_some((i, false)))
+                })
+            {
+                let (o, cl) = pairs[pi];
+                let mut d = 0i32;
+                if is_open {
+                    let mut j = ci;
+                    while j + 1 < total {
+                        j += 1;
+                        let ch = self.rope.char(j);
+                        if ch == o {
+                            d += 1;
+                        } else if ch == cl {
+                            if d == 0 {
+                                self.place(self.rope.char_to_byte(j), false);
+                                return;
+                            }
+                            d -= 1;
+                        }
+                    }
+                } else {
+                    let mut j = ci;
+                    while j > 0 {
+                        j -= 1;
+                        let ch = self.rope.char(j);
+                        if ch == cl {
+                            d += 1;
+                        } else if ch == o {
+                            if d == 0 {
+                                self.place(self.rope.char_to_byte(j), false);
+                                return;
+                            }
+                            d -= 1;
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        if let Some((_, cb)) = self.enclosing_bracket(head, head) {
+            self.place(cb, false);
+        }
+    }
+}
+
+/// `(line_token, block_pair)` for a file extension, VSCode's language defaults.
+/// `None` line token with a `Some` block pair (HTML/CSS) means "toggle line
+/// comment" wraps the line in the block pair instead.
+pub fn comment_tokens(ext: &str) -> Option<(Option<&'static str>, Option<(&'static str, &'static str)>)> {
+    Some(match ext {
+        "rs" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "c" | "h" | "cpp" | "hpp" | "cc"
+        | "java" | "go" | "swift" | "kt" | "kts" | "cs" | "scala" | "dart" | "json" | "jsonc"
+        | "mcp" | "scss" | "less" | "proto" | "zig" | "glsl" | "wgsl" | "vert" | "frag" => {
+            (Some("//"), Some(("/*", "*/")))
+        }
+        "py" | "sh" | "bash" | "zsh" | "fish" | "rb" | "pl" | "yaml" | "yml" | "toml" | "conf"
+        | "ini" | "cfg" | "env" | "dockerfile" | "makefile" | "mk" | "cmake" | "r" | "ex"
+        | "exs" | "tf" | "nix" | "gitignore" => (Some("#"), None),
+        "lua" | "sql" => (Some("--"), None),
+        "html" | "htm" | "xml" | "svg" | "vue" | "md" | "markdown" => {
+            (None, Some(("<!--", "-->")))
+        }
+        "css" => (None, Some(("/*", "*/"))),
+        "vim" => (Some("\""), None),
+        "el" | "lisp" | "clj" | "cljs" => (Some(";;"), None),
+        "hs" | "elm" => (Some("--"), Some(("{-", "-}"))),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -1500,5 +2006,138 @@ mod tests {
         d.insert_str("x", &mut fs);
         d.undo(&mut fs);
         assert_eq!(d.text(), "ab", "edit after a cursor move undoes alone");
+    }
+
+    // ---- Line & selection ops ----
+
+    fn doc(text: &str, fs: &mut glyphon::FontSystem) -> Document {
+        Document::new(Some(std::path::PathBuf::from("t.rs")), text.into(), fs)
+    }
+
+    #[test]
+    fn move_lines_up_down_roundtrip() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut d = doc("aa\nbb\ncc", &mut fs);
+        // caret on "bb"; move down swaps with "cc" (no trailing newline case)
+        d.place(3, false);
+        d.move_lines(true, &mut fs);
+        assert_eq!(d.text(), "aa\ncc\nbb");
+        assert_eq!(d.rope.byte_to_line(d.sel.head), 2); // caret rode along
+        // one undo restores both edits
+        d.undo(&mut fs);
+        assert_eq!(d.text(), "aa\nbb\ncc");
+        // move up swaps with "aa"
+        d.place(3, false);
+        d.move_lines(false, &mut fs);
+        assert_eq!(d.text(), "bb\naa\ncc");
+        assert_eq!(d.rope.byte_to_line(d.sel.head), 0);
+        // moving the unterminated last line up keeps the file unterminated
+        let mut d2 = doc("aa\nbb", &mut fs);
+        d2.place(4, false);
+        d2.move_lines(false, &mut fs);
+        assert_eq!(d2.text(), "bb\naa");
+        // edges are no-ops
+        d2.place(0, false);
+        d2.move_lines(false, &mut fs);
+        assert_eq!(d2.text(), "bb\naa");
+        d2.place(4, false);
+        d2.move_lines(true, &mut fs);
+        assert_eq!(d2.text(), "bb\naa");
+    }
+
+    #[test]
+    fn copy_and_duplicate_lines() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut d = doc("aa\nbb", &mut fs);
+        d.place(0, false);
+        d.copy_lines(true, &mut fs); // copy down: caret rides to the lower copy
+        assert_eq!(d.text(), "aa\naa\nbb");
+        assert_eq!(d.rope.byte_to_line(d.sel.head), 1);
+        d.undo(&mut fs);
+        assert_eq!(d.text(), "aa\nbb");
+        d.copy_lines(false, &mut fs); // copy up: caret stays on the upper copy
+        assert_eq!(d.text(), "aa\naa\nbb");
+        assert_eq!(d.rope.byte_to_line(d.sel.head), 0);
+        // duplicate a selection: copy goes after, selection moves to it
+        let mut d2 = doc("hello", &mut fs);
+        d2.sel = Selection { anchor: 0, head: 5, desired_col: None };
+        d2.duplicate_selection(&mut fs);
+        assert_eq!(d2.text(), "hellohello");
+        assert_eq!(d2.sel.range(), (5, 10));
+    }
+
+    #[test]
+    fn line_comment_toggles() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut d = doc("fn main() {\n    let x = 1;\n    let y = 2;\n}\n", &mut fs);
+        // select both let-lines and comment them at the common indent
+        let lo = d.rope.line_to_byte(1);
+        let hi = d.rope.line_to_byte(3);
+        d.sel = Selection { anchor: lo, head: hi, desired_col: None };
+        d.toggle_line_comment(&mut fs);
+        assert_eq!(d.text(), "fn main() {\n    // let x = 1;\n    // let y = 2;\n}\n");
+        // toggling again removes — and one undo would restore the whole block
+        d.toggle_line_comment(&mut fs);
+        assert_eq!(d.text(), "fn main() {\n    let x = 1;\n    let y = 2;\n}\n");
+        d.undo(&mut fs);
+        assert_eq!(d.text(), "fn main() {\n    // let x = 1;\n    // let y = 2;\n}\n");
+        // caret column survives a single-line toggle
+        let mut d2 = doc("let x = 1;", &mut fs);
+        d2.place(5, false);
+        d2.toggle_line_comment(&mut fs);
+        assert_eq!(d2.text(), "// let x = 1;");
+        assert_eq!(d2.sel.head, 8); // shifted by "// "
+        // hash languages
+        let mut d3 = Document::new(Some(std::path::PathBuf::from("t.py")), "x = 1".into(), &mut fs);
+        d3.toggle_line_comment(&mut fs);
+        assert_eq!(d3.text(), "# x = 1");
+    }
+
+    #[test]
+    fn block_comment_toggles() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut d = doc("abc", &mut fs);
+        d.sel = Selection { anchor: 0, head: 3, desired_col: None };
+        d.toggle_block_comment(&mut fs);
+        assert_eq!(d.text(), "/* abc */");
+        // strip it back off (selection covers the whole comment now? select all)
+        d.select_all();
+        d.toggle_block_comment(&mut fs);
+        assert_eq!(d.text(), "abc");
+        // empty selection wraps the caret line; html uses <!-- -->
+        let mut d2 = Document::new(Some(std::path::PathBuf::from("t.html")), "<b>hi</b>".into(), &mut fs);
+        d2.place(2, false);
+        d2.toggle_line_comment(&mut fs); // html has no line token → block fallback
+        assert_eq!(d2.text(), "<!-- <b>hi</b> -->");
+    }
+
+    #[test]
+    fn expand_shrink_and_goto_bracket() {
+        let mut fs = glyphon::FontSystem::new();
+        let mut d = doc("fn f(aa, (bb)) {}", &mut fs);
+        // caret inside "bb"
+        d.place(11, false);
+        d.expand_selection();
+        assert_eq!(d.sel.range(), (10, 12)); // word "bb"
+        d.expand_selection();
+        assert_eq!(d.sel.range(), (9, 13)); // "(bb)" — contents == word, so include brackets
+        d.expand_selection();
+        assert_eq!(d.sel.range(), (5, 13)); // contents of f(...)
+        d.expand_selection();
+        assert_eq!(d.sel.range(), (4, 14)); // include f's parens
+        d.shrink_selection();
+        assert_eq!(d.sel.range(), (5, 13));
+        d.shrink_selection();
+        assert_eq!(d.sel.range(), (9, 13));
+        // goto bracket: caret on "(" jumps to its ")"
+        d.place(4, false);
+        d.goto_bracket();
+        assert_eq!(d.sel.head, 13);
+        d.goto_bracket(); // and back (caret sits on ")")
+        assert_eq!(d.sel.head, 4);
+        // not on a bracket: jump to the enclosing close
+        d.place(7, false);
+        d.goto_bracket();
+        assert_eq!(d.sel.head, 13);
     }
 }

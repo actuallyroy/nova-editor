@@ -37,6 +37,7 @@ pub enum WorkerMsg {
     LspDiagnosticReport { id: i64, diags: Vec<crate::lsp::Diagnostic> }, // pull diagnostic response
     LspSemanticTokens { id: i64, data: Vec<u32> },              // semanticTokens/full response
     LspCompletion { id: i64, items: Vec<crate::lsp::CompletionItem> }, // textDocument/completion response
+    LspLocations { id: i64, locs: Vec<crate::lsp::LspLocation> }, // definition/references/symbol response
     LspSemanticRefresh { server: &'static str },                // server asked us to re-pull semantic tokens
     LspLog { server: &'static str, message: String },           // server log / stderr line
     LspExited { server: &'static str },                         // server process ended

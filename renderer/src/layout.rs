@@ -2,9 +2,30 @@
 // Every widget and the renderer read their rects from here, so positions have a
 // single source of truth.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::theme;
 use crate::widgets::Rect;
 use crate::SidebarView;
+
+// View-mode flags (View > Zen Mode / Centered Layout). Globals like the settings
+// store: layout geometry is computed from many call sites, and these are pure
+// presentation toggles with no per-window state.
+static ZEN: AtomicBool = AtomicBool::new(false);
+static CENTERED: AtomicBool = AtomicBool::new(false);
+
+pub fn zen() -> bool {
+    ZEN.load(Ordering::Relaxed)
+}
+pub fn set_zen(on: bool) {
+    ZEN.store(on, Ordering::Relaxed);
+}
+pub fn centered() -> bool {
+    CENTERED.load(Ordering::Relaxed)
+}
+pub fn set_centered(on: bool) {
+    CENTERED.store(on, Ordering::Relaxed);
+}
 
 pub struct Layout {
     pub title_bar: Rect,
@@ -41,9 +62,11 @@ impl Layout {
     ) -> Self {
         let tb = theme::TITLE_BAR_H();
         let title_bar = Rect { x: 0.0, y: 0.0, w, h: tb };
-        let panel_h = h - theme::STATUS_BAR_HEIGHT() - tb;
+        // Zen Mode strips the chrome: status + activity bars collapse to nothing.
+        let sb_h = if zen() { 0.0 } else { theme::STATUS_BAR_HEIGHT() };
+        let panel_h = h - sb_h - tb;
         // workbench.activityBar.visible — collapse to 0 width when hidden.
-        let activity_w = if crate::settings::activitybar_visible() { theme::ACTIVITY_BAR_WIDTH() } else { 0.0 };
+        let activity_w = if !zen() && crate::settings::activitybar_visible() { theme::ACTIVITY_BAR_WIDTH() } else { 0.0 };
         let activity_bar = Rect {
             x: 0.0,
             y: tb,
@@ -71,10 +94,10 @@ impl Layout {
         // maximize request (huge height) is clamped here to fill the whole content
         // area (editor_h → 0); normal drag is bounded by the splitter's own max.
         let term_h = match terminal_height {
-            Some(req) => req.min((h - editor_y - theme::STATUS_BAR_HEIGHT()).max(0.0)),
+            Some(req) => req.min((h - editor_y - sb_h).max(0.0)),
             None => 0.0,
         };
-        let editor_h = (h - editor_y - theme::STATUS_BAR_HEIGHT() - term_h).max(0.0);
+        let editor_h = (h - editor_y - sb_h - term_h).max(0.0);
         let terminal_panel = if term_h > 0.0 {
             Some(Rect {
                 x: editor_left,
@@ -93,23 +116,33 @@ impl Layout {
         } else {
             theme::GUTTER_WIDTH()
         };
-        let gutter = Rect {
+        let mut gutter = Rect {
             x: editor_left,
             y: editor_y,
             w: gutter_w,
             h: editor_h,
         };
-        let editor_text = Rect {
+        let mut editor_text = Rect {
             x: gutter.x + gutter.w,
             y: editor_y,
             w: (w - gutter.x - gutter.w).max(0.0),
             h: editor_h,
         };
+        // Centered Layout: inset the editor column symmetrically (the tab strip and
+        // panels keep their full width, like VSCode).
+        if centered() {
+            let region_w = w - gutter.x;
+            let target = (region_w * 0.66).max((theme::zpx(700.0)).min(region_w));
+            let pad = ((region_w - target) * 0.5).max(0.0);
+            gutter.x += pad;
+            editor_text.x += pad;
+            editor_text.w = (editor_text.w - pad * 2.0).max(0.0);
+        }
         let status_bar = Rect {
             x: 0.0,
-            y: h - theme::STATUS_BAR_HEIGHT(),
+            y: h - sb_h,
             w,
-            h: theme::STATUS_BAR_HEIGHT(),
+            h: sb_h,
         };
         let palette = if palette_active {
             let pw = theme::PALETTE_WIDTH().min(w - theme::zpx(40.0));

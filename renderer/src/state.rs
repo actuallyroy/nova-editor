@@ -18,6 +18,8 @@ pub struct State {
     pub zoom: Option<f32>,
     /// The last workspace folder the user had open, reopened on launch.
     pub last_workspace: Option<PathBuf>,
+    /// Recently-opened workspace folders, newest first (File > Open Recent).
+    pub recent: Vec<PathBuf>,
 }
 
 fn state_path() -> Option<PathBuf> {
@@ -40,7 +42,22 @@ impl State {
                 s.last_workspace = Some(PathBuf::from(p));
             }
         }
+        if let Some(arr) = v.get("recentFolders").and_then(|r| r.as_array()) {
+            s.recent = arr
+                .iter()
+                .filter_map(|e| e.as_str())
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+                .collect();
+        }
         s
+    }
+
+    /// Move `folder` to the front of the recent list (dedup, capped at 10).
+    pub fn touch_recent(&mut self, folder: &PathBuf) {
+        self.recent.retain(|p| p != folder);
+        self.recent.insert(0, folder.clone());
+        self.recent.truncate(10);
     }
 
     /// Write the current state to disk (best-effort — errors are ignored).
@@ -52,6 +69,10 @@ impl State {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
+            "recentFolders": self.recent
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
         });
         if let Ok(text) = serde_json::to_string_pretty(&doc) {
             let _ = std::fs::write(&path, text);

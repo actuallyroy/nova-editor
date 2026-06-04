@@ -122,6 +122,99 @@ pub fn language_id(ext: &str) -> Option<&'static str> {
 // `init_options`/`config_reply` carry any server-specific protocol bits, and the
 // `pull_*` flags say which features Aether requests (diagnostics / semantic tokens).
 
+/// A navigation-request flavor (Go to Definition family / references / symbols).
+/// One id→kind map routes all their responses, since the wire shape is shared.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LocKind {
+    Definition,
+    Declaration,
+    TypeDefinition,
+    Implementation,
+    References,
+    WorkspaceSymbol,
+}
+
+impl LocKind {
+    pub fn method(self) -> &'static str {
+        match self {
+            LocKind::Definition => "textDocument/definition",
+            LocKind::Declaration => "textDocument/declaration",
+            LocKind::TypeDefinition => "textDocument/typeDefinition",
+            LocKind::Implementation => "textDocument/implementation",
+            LocKind::References => "textDocument/references",
+            LocKind::WorkspaceSymbol => "workspace/symbol",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            LocKind::Definition => "definition",
+            LocKind::Declaration => "declaration",
+            LocKind::TypeDefinition => "type definition",
+            LocKind::Implementation => "implementation",
+            LocKind::References => "references",
+            LocKind::WorkspaceSymbol => "symbol",
+        }
+    }
+}
+
+/// One resolved target from a location-shaped response (Location, LocationLink,
+/// or SymbolInformation).
+#[derive(Clone, Debug)]
+pub struct LspLocation {
+    pub uri: String,
+    pub line: u32,      // 0-based
+    pub character: u32, // UTF-16 col
+    pub name: Option<String>, // symbol name (workspace/symbol results)
+}
+
+/// Parse a location-shaped response: a single Location, Location[],
+/// LocationLink[], or SymbolInformation[]/WorkspaceSymbol[]. Null → empty.
+pub fn parse_locations(r: &Value) -> Vec<LspLocation> {
+    fn one(v: &Value) -> Option<LspLocation> {
+        // SymbolInformation / WorkspaceSymbol: { name, location: {uri, range} }.
+        if let Some(loc) = v.get("location") {
+            let mut l = one(loc)?;
+            l.name = v.get("name").and_then(|n| n.as_str()).map(String::from);
+            return Some(l);
+        }
+        // LocationLink: prefer the precise selection range.
+        let (uri, range) = if let Some(u) = v.get("targetUri") {
+            (u, v.get("targetSelectionRange").or(v.get("targetRange")))
+        } else {
+            (v.get("uri")?, v.get("range"))
+        };
+        let start = range?.get("start")?;
+        Some(LspLocation {
+            uri: uri.as_str()?.to_string(),
+            line: start.get("line")?.as_u64()? as u32,
+            character: start.get("character").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
+            name: None,
+        })
+    }
+    match r {
+        Value::Array(a) => a.iter().filter_map(one).collect(),
+        Value::Object(_) => one(r).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Shape check for location-flavored responses (vs completion lists, which are
+/// also arrays): single Location object, null, or an array whose first element
+/// carries `uri` / `targetUri` / `location`.
+fn looks_like_locations(r: &Value) -> bool {
+    match r {
+        Value::Null => true,
+        Value::Object(_) => r.get("uri").is_some() && r.get("range").is_some(),
+        Value::Array(a) => match a.first() {
+            None => false, // ambiguous — let completion take empty arrays
+            Some(e) => {
+                e.get("uri").is_some() || e.get("targetUri").is_some() || e.get("location").is_some()
+            }
+        },
+        _ => false,
+    }
+}
+
 pub struct ServerSpec {
     pub name: &'static str,
     pub languages: &'static [&'static str],
@@ -603,6 +696,45 @@ impl LspClient {
         id
     }
 
+    /// Fire a position-based request (`textDocument/definition` family). The
+    /// references flavor adds its required `context` param.
+    pub fn request_at(&mut self, kind: LocKind, uri: &str, line: u32, character: u32) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+        if kind == LocKind::References {
+            params["context"] = json!({ "includeDeclaration": true });
+        }
+        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": kind.method(), "params": params });
+        if self.initialized {
+            self.send_raw(msg);
+        } else {
+            self.pending.push(msg);
+        }
+        id
+    }
+
+    /// Fire a `workspace/symbol` query.
+    pub fn request_symbols(&mut self, query: &str) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "workspace/symbol",
+            "params": { "query": query }
+        });
+        if self.initialized {
+            self.send_raw(msg);
+        } else {
+            self.pending.push(msg);
+        }
+        id
+    }
+
     pub fn shutdown(&mut self) {
         let id = self.next_id;
         self.next_id += 1;
@@ -622,6 +754,7 @@ pub struct LspManager {
     sem_pending: std::collections::HashMap<i64, String>,  // semantic-tokens request id → uri
     sem_legend: Vec<String>,                              // semantic token-type names
     comp_pending: Option<i64>,                            // latest completion request id
+    loc_pending: std::collections::HashMap<i64, LocKind>, // navigation request id → flavor
 }
 
 impl LspManager {
@@ -675,6 +808,51 @@ impl LspManager {
     /// True if `id` is the newest completion request (drop superseded responses).
     pub fn is_current_completion(&self, id: i64) -> bool {
         self.comp_pending == Some(id)
+    }
+
+    /// Fire a Go-to / references request on whatever running server serves `lang`.
+    /// Returns false when no server is up for the language.
+    pub fn request_locations(&mut self, lang: &str, uri: &str, line: u32, character: u32, kind: LocKind) -> bool {
+        let Some(name) = registry()
+            .iter()
+            .find(|s| s.languages.contains(&lang) && self.clients.iter().any(|c| c.server == s.name))
+            .map(|s| s.name)
+        else {
+            return false;
+        };
+        if let Some(c) = self.client_mut(name) {
+            let id = c.request_at(kind, uri, line, character);
+            self.loc_pending.insert(id, kind);
+            return true;
+        }
+        false
+    }
+
+    /// Fire a workspace-symbol query, preferring the server for `lang` but falling
+    /// back to any running client (the palette's `#` mode works without a focused
+    /// doc of that language).
+    pub fn request_workspace_symbols(&mut self, lang: Option<&str>, query: &str) -> bool {
+        let preferred = lang.and_then(|l| {
+            registry()
+                .iter()
+                .find(|s| s.languages.contains(&l) && self.clients.iter().any(|c| c.server == s.name))
+                .map(|s| s.name)
+        });
+        let Some(client) = (match preferred {
+            Some(name) => self.client_mut(name),
+            None => self.clients.first_mut(),
+        }) else {
+            return false;
+        };
+        let id = client.request_symbols(query);
+        self.loc_pending.insert(id, LocKind::WorkspaceSymbol);
+        true
+    }
+
+    /// Resolve a location-shaped response to the request flavor it answers (None ⇒
+    /// not ours / superseded).
+    pub fn take_locations(&mut self, id: i64) -> Option<LocKind> {
+        self.loc_pending.remove(&id)
     }
 
     /// The running server name that serves `lang` with completion, if any.
@@ -1051,6 +1229,13 @@ fn handle_server_message(server: &'static str, msg: &Value, reply_tx: &Sender<Ve
                         .map(|a| a.iter().filter_map(|n| n.as_u64().map(|x| x as u32)).collect())
                         .unwrap_or_default();
                     let _ = tx.send(WorkerMsg::LspSemanticTokens { id: id.as_i64().unwrap_or(0), data });
+                } else if looks_like_locations(r) {
+                    // Location / LocationLink / SymbolInformation results (or null —
+                    // "no definition found"). Routed by id on the main thread; empty
+                    // arrays also land here and are dropped by whoever doesn't own
+                    // the id.
+                    let locs = parse_locations(r);
+                    let _ = tx.send(WorkerMsg::LspLocations { id: id.as_i64().unwrap_or(0), locs });
                 } else if r.is_array() || r.get("isIncomplete").is_some() {
                     // Completion: a bare CompletionItem[] or a CompletionList. Checked
                     // before the diagnostic branch since both carry an `items` array.
