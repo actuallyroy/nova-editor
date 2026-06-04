@@ -41,6 +41,8 @@ pub struct Theme {
     pub selection: [f32; 4],
     pub line_highlight: [f32; 4],
     pub find_match: [f32; 4],
+    pub bracket_match_bg: [f32; 4],     // fill behind a matched bracket pair
+    pub bracket_match_border: [f32; 4], // 1px box around each bracket of the pair
     pub activity_bar_bg: [f32; 4],
     pub activity_bar_active: [f32; 4],
     pub activity_active_border: [f32; 4], // accent stripe on the active view's icon
@@ -119,6 +121,9 @@ impl Theme {
             selection: [0.43, 0.55, 1.0, 0.22],
             line_highlight: [1.0, 1.0, 1.0, 0.035],
             find_match: [0.85, 0.62, 0.20, 0.40],
+            // VSCode Dark+ editorBracketMatch: faint green fill, grey box.
+            bracket_match_bg: [0.0, 0.39, 0.0, 0.10],
+            bracket_match_border: [0.53, 0.53, 0.53, 1.0],
             activity_bar_bg: [0.075, 0.082, 0.106, 1.0],
             activity_bar_active: [1.0, 1.0, 1.0, 0.07],
             activity_active_border: [0.43, 0.55, 1.0, 1.0],
@@ -383,6 +388,8 @@ pub fn load_vscode(path: &std::path::Path) -> Option<Theme> {
         quad(&["editor.selectionBackground"], &mut t.selection);
         quad(&["editor.lineHighlightBackground"], &mut t.line_highlight);
         quad(&["editor.findMatchHighlightBackground", "editor.findMatchBackground"], &mut t.find_match);
+        quad(&["editorBracketMatch.background"], &mut t.bracket_match_bg);
+        quad(&["editorBracketMatch.border"], &mut t.bracket_match_border);
         quad(&["editorCursor.foreground", "editor.foreground"], &mut t.cursor);
         quad(&["scrollbarSlider.background"], &mut t.scrollbar_thumb);
         quad(&["scrollbarSlider.hoverBackground"], &mut t.scrollbar_thumb_hover);
@@ -514,6 +521,8 @@ pub fn SCROLLBAR_THUMB_HOVER() -> [f32; 4] { current().read().unwrap().scrollbar
 pub fn SELECTION() -> [f32; 4] { current().read().unwrap().selection }
 pub fn LINE_HIGHLIGHT() -> [f32; 4] { current().read().unwrap().line_highlight }
 pub fn FIND_MATCH() -> [f32; 4] { current().read().unwrap().find_match }
+pub fn BRACKET_MATCH_BG() -> [f32; 4] { current().read().unwrap().bracket_match_bg }
+pub fn BRACKET_MATCH_BORDER() -> [f32; 4] { current().read().unwrap().bracket_match_border }
 pub fn ACTIVITY_BAR_BG() -> [f32; 4] { current().read().unwrap().activity_bar_bg }
 pub fn ACTIVITY_BAR_ACTIVE() -> [f32; 4] { current().read().unwrap().activity_bar_active }
 pub fn ACTIVITY_ACTIVE_BORDER() -> [f32; 4] { current().read().unwrap().activity_active_border }

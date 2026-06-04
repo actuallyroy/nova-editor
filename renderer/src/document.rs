@@ -90,6 +90,9 @@ pub struct Document {
     hl_dirty_from: usize,                // lowest line changed since the last highlight (usize::MAX = none)
     semantic: Vec<(usize, usize, Color)>, // Layer-2 LSP semantic tokens (byte range → color)
     expand_stack: Vec<(usize, usize)>, // prior ranges for Expand/Shrink Selection
+    // Matching-bracket highlight memo: (caret, version) → pair. Cell because the
+    // render loop only holds &Document; the scan reruns only when the key changes.
+    bracket_hl_cache: std::cell::Cell<Option<(usize, i32, Option<(usize, usize)>)>>,
     pub info: Option<crate::ui::info_page::InfoPage>, // Some ⇒ designed info page (Welcome / Tips / Shortcuts)
     /// Large-file mode: only a sliding window of lines is shaped into `buffer`
     /// (shaping a 450k-line file whole takes ~50s). Highlighting, LSP, folding and
@@ -333,6 +336,7 @@ impl Document {
             hl_dirty_from: usize::MAX,
             semantic: Vec::new(),
             expand_stack: Vec::new(),
+            bracket_hl_cache: std::cell::Cell::new(None),
             info: None,
             large,
             buf_first: 0,
@@ -406,6 +410,7 @@ impl Document {
             hl_dirty_from: usize::MAX,
             semantic: Vec::new(),
             expand_stack: Vec::new(),
+            bracket_hl_cache: std::cell::Cell::new(None),
             info: None,
             large: false,
             buf_first: 0,
@@ -495,6 +500,7 @@ impl Document {
             hl_dirty_from: usize::MAX,
             semantic: Vec::new(),
             expand_stack: Vec::new(),
+            bracket_hl_cache: std::cell::Cell::new(None),
             info: None,
             large: false,
             buf_first: 0,
@@ -2180,62 +2186,88 @@ impl Document {
         }
     }
 
-    /// Jump to the bracket matching the one at/under the caret; if the caret isn't
-    /// on a bracket, jump to the close of the nearest enclosing pair (VSCode).
-    pub fn goto_bracket(&mut self) {
+    /// The bracket at/just beside `head` (the char after the caret, else the char
+    /// before — VSCode's adjacency rule) plus its match, as byte offsets
+    /// (bracket_at_caret, matching_bracket). Shared by Go to Bracket and the
+    /// matching-pair highlight. Naive scan (ignores brackets inside strings).
+    pub fn bracket_pair_at(&self, head: usize) -> Option<(usize, usize)> {
         let pairs: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}')];
-        let head = self.sel.head.min(self.rope.len_bytes());
+        let head = head.min(self.rope.len_bytes());
         let hc = self.rope.byte_to_char(head);
         let total = self.rope.len_chars();
-        // The bracket "at" the caret: the char after it, else the char before.
         let cand = [(hc, false), (hc.saturating_sub(1), true)];
         for (ci, before) in cand {
             if ci >= total || (before && hc == 0) {
                 continue;
             }
             let c = self.rope.char(ci);
-            if let Some((pi, is_open)) = pairs
-                .iter()
-                .enumerate()
-                .find_map(|(i, (o, cl))| {
-                    (c == *o).then_some((i, true)).or((c == *cl).then_some((i, false)))
-                })
-            {
-                let (o, cl) = pairs[pi];
-                let mut d = 0i32;
-                if is_open {
-                    let mut j = ci;
-                    while j + 1 < total {
-                        j += 1;
-                        let ch = self.rope.char(j);
-                        if ch == o {
-                            d += 1;
-                        } else if ch == cl {
-                            if d == 0 {
-                                self.place(self.rope.char_to_byte(j), false);
-                                return;
-                            }
-                            d -= 1;
+            let Some((pi, is_open)) = pairs.iter().enumerate().find_map(|(i, (o, cl))| {
+                (c == *o).then_some((i, true)).or((c == *cl).then_some((i, false)))
+            }) else {
+                continue;
+            };
+            let (o, cl) = pairs[pi];
+            let mut d = 0i32;
+            if is_open {
+                let mut j = ci;
+                while j + 1 < total {
+                    j += 1;
+                    let ch = self.rope.char(j);
+                    if ch == o {
+                        d += 1;
+                    } else if ch == cl {
+                        if d == 0 {
+                            return Some((self.rope.char_to_byte(ci), self.rope.char_to_byte(j)));
                         }
-                    }
-                } else {
-                    let mut j = ci;
-                    while j > 0 {
-                        j -= 1;
-                        let ch = self.rope.char(j);
-                        if ch == cl {
-                            d += 1;
-                        } else if ch == o {
-                            if d == 0 {
-                                self.place(self.rope.char_to_byte(j), false);
-                                return;
-                            }
-                            d -= 1;
-                        }
+                        d -= 1;
                     }
                 }
-                return;
+            } else {
+                let mut j = ci;
+                while j > 0 {
+                    j -= 1;
+                    let ch = self.rope.char(j);
+                    if ch == cl {
+                        d += 1;
+                    } else if ch == o {
+                        if d == 0 {
+                            return Some((self.rope.char_to_byte(ci), self.rope.char_to_byte(j)));
+                        }
+                        d -= 1;
+                    }
+                }
             }
+            return None; // on a bracket but unmatched — nothing to pair with
+        }
+        None
+    }
+
+    /// Matching-bracket pair to highlight for the current caret (None while a
+    /// selection is active or the caret isn't beside a bracket). Cached per
+    /// (caret, version) — the render loop asks every frame but the scan should
+    /// only run when the caret actually moved or the text changed.
+    pub fn bracket_highlight(&self) -> Option<(usize, usize)> {
+        if !self.sel.is_empty() {
+            return None;
+        }
+        let head = self.sel.head.min(self.rope.len_bytes());
+        if let Some((h, v, r)) = self.bracket_hl_cache.get() {
+            if h == head && v == self.version {
+                return r;
+            }
+        }
+        let r = self.bracket_pair_at(head);
+        self.bracket_hl_cache.set(Some((head, self.version, r)));
+        r
+    }
+
+    /// Jump to the bracket matching the one at/under the caret; if the caret isn't
+    /// on a bracket, jump to the close of the nearest enclosing pair (VSCode).
+    pub fn goto_bracket(&mut self) {
+        let head = self.sel.head.min(self.rope.len_bytes());
+        if let Some((_, m)) = self.bracket_pair_at(head) {
+            self.place(m, false);
+            return;
         }
         if let Some((_, cb)) = self.enclosing_bracket(head, head) {
             self.place(cb, false);
@@ -2485,6 +2517,37 @@ mod tests {
         d.place(7, false);
         d.goto_bracket();
         assert_eq!(d.sel.head, 13);
+    }
+
+    #[test]
+    fn bracket_pair_highlight() {
+        let mut fs = glyphon::FontSystem::new();
+        //                   0123456789012345 6
+        let mut d = doc("fn f(aa, (bb)) {}", &mut fs);
+        // Caret before "(" of f(...): pair is (4, 13).
+        d.place(4, false);
+        assert_eq!(d.bracket_highlight(), Some((4, 13)));
+        // Caret just AFTER ")" — the char-before rule still pairs it.
+        d.place(14, false);
+        assert_eq!(d.bracket_highlight(), Some((13, 4)));
+        // Inner pair wins when the caret is beside it.
+        d.place(9, false);
+        assert_eq!(d.bracket_highlight(), Some((9, 12)));
+        // Not beside any bracket → no highlight.
+        d.place(7, false);
+        assert_eq!(d.bracket_highlight(), None);
+        // A selection suppresses the highlight.
+        d.place(4, false);
+        d.place(5, true);
+        assert_eq!(d.bracket_highlight(), None);
+        // The cache invalidates on edit: deleting ")" unmatches the "(".
+        let mut d2 = doc("(x)", &mut fs);
+        d2.place(0, false);
+        assert_eq!(d2.bracket_highlight(), Some((0, 2)));
+        d2.place(3, false);
+        d2.backspace(&mut fs); // "(x"
+        d2.place(0, false);
+        assert_eq!(d2.bracket_highlight(), None);
     }
 
     // Diagnostic timing for huge files (run with --ignored --nocapture). Mirrors a

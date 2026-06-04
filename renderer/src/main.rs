@@ -5281,13 +5281,22 @@ impl App {
                     self.redraw();
                     return;
                 }
-                // Paste: Ctrl/Cmd+V (and Ctrl+Shift+V) sends the clipboard to the shell
-                // as input — newlines become CR, like pressing Enter.
+                // Paste: Cmd+V on macOS, Ctrl(+Shift)+V elsewhere — sends the clipboard
+                // to the shell as input (newlines become CR, like pressing Enter).
+                // On macOS plain Ctrl+V is deliberately NOT paste: it falls through to
+                // the shell as a literal ^V (0x16), which TUIs that read the clipboard
+                // themselves bind — claude code's Ctrl+V image paste — matching
+                // Terminal.app/iTerm behavior (#39).
                 let is_v = matches!(
                     event.physical_key,
                     winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV)
                 );
-                if ctrl && is_v {
+                let paste_mod = if cfg!(target_os = "macos") {
+                    self.mods.super_key()
+                } else {
+                    self.mods.control_key()
+                };
+                if paste_mod && is_v {
                     if let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
                         self.terminal.clear_focused_selection();
                         self.terminal.paste_focused(&text);

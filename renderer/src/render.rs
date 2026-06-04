@@ -1079,6 +1079,39 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
+        // Matching-bracket highlight (VSCode editorBracketMatch): when the caret
+        // sits beside a bracket, box both that bracket and its match — faint fill
+        // plus a 1px outline. Skipped in diffs/read-only views (no caret there).
+        if d.diff.is_none() && !d.read_only {
+            if let Some((a, b)) = d.bracket_highlight() {
+                for pos in [a, b] {
+                    let line = d.rope.byte_to_line(pos.min(d.rope.len_bytes()));
+                    if d.is_line_hidden(line) {
+                        continue;
+                    }
+                    let col = pos - d.rope.line_to_byte(line);
+                    for run in d.buffer.layout_runs() {
+                        if run.line_i != line {
+                            continue;
+                        }
+                        let (xs, xe) = x_range_in_run(&run, col, col + 1);
+                        let w = (xe - xs).max(2.0);
+                        let by = layout.editor_text.y + theme::EDITOR_PAD() + run.line_top - d.scroll_y() - foff(line);
+                        let bx = layout.editor_text.x + theme::EDITOR_PAD() + xs - d.scroll_x();
+                        if let Some((qy, qh)) = clip_v(by, run.line_height) {
+                            let bw = 1.0_f32.max(theme::ui_zoom().floor());
+                            let bc = theme::BRACKET_MATCH_BORDER();
+                            bg_quads.push(Quad::new(bx, qy, w, qh, theme::BRACKET_MATCH_BG()));
+                            bg_quads.push(Quad::new(bx, qy, w, bw, bc));
+                            bg_quads.push(Quad::new(bx, qy + qh - bw, w, bw, bc));
+                            bg_quads.push(Quad::new(bx, qy + bw, bw, qh - 2.0 * bw, bc));
+                            bg_quads.push(Quad::new(bx + w - bw, qy + bw, bw, qh - 2.0 * bw, bc));
+                        }
+                    }
+                }
+            }
+        }
+
         // Diagnostic underlines (LSP). One ~2px bar at the bottom of each covered
         // visual row, colored by severity — reuses the selection byte→x mapping.
         if !d.diagnostics.is_empty() {
@@ -1193,6 +1226,22 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let w = if current { track.w } else { track.w - inset * 2.0 };
                 let x = if current { track.x } else { track.x + inset };
                 fg_quads.push(Quad::new(x, y, w, mh, color));
+            }
+        }
+        // Matching-bracket ticks on the same track (VSCode's
+        // editorOverviewRuler.bracketMatchForeground) — one per end of the pair,
+        // so an off-screen match is still locatable at a glance.
+        if !modal_open && d.diff.is_none() && !d.read_only {
+            if let Some((a, b)) = d.bracket_highlight() {
+                let track = d.scroll.vtrack_rect();
+                let total = d.rope.len_lines().max(1) as f32;
+                let mh = theme::zpx(2.0).max(1.0);
+                let inset = theme::zpx(1.0);
+                for pos in [a, b] {
+                    let line = d.rope.byte_to_line(pos.min(d.rope.len_bytes())) as f32;
+                    let y = track.y + (line / total) * track.h - mh * 0.5;
+                    fg_quads.push(Quad::new(track.x + inset, y, track.w - inset * 2.0, mh, theme::BRACKET_MATCH_BORDER()));
+                }
             }
         }
     }
