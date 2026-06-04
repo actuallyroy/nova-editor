@@ -165,6 +165,11 @@ pub struct Grid {
     // renderer (Ink/claude code) that moves the cursor after filling the last column
     // doesn't trigger a spurious newline/scroll that floods the scrollback.
     wrap_pending: bool,
+    /// Replies owed to the application (DSR cursor-position reports, DA). The
+    /// parser can't write to the pty, so they queue here and `Terminal::feed`
+    /// flushes them after each chunk. Apps that query and never hear back
+    /// (zle, inline TUIs measuring their viewport) mis-position their redraws.
+    replies: Vec<u8>,
 }
 
 const MAX_SCROLLBACK: usize = 5000;
@@ -192,6 +197,7 @@ impl Grid {
             sgr_mouse: false,
             bracketed_paste: false,
             wrap_pending: false,
+            replies: Vec::new(),
         }
     }
 
@@ -541,9 +547,19 @@ impl Perform for Grid {
             }
             return;
         }
+        // Sequences with private markers / intermediates (`ESC[<u` kitty keyboard
+        // pop, `ESC[>4m` modifyOtherKeys, `ESC[!p` soft reset, …) are NOT the
+        // ANSI sequences their final byte suggests. Dispatching them as such
+        // teleports the cursor: claude code's exit emits `ESC[<u`, which read as
+        // plain `CSI u` (restore cursor) jumped to a stale saved position and
+        // left the cursor a row above the next shell prompt. None of the forms
+        // we implement use intermediates, so: not ours — ignore.
+        if !inter.is_empty() {
+            return;
+        }
         // Any explicit cursor positioning disarms a deferred autowrap (so a renderer
         // that fills the last column then repositions doesn't wrap spuriously).
-        if matches!(action, 'H' | 'f' | 'A' | 'B' | 'C' | 'D' | 'G' | 'd' | 'r' | 'u') {
+        if matches!(action, 'H' | 'f' | 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'd' | 'r' | 'u') {
             self.wrap_pending = false;
         }
         match action {
@@ -555,10 +571,49 @@ impl Perform for Grid {
                 self.cur_row = (r - 1).min(self.rows - 1);
                 self.cur_col = (c - 1).min(self.cols - 1);
             }
-            'A' => self.cur_row = self.cur_row.saturating_sub(n),
-            'B' => self.cur_row = (self.cur_row + n).min(self.rows - 1),
+            // CUU/CUD stop at the scroll-region margins when the cursor starts
+            // inside the region (DECSTBM semantics) — clamping at the screen edge
+            // instead lets a TUI's relative redraw escape its protected viewport
+            // and paint over rows it believes are out of reach.
+            'A' => {
+                let top = if self.cur_row >= self.scroll_top { self.scroll_top } else { 0 };
+                self.cur_row = self.cur_row.saturating_sub(n).max(top);
+            }
+            'B' => {
+                let bot = if self.cur_row <= self.scroll_bottom { self.scroll_bottom } else { self.rows - 1 };
+                self.cur_row = (self.cur_row + n).min(bot);
+            }
             'C' => self.cur_col = (self.cur_col + n).min(self.cols - 1),
             'D' => self.cur_col = self.cur_col.saturating_sub(n),
+            'E' => {
+                // CNL: down n lines, column 0 (region-clamped like CUD).
+                let bot = if self.cur_row <= self.scroll_bottom { self.scroll_bottom } else { self.rows - 1 };
+                self.cur_row = (self.cur_row + n).min(bot);
+                self.cur_col = 0;
+            }
+            'F' => {
+                // CPL: up n lines, column 0 (region-clamped like CUU).
+                let top = if self.cur_row >= self.scroll_top { self.scroll_top } else { 0 };
+                self.cur_row = self.cur_row.saturating_sub(n).max(top);
+                self.cur_col = 0;
+            }
+            'n' => {
+                // DSR: the app is asking — silence breaks zle's and inline TUIs'
+                // position math, which then mis-aim their relative redraws.
+                match p1 {
+                    6 => {
+                        // CPR: cursor position, 1-based.
+                        let s = format!("\x1b[{};{}R", self.cur_row + 1, self.cur_col + 1);
+                        self.replies.extend_from_slice(s.as_bytes());
+                    }
+                    5 => self.replies.extend_from_slice(b"\x1b[0n"), // "operating"
+                    _ => {}
+                }
+            }
+            'c' => {
+                // DA1: identify as a VT220-class terminal.
+                self.replies.extend_from_slice(b"\x1b[?62;22c");
+            }
             'G' => self.cur_col = (n - 1).min(self.cols - 1),
             'd' => self.cur_row = (n - 1).min(self.rows - 1),
             'J' => self.erase_in_display(p1),
@@ -721,6 +776,14 @@ impl Terminal {
     pub fn feed(&mut self, data: &[u8]) {
         for &b in data {
             self.parser.advance(&mut self.grid, b);
+        }
+        // Send any replies the stream provoked (DSR cursor reports, DA) back to
+        // the application — but NEVER for a re-attach backlog replay: those
+        // queries are from the PAST and already answered (or their asker is
+        // gone); late replies would land in the live shell as garbage input.
+        let replies = std::mem::take(&mut self.grid.replies);
+        if !replies.is_empty() && !self.pending_backlog {
+            self.write(&replies);
         }
     }
 
@@ -964,4 +1027,101 @@ pub(crate) fn translate_terminal_key(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed raw VT bytes through a fresh parser+grid (like Terminal::feed).
+    fn feed(grid: &mut Grid, parser: &mut Parser, data: &[u8]) {
+        for &b in data {
+            parser.advance(grid, b);
+        }
+    }
+
+    fn row_text(grid: &Grid, r: usize) -> String {
+        grid.cells[r].iter().map(|c| c.ch).collect::<String>().trim_end().to_string()
+    }
+
+    // Regression for "cursor shifted to the upper line after Ctrl+C closed claude":
+    // a REAL captured session (zsh -f → claude → 2× Ctrl+C → prompt, 120x30 pty).
+    // After the dust settles, the cursor must sit on the same row as the final
+    // shell prompt, right after "% ". The original bug: claude's exit cleanup
+    // emits ESC[<u (kitty keyboard pop), which the grid misread as plain CSI u
+    // (ANSI restore-cursor) and teleported the cursor to a stale position.
+    #[test]
+    fn claude_exit_leaves_cursor_on_prompt_row() {
+        let data = include_bytes!("fixtures_claude_session.bin");
+        let mut grid = Grid::new(30, 120);
+        let mut parser = Parser::new();
+        feed(&mut grid, &mut parser, data);
+        // The last grid row containing the zsh prompt.
+        let prompt_row = (0..grid.rows)
+            .rev()
+            .find(|&r| row_text(&grid, r).contains("macs-MacBook-Pro%"))
+            .expect("prompt visible after exit");
+        assert_eq!(
+            grid.cur_row, prompt_row,
+            "cursor row {} != prompt row {} (rows around:\n  {}\n  {}\n)",
+            grid.cur_row,
+            prompt_row,
+            row_text(&grid, prompt_row.saturating_sub(1)),
+            row_text(&grid, prompt_row),
+        );
+        // Column right after "macs-MacBook-Pro% ".
+        let line = row_text(&grid, prompt_row);
+        let expect_col = line.len() + 1; // trailing space after '%'
+        assert_eq!(grid.cur_col, expect_col, "cursor col after the prompt");
+    }
+
+    // ESC[<u / ESC[>4m etc. carry private markers and are NOT the ANSI sequences
+    // their final byte suggests — they must be ignored, not dispatched.
+    #[test]
+    fn private_marker_csi_sequences_are_ignored() {
+        let mut grid = Grid::new(10, 40);
+        let mut parser = Parser::new();
+        feed(&mut grid, &mut parser, b"hello\r\nworld");
+        let (row, col) = (grid.cur_row, grid.cur_col);
+        // Save a stale position, move on, then hit the kitty pop: must NOT restore.
+        feed(&mut grid, &mut parser, b"\x1b[s");
+        feed(&mut grid, &mut parser, b"\r\nthird line here");
+        let here = (grid.cur_row, grid.cur_col);
+        assert_ne!(here, (row, col));
+        feed(&mut grid, &mut parser, b"\x1b[<u");
+        assert_eq!((grid.cur_row, grid.cur_col), here, "ESC[<u must not move the cursor");
+        // modifyOtherKeys reset must not leak into SGR.
+        feed(&mut grid, &mut parser, b"\x1b[>4m");
+        assert_eq!((grid.cur_row, grid.cur_col), here);
+    }
+
+    // DSR 6n must queue a cursor-position report (zle and inline TUIs block on
+    // it / mis-measure without one); DA1 identifies the terminal.
+    #[test]
+    fn dsr_and_da_queue_replies() {
+        let mut grid = Grid::new(10, 40);
+        let mut parser = Parser::new();
+        feed(&mut grid, &mut parser, b"ab\r\ncd");
+        feed(&mut grid, &mut parser, b"\x1b[6n");
+        assert_eq!(std::mem::take(&mut grid.replies), b"\x1b[2;3R".to_vec());
+        feed(&mut grid, &mut parser, b"\x1b[c");
+        assert!(grid.replies.starts_with(b"\x1b[?"));
+    }
+
+    // CUU/CUD clamp at the scroll-region margins while the cursor is inside the
+    // region (DECSTBM), not at the screen edges.
+    #[test]
+    fn cursor_moves_clamp_to_scroll_region() {
+        let mut grid = Grid::new(10, 40);
+        let mut parser = Parser::new();
+        feed(&mut grid, &mut parser, b"\x1b[3;7r"); // region rows 2..=6 (0-based)
+        feed(&mut grid, &mut parser, b"\x1b[5;1H"); // inside the region (row 4)
+        feed(&mut grid, &mut parser, b"\x1b[99A"); // up beyond the top margin
+        assert_eq!(grid.cur_row, 2, "CUU stops at the region top");
+        feed(&mut grid, &mut parser, b"\x1b[99B"); // down beyond the bottom margin
+        assert_eq!(grid.cur_row, 6, "CUD stops at the region bottom");
+        // Outside the region the screen edges still apply.
+        feed(&mut grid, &mut parser, b"\x1b[9;1H\x1b[99B");
+        assert_eq!(grid.cur_row, 9);
+    }
 }
