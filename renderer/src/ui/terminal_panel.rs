@@ -36,6 +36,9 @@ pub struct TerminalPanel {
     /// spawning the daemon if needed). The daemon owns the shells so they survive a
     /// GUI restart.
     client: Option<Client>,
+    /// A pending plain click in a pane's content: if it releases without becoming a
+    /// drag-selection, the shell cursor walks to the clicked column (arrow keys).
+    click_cell: Option<(usize, usize)>,
     /// Local tags for shells whose `Created` reply hasn't arrived yet (FIFO; the
     /// daemon replies in request order on one connection).
     pending: VecDeque<u64>,
@@ -64,6 +67,7 @@ impl TerminalPanel {
             maximized: false,
             cwd,
             client: None,
+            click_cell: None,
             pending: VecDeque::new(),
             next_tag: 1,
             focus_requested: false,
@@ -205,6 +209,36 @@ impl TerminalPanel {
         self.cwd = cwd;
         if let Some(c) = self.client.as_ref() {
             c.set_workspace(&self.cwd.to_string_lossy());
+        }
+    }
+
+    /// Paste text into the focused shell: CRLF/LF → CR, and wrapped in bracketed-
+    /// paste markers when the running app enabled mode 2004 (without the wrap, a
+    /// multi-line paste into a TUI like claude code submits line by line).
+    pub fn paste_focused(&mut self, text: &str) {
+        let norm = text.replace("\r\n", "\n").replace('\n', "\r");
+        if let Some(g) = self.groups.get_mut(self.active) {
+            if let Some(p) = g.panes.get_mut(g.focused) {
+                if p.term.bracketed_paste() {
+                    let mut b = b"\x1b[200~".to_vec();
+                    b.extend_from_slice(norm.as_bytes());
+                    b.extend_from_slice(b"\x1b[201~");
+                    p.term.write(&b);
+                } else {
+                    p.term.write(norm.as_bytes());
+                }
+                p.scroll.scroll_to_end();
+                p.dirty = true;
+            }
+        }
+    }
+
+    /// Send raw bytes to the focused pane's shell (e.g. a dropped file's path).
+    pub fn write_focused(&mut self, bytes: &[u8]) {
+        if let Some(g) = self.groups.get_mut(self.active) {
+            if let Some(p) = g.panes.get_mut(g.focused) {
+                p.term.write(bytes);
+            }
         }
     }
 
@@ -487,6 +521,7 @@ impl TerminalPanel {
                             _ => {
                                 pane.sel = Some(((line, col), (line, col)));
                                 pane.sel_dragging = true;
+                                self.click_cell = Some((line, col));
                             }
                         }
                         pane.dirty = true;
@@ -570,6 +605,30 @@ impl TerminalPanel {
 
     /// End any in-progress selection drag; drop a zero-width selection (plain click).
     pub fn selection_release(&mut self) {
+        // A plain click (released without dragging a selection) walks the shell
+        // cursor to the clicked column with arrow keys — only at a normal prompt
+        // (not in a full-screen app) and only on the row the cursor is on.
+        if let Some((line, col)) = self.click_cell.take() {
+            if let Some(g) = self.groups.get_mut(self.active) {
+                if let Some(p) = g.panes.get_mut(g.focused) {
+                    let no_drag = p.sel.map_or(true, |(a, b)| a == b);
+                    if no_drag && !p.term.is_alt() {
+                        let (cur_col, cur_row) = p.term.cursor();
+                        let (_, rows) = p.term.dims();
+                        let cursor_line = p.term.total_lines().saturating_sub(rows) + cur_row;
+                        if line == cursor_line {
+                            let delta = col as i64 - cur_col as i64;
+                            let one: &[u8] = if delta > 0 { b"\x1b[C" } else { b"\x1b[D" };
+                            let n = delta.unsigned_abs().min(512) as usize;
+                            if n > 0 {
+                                let bytes: Vec<u8> = one.iter().copied().cycle().take(one.len() * n).collect();
+                                p.term.write(&bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for g in &mut self.groups {
             for p in &mut g.panes {
                 if p.sel_dragging {

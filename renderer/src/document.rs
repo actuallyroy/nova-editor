@@ -514,7 +514,15 @@ impl Document {
     /// Buffer-local (x, y, height) of the caret. y is the top of the visual row the
     /// caret is on; x is the offset within that row.
     pub fn caret_visual(&self) -> (f32, f32, f32) {
-        let (line, col_byte) = self.head_line_col();
+        self.byte_visual(self.sel.head)
+    }
+
+    /// Buffer-local (x, top, height) of an arbitrary byte offset (the caret math,
+    /// generalized — used e.g. for the drag-and-drop insertion caret).
+    pub fn byte_visual(&self, byte: usize) -> (f32, f32, f32) {
+        let byte = byte.min(self.rope.len_bytes());
+        let line = self.rope.byte_to_line(byte);
+        let col_byte = byte - self.rope.line_to_byte(line);
         let mut last_top = line as f32 * theme::LINE_HEIGHT();
         let mut last_h = theme::LINE_HEIGHT();
         let mut last_end_x = 0.0f32;
@@ -975,6 +983,30 @@ impl Document {
             EditOp::Insert(s.to_string()),
             head,
             Selection::caret(new_head),
+        );
+        self.reshape(fs);
+    }
+
+    /// Move the selected text to `target` (drag-and-drop). One undo step; the moved
+    /// text stays selected at its new home (VSCode behavior). No-op if `target` is
+    /// inside the selection.
+    pub fn move_selection_to(&mut self, target: usize, fs: &mut FontSystem) {
+        if self.read_only || self.sel.is_empty() {
+            return;
+        }
+        let (lo, hi) = self.sel.range();
+        if target >= lo && target <= hi {
+            return;
+        }
+        let text = self.rope.slice(self.rope.byte_to_char(lo)..self.rope.byte_to_char(hi)).to_string();
+        self.delete_selection_no_reshape();
+        self.force_join = true; // delete + insert = one undo group
+        let dest = if target > hi { target - (hi - lo) } else { target };
+        self.sel = Selection::caret(dest);
+        self.push_and_apply(
+            EditOp::Insert(text.clone()),
+            dest,
+            Selection { anchor: dest, head: dest + text.len(), desired_col: None },
         );
         self.reshape(fs);
     }

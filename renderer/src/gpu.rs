@@ -44,6 +44,7 @@ pub struct UiBuffers {
     pub zoom_minus: TextLabel, // status-bar window-zoom control
     pub zoom_plus: TextLabel,
     pub zoom_pct: TextLabel,
+    pub drag_ghost: TextLabel, // file name floating at the cursor during a tree drag
     pub palette_input: TextInput,
     pub palette_list: ListView,
     pub completion_list: ListView,
@@ -278,6 +279,7 @@ impl GpuState {
                 l
             },
             zoom_pct: TextLabel::new(&mut font_system, 52.0, theme::STATUS_BAR_HEIGHT()),
+            drag_ghost: TextLabel::new(&mut font_system, 320.0, theme::TREE_ROW_HEIGHT()),
             dialog: Dialog::new(&mut font_system),
             diag_hover: HoverCard::new(&mut font_system),
             ext_detail: ExtensionDetail::new(&mut font_system),

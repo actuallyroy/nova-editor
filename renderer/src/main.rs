@@ -43,7 +43,7 @@ mod ui;
 mod widgets;
 mod workspace;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -257,6 +257,21 @@ pub(crate) struct App {
     // request (id, prefix_start) so a stale response can't apply to a moved cursor.
     pub(crate) completion: completion::Completion,
     pub(crate) completion_req: Option<(i64, usize)>,
+    // Drag-and-drop state: explorer entry being dragged (path, press pos, past the
+    // activation threshold), the folder it would drop into, and a tab drag-reorder.
+    pub(crate) tree_drag: Option<(PathBuf, (f32, f32), bool)>,
+    pub(crate) tree_drop_target: Option<PathBuf>,
+    pub(crate) tab_drag: Option<(usize, (f32, f32), bool)>,
+    /// Caret byte to restore if the palette's symbol preview is dismissed (Esc).
+    pub(crate) palette_preview_return: Option<usize>,
+    /// Generation of the palette's in-flight `%` text search (offset far above the
+    /// Search panel's gens so streamed results route to the right consumer).
+    pub(crate) palette_search_gen: u64,
+    /// Line range (0-based, inclusive) tinted while previewing an `@` symbol — the
+    /// symbol's whole block (via the indentation fold range), not just its name.
+    pub(crate) palette_preview_region: Option<(usize, usize)>,
+    /// Last lone-Shift press, for the double-Shift palette shortcut.
+    pub(crate) last_shift: Option<Instant>,
     // Native macOS menu bar — kept alive here; map resolves a click to a MenuCmd.
     #[cfg(target_os = "macos")]
     pub(crate) macos_menu: Option<(muda::Menu, std::collections::HashMap<String, menus::MenuCmd>)>,
@@ -348,6 +363,13 @@ impl App {
             find_drag: None,
             completion: completion::Completion::default(),
             completion_req: None,
+            tree_drag: None,
+            tree_drop_target: None,
+            tab_drag: None,
+            palette_preview_return: None,
+            palette_search_gen: 1 << 32,
+            palette_preview_region: None,
+            last_shift: None,
             sel_matches: Vec::new(),
             sel_hl_text: String::new(),
             sel_hl_version: -1,
@@ -1063,14 +1085,7 @@ impl App {
                         }
                         self.terminal.clear_focused_selection();
                     } else if let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
-                        let norm = text.replace("\r\n", "\n").replace('\n', "\r");
-                        if let Some(g) = self.terminal.groups.get_mut(self.terminal.active) {
-                            if let Some(p) = g.panes.get_mut(g.focused) {
-                                p.term.write(norm.as_bytes());
-                                p.scroll.scroll_to_end();
-                                p.dirty = true;
-                            }
-                        }
+                        self.terminal.paste_focused(&text);
                     }
                     self.redraw();
                     return;
@@ -1903,6 +1918,46 @@ impl App {
         self.redraw();
     }
 
+    /// Live-preview the selected palette item: in `@` symbols mode the editor jumps
+    /// to each symbol as you move through the list (VSCode behavior); the original
+    /// position is restored if the palette is dismissed without committing.
+    fn palette_preview(&mut self) {
+        if self.palette.mode != commands::PaletteMode::Symbols {
+            return;
+        }
+        let Some((line, label)) = self
+            .palette
+            .selected_item()
+            .and_then(|it| it.line.map(|l| (l, it.label.clone())))
+        else {
+            return;
+        };
+        if self.palette_preview_return.is_none() {
+            self.palette_preview_return = self.workspace.active_doc().map(|d| d.caret_byte());
+        }
+        let _ = label;
+        self.goto_line(line);
+        // Highlight the REGION: the symbol's whole block (declaration line through the
+        // end of its indented body, via the fold engine), drawn as a tinted band.
+        if let Some(d) = self.workspace.active_doc() {
+            let l = line.saturating_sub(1).min(d.rope.len_lines().saturating_sub(1));
+            let end = d.fold_range(l).unwrap_or(l);
+            self.palette_preview_region = Some((l, end));
+        }
+    }
+
+    /// Undo a symbol preview (palette dismissed without committing).
+    fn palette_restore_preview(&mut self) {
+        self.palette_preview_region = None;
+        if let Some(byte) = self.palette_preview_return.take() {
+            if let Some(d) = self.workspace.active_doc_mut() {
+                let b = byte.min(d.rope.len_bytes());
+                d.place(b, false);
+            }
+            self.ensure_cursor_visible();
+        }
+    }
+
     /// Build the quick-pick item list of available color themes: the built-in plus
     /// every theme contributed by installed extensions. `only_ext` scopes it to one
     /// extension (the detail page's "Set Color Theme" button).
@@ -1958,7 +2013,10 @@ impl App {
     /// All files under the workspace root (skipping VCS/build dirs), as Files-mode
     /// items. `label` is the repo-relative path (filtered + opened on commit).
     fn build_file_items(&self) -> Vec<commands::PickItem> {
-        const SKIP: &[&str] = &[".git", "target", "node_modules", ".aether", "dist", "build", "out", ".next", ".venv"];
+        const SKIP: &[&str] = &[
+            ".git", "target", "node_modules", ".aether", "dist", "build", "out", ".next", ".venv",
+            "bin", "obj", "Pods", ".expo", "__pycache__", ".gradle", "DerivedData", "coverage",
+        ];
         let root = self.cwd.clone();
         let mut out = Vec::new();
         let mut stack = vec![root.clone()];
@@ -1974,7 +2032,9 @@ impl App {
                 } else {
                     let rel = p.strip_prefix(&root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
                     out.push(commands::PickItem::new(rel, ""));
-                    if out.len() >= 8000 {
+                    // Generous cap: a truncated index silently "loses" files from
+                    // search (rendering is separately capped at 500 matches).
+                    if out.len() >= 100_000 {
                         return out;
                     }
                 }
@@ -1998,6 +2058,7 @@ impl App {
     /// and center it.
     fn goto_line(&mut self, line: usize) {
         let target = line.saturating_sub(1);
+        let editor_h = self.layout().editor_text.h;
         if let Some(d) = self.workspace.active_doc_mut() {
             let l = target.min(d.rope.len_lines().saturating_sub(1));
             if d.is_line_hidden(l) {
@@ -2005,8 +2066,11 @@ impl App {
             }
             let byte = d.rope.line_to_byte(l);
             d.place(byte, false);
+            // Center the target (VSCode revealInCenter) — a minimal "keep visible"
+            // scroll leaves the destination hugging the bottom edge, out of view.
+            let y = l as f32 * theme::LINE_HEIGHT() - (editor_h - theme::LINE_HEIGHT()) * 0.5;
+            d.scroll.scroll_to_y(y.max(0.0));
         }
-        self.ensure_cursor_visible();
         self.redraw();
     }
 
@@ -2021,8 +2085,30 @@ impl App {
             Some('>') => (commands::PaletteMode::Commands, raw[1..].to_string()),
             Some('@') => (commands::PaletteMode::Symbols, raw.trim_start_matches(['@', ':']).to_string()),
             Some(':') => (commands::PaletteMode::GoToLine, raw[1..].to_string()),
+            Some('%') => (commands::PaletteMode::TextSearch, raw[1..].to_string()),
             _ => (commands::PaletteMode::Files, raw.clone()),
         };
+        // `%` text search: live results stream into the palette list itself.
+        if mode == commands::PaletteMode::TextSearch {
+            // Tolerate SQL-LIKE habits: %query% — the wrapping %s aren't part of it.
+            let q = sub.trim().trim_matches('%').trim().to_string();
+            if q.len() < 3 {
+                let hint = "Search in files… (type at least 3 characters)".to_string();
+                self.palette.set_source(mode, vec![commands::PickItem::new(hint, "")]);
+                return;
+            }
+            // New query → new generation; stale streams are dropped by the gen guard.
+            self.palette_search_gen += 1;
+            self.palette.set_source(mode, Vec::new());
+            crate::search::search_async(
+                self.worker_tx.clone(),
+                self.palette_search_gen,
+                self.cwd.clone(),
+                q,
+                crate::search::SearchOpts::default(),
+            );
+            return;
+        }
         // Go-to-line: show a single hint row reflecting the typed number.
         if mode == commands::PaletteMode::GoToLine {
             let total = self.workspace.active_doc().map_or(0, |d| d.rope.len_lines());
@@ -2047,6 +2133,7 @@ impl App {
                     self.palette.set_source(mode, items);
                 }
                 commands::PaletteMode::GoToLine => self.palette.set_source(mode, Vec::new()),
+                commands::PaletteMode::TextSearch => {} // handled by the early return above
                 commands::PaletteMode::QuickPick(_) => {}
             }
         }
@@ -2056,6 +2143,8 @@ impl App {
     /// Commit the current palette selection based on its mode. Returns true if the
     /// palette should close afterward.
     fn commit_palette(&mut self) -> bool {
+        self.palette_preview_return = None; // a commit keeps the navigated position
+        self.palette_preview_region = None;
         match self.palette.mode {
             commands::PaletteMode::Commands => {
                 if let Some(cmd) = self.palette.selected_command() {
@@ -2074,7 +2163,7 @@ impl App {
             commands::PaletteMode::Files => {
                 if let Some(rel) = self.palette.selected_item().map(|it| it.label.clone()) {
                     self.palette.close();
-                    let path = self.cwd.join(rel);
+                    let path = self.cwd.join(&rel);
                     self.open_file_at(path, 1, 0);
                 }
                 true
@@ -2083,6 +2172,20 @@ impl App {
                 if let Some(line) = self.palette.selected_item().and_then(|it| it.line) {
                     self.palette.close();
                     self.goto_line(line);
+                }
+                true
+            }
+            commands::PaletteMode::TextSearch => {
+                // Each row is one match: detail = workspace-relative path, line = hit.
+                if let Some((rel, line)) = self
+                    .palette
+                    .selected_item()
+                    .filter(|it| it.line.is_some())
+                    .map(|it| (it.detail.clone(), it.line.unwrap_or(1)))
+                {
+                    self.palette.close();
+                    let path = self.cwd.join(rel);
+                    self.open_file_at(path, line, 0);
                 }
                 true
             }
@@ -2981,7 +3084,9 @@ impl App {
 
         // Palette
         if let Some(pal) = layout.palette.as_ref() {
-            if !pal.box_.contains((x, y)) {
+            // The input is the title-bar pill now — clicking it keeps the palette open.
+            if !pal.box_.contains((x, y)) && !pal.input.contains((x, y)) {
+                self.palette_restore_preview();
                 self.palette.close();
                 self.redraw();
                 return;
@@ -3165,6 +3270,9 @@ impl App {
             });
             if let Some(idx) = row {
                 self.selected_tree = Some(idx);
+                // Arm a drag-to-move; it activates only past a movement threshold,
+                // so plain clicks behave exactly as before.
+                self.tree_drag = Some((self.workspace.tree.nodes[idx].path.clone(), (x, y), false));
                 let is_dir = self.workspace.tree.nodes[idx].is_dir;
                 if is_dir {
                     self.workspace.tree.toggle(idx);
@@ -3193,6 +3301,8 @@ impl App {
                 } else {
                     self.workspace.switch_to(idx);
                     self.detail.open_extension = None;
+                    // Arm a drag-reorder (activates past a horizontal threshold).
+                    self.tab_drag = Some((idx, (x, y), false));
                 }
                 self.redraw();
             }
@@ -3420,6 +3530,15 @@ impl App {
                 }
             }
         }
+        // Source Control scrollbar thumb drag.
+        if self.mouse_pressed {
+            if let Some(scp) = self.source_control.as_mut() {
+                if scp.scroll.is_dragging() && scp.scroll.drag((x, y)) {
+                    self.redraw();
+                    return;
+                }
+            }
+        }
         if self.sidebar_split.is_dragging() && self.mouse_pressed {
             if self.sidebar_split.drag(x, theme::ACTIVITY_BAR_WIDTH()) {
                 self.redraw();
@@ -3434,7 +3553,7 @@ impl App {
             }
             return;
         }
-        if self.editor.dragging && self.mouse_pressed {
+        if (self.editor.dragging || self.editor.text_move.is_some()) && self.mouse_pressed {
             let layout = self.layout();
             if let Some(d) = self.workspace.active_doc_mut() {
                 if self.editor.on_drag(d, &layout, x, y) {
@@ -3442,9 +3561,92 @@ impl App {
                 }
             }
         }
+        // Explorer drag-to-move: activate past a threshold, then track the folder
+        // under the pointer (a file row targets its parent; empty space → the root).
+        if self.mouse_pressed {
+            if let Some((path, at, active)) = self.tree_drag.clone() {
+                let dist = ((x - at.0).powi(2) + (y - at.1).powi(2)).sqrt();
+                let now_active = active || dist > 5.0 * theme::ui_zoom();
+                if now_active != active {
+                    self.tree_drag = Some((path.clone(), at, true));
+                }
+                if now_active {
+                    let layout = self.layout();
+                    let tr = layout.tree_region();
+                    let target = if tr.contains((x, y)) {
+                        let row = self.gpu.as_ref().and_then(|g| {
+                            g.ui.sidebar.row_at_scrolled(tr, self.explorer.scroll.offset().1, (x, y), self.workspace.tree.nodes.len())
+                        });
+                        match row.and_then(|i| self.workspace.tree.nodes.get(i)) {
+                            Some(n) if n.is_dir => Some(n.path.clone()),
+                            Some(n) => n.path.parent().map(|p| p.to_path_buf()),
+                            None => Some(self.workspace.tree.root.clone()),
+                        }
+                    } else {
+                        None
+                    };
+                    if target != self.tree_drop_target {
+                        self.tree_drop_target = target;
+                    }
+                    self.redraw(); // the drag ghost follows the cursor
+                }
+            }
+            // Tab drag-reorder: live-swap once the pointer crosses another tab.
+            if let Some((idx, at, active)) = self.tab_drag {
+                let now_active = active || (x - at.0).abs() > 6.0 * theme::ui_zoom();
+                if now_active != active {
+                    self.tab_drag = Some((idx, at, true));
+                }
+                if now_active {
+                    let layout = self.layout();
+                    let rects = layout.tab_rects(self.tab_count());
+                    if let Some(j) = rects.iter().position(|r| r.contains((x, y))) {
+                        let ndocs = self.workspace.documents.len();
+                        if j != idx && j < ndocs && idx < ndocs {
+                            self.workspace.move_tab(idx, j);
+                            self.tab_drag = Some((j, at, true));
+                            self.redraw();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn on_mouse_release(&mut self) {
+        // Text drag-move: drop the selection at the target, or — if the press never
+        // became a drag — place the caret now (deferred from press).
+        if let Some(tm) = self.editor.text_move.take() {
+            let layout = self.layout();
+            let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+            if let (Some(gpu), Some(d)) = (self.gpu.as_mut(), self.workspace.active_doc_mut()) {
+                if tm.active {
+                    if let Some(drop) = tm.drop {
+                        d.move_selection_to(drop, &mut gpu.font_system);
+                    }
+                } else {
+                    ui::editor_view::EditorView::place_caret(d, &layout, p.0, p.1, false);
+                }
+            }
+            self.redraw();
+        }
+        // Explorer drag-to-move: dropping on the terminal pastes the quoted path
+        // (VSCode behavior); dropping on a folder moves the entry there.
+        if let Some((src, _, active)) = self.tree_drag.take() {
+            let target = self.tree_drop_target.take();
+            if active {
+                let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+                let over_terminal = self.terminal.visible
+                    && self.layout().terminal_panel.map_or(false, |tp| tp.contains(p));
+                if over_terminal {
+                    self.terminal.write_focused(shell_quoted(&src).as_bytes());
+                } else if let Some(dir) = target {
+                    self.move_tree_entry(&src, &dir);
+                }
+                self.redraw();
+            }
+        }
+        self.tab_drag = None;
         self.editor.on_release();
         self.text_drag = None;
         self.find_drag = None;
@@ -3458,6 +3660,9 @@ impl App {
         self.terminal.selection_release();
         self.detail.ext_detail_scroll.release();
         self.explorer.scroll.release();
+        if let Some(scp) = self.source_control.as_mut() {
+            scp.scroll.release();
+        }
         if let Some(ep) = self.extensions_panel.as_mut() {
             ep.on_release();
         }
@@ -3469,14 +3674,43 @@ impl App {
         }
     }
 
+    /// Move a file/folder into `dir` (explorer drag-and-drop). Refuses no-op,
+    /// into-own-subtree, and would-overwrite moves; re-points any open documents
+    /// living under the moved entry and refreshes the tree + git badge.
+    fn move_tree_entry(&mut self, src: &Path, dir: &Path) {
+        let Some(name) = src.file_name() else { return };
+        let dest = dir.join(name);
+        if dest == *src || dir.starts_with(src) || dest.exists() {
+            return;
+        }
+        if std::fs::rename(src, &dest).is_err() {
+            return;
+        }
+        if let Some(gpu) = self.gpu.as_mut() {
+            for d in self.workspace.documents.iter_mut() {
+                if let Some(p) = d.path.clone() {
+                    if let Ok(rest) = p.strip_prefix(src) {
+                        let np = if rest.as_os_str().is_empty() { dest.clone() } else { dest.join(rest) };
+                        d.set_path(np, &mut gpu.font_system);
+                    }
+                }
+            }
+        }
+        self.workspace.tree.refresh();
+        self.refresh_source_control();
+    }
+
     fn on_scroll(&mut self, dy: f32) {
         let layout = self.layout();
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
-        // Command palette (modal) scrolls its result list.
+        // Command palette: the wheel scrolls its list only when the pointer is over
+        // the card; elsewhere the editor scrolls underneath (useful while previewing).
         if self.palette.active {
-            self.palette.scroll = (self.palette.scroll - dy).max(0.0);
-            self.redraw();
-            return;
+            if layout.palette.as_ref().map_or(false, |pal| pal.box_.contains(p)) {
+                self.palette.scroll = (self.palette.scroll - dy).max(0.0);
+                self.redraw();
+                return;
+            }
         }
         // Terminal scrollback: the panel owns its pane ScrollViews; consumes the
         // event (when over the content) so the editor doesn't scroll underneath.
@@ -3508,6 +3742,16 @@ impl App {
             let region = layout.tree_region();
             if let Some(sp) = self.search.as_mut() {
                 if sp.on_wheel(p, region, dy) {
+                    self.redraw();
+                    return;
+                }
+            }
+        }
+        // Source Control: the groups area (headers + file lists) scrolls.
+        if self.sidebar_visible && self.sidebar_view == SidebarView::SourceControl {
+            let region = layout.panel_region();
+            if let Some(scp) = self.source_control.as_mut() {
+                if scp.on_wheel(p, region, dy) {
                     self.redraw();
                     return;
                 }
@@ -3559,6 +3803,24 @@ impl App {
     fn on_key(&mut self, event: winit::event::KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
+        }
+        // Double-Shift opens the command palette (IntelliJ-style). A lone Shift tap
+        // twice within the window — any other key in between resets the chain.
+        if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Shift)) {
+            if !self.mods.control_key() && !self.mods.super_key() && !self.mods.alt_key() {
+                let now = Instant::now();
+                if self.last_shift.map_or(false, |t| now.duration_since(t) < Duration::from_millis(350)) {
+                    self.last_shift = None;
+                    if !self.palette.active {
+                        self.open_palette();
+                    }
+                    return;
+                }
+                self.last_shift = Some(now);
+            }
+            return; // a bare Shift press does nothing else
+        } else {
+            self.last_shift = None;
         }
         let extend = self.mods.shift_key();
         // The primary shortcut modifier: Ctrl everywhere, plus Cmd (super) on macOS
@@ -3646,20 +3908,27 @@ impl App {
                 );
                 if ctrl && is_v {
                     if let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
-                        let norm = text.replace("\r\n", "\n").replace('\n', "\r");
                         self.terminal.clear_focused_selection();
-                        if let Some(g) = self.terminal.groups.get_mut(self.terminal.active) {
-                            if let Some(p) = g.panes.get_mut(g.focused) {
-                                p.term.write(norm.as_bytes());
-                                p.scroll.scroll_to_end();
-                                p.dirty = true;
-                            }
-                        }
+                        self.terminal.paste_focused(&text);
                         self.redraw();
                     }
                     return;
                 }
-                if let Some(bytes) = translate_terminal_key(&event, ctrl, extend) {
+                let alt = self.mods.alt_key();
+                if let Some(mut bytes) = translate_terminal_key(&event, ctrl, extend, alt) {
+                    // Escape at a normal shell prompt clears the typed input (kill-line,
+                    // Ctrl+U). Full-screen apps (vim, TUIs) still get the real ESC.
+                    if bytes == [0x1b] {
+                        let in_alt = self
+                            .terminal
+                            .groups
+                            .get(self.terminal.active)
+                            .and_then(|g| g.panes.get(g.focused))
+                            .map_or(false, |p| p.term.is_alt());
+                        if !in_alt {
+                            bytes = vec![0x15]; // ^U — kill the whole input line
+                        }
+                    }
                     self.terminal.clear_focused_selection(); // input dismisses the selection
                     if let Some(g) = self.terminal.groups.get_mut(self.terminal.active) {
                         if let Some(p) = g.panes.get_mut(g.focused) {
@@ -3705,17 +3974,20 @@ impl App {
             Focus::Palette => {
                 match event.logical_key.as_ref() {
                     Key::Named(NamedKey::Escape) => {
+                        self.palette_restore_preview();
                         self.palette.close();
                         self.redraw();
                         return;
                     }
                     Key::Named(NamedKey::ArrowDown) => {
                         self.palette.select_next();
+                        self.palette_preview();
                         self.redraw();
                         return;
                     }
                     Key::Named(NamedKey::ArrowUp) => {
                         self.palette.select_prev();
+                        self.palette_preview();
                         self.redraw();
                         return;
                     }
@@ -3732,6 +4004,7 @@ impl App {
                 if let Some(changed) = consumed {
                     if changed {
                         self.refilter_palette();
+                        self.palette_preview();
                     }
                     self.redraw();
                 }
@@ -4352,6 +4625,26 @@ impl ApplicationHandler for App {
                     }
                     self.redraw();
                 }
+                WorkerMsg::SearchHits { gen, files } if gen == self.palette_search_gen => {
+                    // The palette's `%` live search: append rows (file:line — snippet).
+                    if self.palette.active && self.palette.mode == commands::PaletteMode::TextSearch {
+                        for f in files {
+                            for lm in &f.lines {
+                                if self.palette.items.len() >= 500 {
+                                    break;
+                                }
+                                let label = format!("{}:{}  {}", f.rel, lm.line, lm.text.trim());
+                                self.palette.items.push(commands::PickItem {
+                                    label,
+                                    detail: f.rel.clone(),
+                                    line: Some(lm.line),
+                                });
+                            }
+                        }
+                        self.palette.refilter("");
+                        self.redraw();
+                    }
+                }
                 WorkerMsg::SearchHits { gen, files } => {
                     if let Some(sp) = self.search.as_mut() {
                         sp.ingest(gen, files);
@@ -4710,6 +5003,21 @@ impl ApplicationHandler for App {
                 self.reset_blink();
                 self.on_key(event);
             }
+            // Files dragged in from the OS: over the terminal the quoted path is
+            // pasted; elsewhere a folder becomes the workspace and a file opens.
+            WindowEvent::DroppedFile(path) => {
+                let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+                let over_terminal = self.terminal.visible
+                    && self.layout().terminal_panel.map_or(false, |tp| tp.contains(p));
+                if over_terminal {
+                    self.terminal.write_focused(shell_quoted(&path).as_bytes());
+                } else if path.is_dir() {
+                    self.open_folder(path);
+                } else {
+                    self.open_file_at(path, 1, 0);
+                }
+                self.redraw();
+            }
             WindowEvent::RedrawRequested => {
                 if let Err(e) = render::render(self) {
                     eprintln!("render: {e}");
@@ -4718,6 +5026,12 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+}
+
+/// Shell-single-quote a path for pasting into a terminal (a trailing space lets
+/// repeated drops form an argument list).
+fn shell_quoted(path: &Path) -> String {
+    format!("'{}' ", path.to_string_lossy().replace('\'', r"'\''"))
 }
 
 fn main() -> Result<()> {

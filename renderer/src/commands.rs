@@ -35,7 +35,7 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
 
 /// What a quick-pick selection does. Each variant carries no data here; the chosen
 /// item's `label` is read from `PaletteState` when the pick is committed.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PickKind {
     SetColorTheme,
 }
@@ -60,12 +60,13 @@ impl PickItem {
 /// Quick-open modes, VSCode-style. Most are driven by the input's leading prefix
 /// (`>` commands, `@` symbols, `:` line, none = files); `QuickPick` is a one-off
 /// chooser (e.g. themes) opened programmatically.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaletteMode {
     Commands,         // `>` — run a command
     Files,            // (no prefix) — go to file
     Symbols,          // `@` — go to symbol in the active file
     GoToLine,         // `:` — go to line
+    TextSearch,       // `%` — find text across the workspace (opens the Search panel)
     QuickPick(PickKind),
 }
 
@@ -107,11 +108,19 @@ impl PaletteState {
         }
     }
     pub fn refilter(&mut self, query: &str) {
-        let q = query.to_lowercase();
-        self.filtered = (0..self.source_len())
-            .filter(|&i| q.is_empty() || self.row_text(i).contains(&q))
-            .take(500) // cap the rendered set (go-to-file can have thousands of matches)
-            .collect();
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            self.filtered = (0..self.source_len()).take(500).collect();
+        } else {
+            // Fuzzy (VSCode-style): query chars must appear in order (spaces in the
+            // query ignored, so "login screen" hits LoginScreen.tsx); results rank by
+            // contiguity, word boundaries, and filename-segment matches.
+            let mut scored: Vec<(i32, usize)> = (0..self.source_len())
+                .filter_map(|i| fuzzy_score(&self.row_text(i), &q).map(|s| (s, i)))
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            self.filtered = scored.into_iter().map(|(_, i)| i).take(500).collect();
+        }
         if self.selected >= self.filtered.len() {
             self.selected = self.filtered.len().saturating_sub(1);
         }
@@ -207,5 +216,67 @@ impl FindBarState {
             matches: Vec::new(),
             index: None,
         }
+    }
+}
+
+/// Fuzzy match `q` (lowercase, whitespace ignored) against `text` (lowercase) as an
+/// in-order subsequence. None = no match; higher scores = better: contiguous runs,
+/// matches right after a separator (word starts), and matches inside the last path
+/// segment (the filename) all earn bonuses, so "login screen" ranks
+/// `…/auth/LoginScreen.tsx` above incidental scattered-letter matches.
+fn fuzzy_score(text: &str, q: &str) -> Option<i32> {
+    let t: Vec<char> = text.chars().collect();
+    let file_start = text.rfind('/').map(|i| text[..i].chars().count() + 1).unwrap_or(0);
+    let mut score = 0i32;
+    let mut ti = 0usize;
+    let mut last: Option<usize> = None;
+    let mut first: Option<usize> = None;
+    for qc in q.chars().filter(|c| !c.is_whitespace()) {
+        let mut found = None;
+        while ti < t.len() {
+            if t[ti] == qc {
+                found = Some(ti);
+                break;
+            }
+            ti += 1;
+        }
+        let i = found?;
+        first.get_or_insert(i);
+        score += 1;
+        if last == Some(i.wrapping_sub(1)) {
+            score += 8; // contiguous with the previous matched char
+        }
+        if i == 0 || matches!(t[i - 1], '/' | '_' | '-' | '.' | ' ') {
+            score += 6; // word start
+        }
+        if i >= file_start {
+            score += 2; // inside the filename segment
+        }
+        last = Some(i);
+        ti = i + 1;
+    }
+    // Strong preference for matches that begin in the filename itself.
+    if first.map_or(false, |f| f >= file_start) {
+        score += 30;
+    }
+    Some(score)
+}
+
+#[cfg(test)]
+mod fuzzy_tests {
+    use super::fuzzy_score;
+
+    #[test]
+    fn fuzzy_matches_and_ranks() {
+        // Space-separated words match camel-case filenames.
+        assert!(fuzzy_score("mobile/src/screens/auth/loginscreen.tsx", "login screen").is_some());
+        // Plain subsequence ("lgscr") matches too.
+        assert!(fuzzy_score("mobile/src/screens/auth/loginscreen.tsx", "lgscr").is_some());
+        // Non-subsequence does not.
+        assert!(fuzzy_score("readme.md", "xyz").is_none());
+        // A filename match outranks a scattered path match.
+        let a = fuzzy_score("screens/auth/loginscreen.tsx", "loginscreen").unwrap();
+        let b = fuzzy_score("logs/in_screen_dump/other.txt", "loginscreen").unwrap_or(0);
+        assert!(a > b, "filename match should win: {a} vs {b}");
     }
 }

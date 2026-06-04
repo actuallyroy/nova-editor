@@ -236,4 +236,24 @@ impl Workspace {
             self.active = Some(idx);
         }
     }
+
+    /// Reorder an open tab (drag-reorder). `active` keeps following its document.
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.documents.len() || to >= self.documents.len() {
+            return;
+        }
+        let doc = self.documents.remove(from);
+        self.documents.insert(to, doc);
+        self.active = self.active.map(|a| {
+            if a == from {
+                to
+            } else if from < a && a <= to {
+                a - 1
+            } else if to <= a && a < from {
+                a + 1
+            } else {
+                a
+            }
+        });
+    }
 }

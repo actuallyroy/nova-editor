@@ -153,7 +153,17 @@ fn id_prefixed(id: TermId, data: &[u8]) -> Vec<u8> {
 /// `ptyhost.json`) and new builds never read each other's files, so a stale install
 /// can't capture new windows (and vice versa).
 pub fn info_path() -> Option<std::path::PathBuf> {
-    crate::settings::config_dir().map(|d| d.join("ptyhost-v2.json"))
+    // Keyed by the running binary's path: a debug build and the installed release
+    // app each get their OWN daemon. Sharing one file made them fight — every GUI
+    // that couldn't claim the other's daemon spawned a duplicate, and the
+    // single-window-per-folder check forwarded debug launches to a release window
+    // (the debug process then exits "silently").
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Ok(exe) = std::env::current_exe() {
+        exe.hash(&mut h);
+    }
+    crate::settings::config_dir().map(|d| d.join(format!("ptyhost-v2-{:08x}.json", h.finish() as u32)))
 }
 
 /// Contents of the discovery file: where to connect + the auth token.

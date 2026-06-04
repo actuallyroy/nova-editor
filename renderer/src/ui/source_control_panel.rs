@@ -18,7 +18,7 @@ use crate::git;
 use crate::quad::Quad;
 use crate::theme;
 use crate::ui::Intent;
-use crate::widgets::{ListView, Rect, TextInput, TextLabel};
+use crate::widgets::{ListView, Rect, ScrollOpts, ScrollView, TextInput, TextLabel};
 
 // Geometry is reactive, not frozen: row height tracks the sidebar's (which scales
 // with UI zoom) and the paddings scale with zoom too, so the whole panel stays
@@ -74,6 +74,13 @@ const BADGE_RGB: [(u8, u8, u8); 5] = [
     (115, 158, 230),
     (102, 199, 117),
 ];
+/// Vertical intersection of `r` with viewport `vp` (None when fully outside).
+fn vclip(r: Rect, vp: Rect) -> Option<Rect> {
+    let top = r.y.max(vp.y);
+    let bot = (r.y + r.h).min(vp.y + vp.h);
+    (bot > top).then(|| Rect { x: r.x, y: top, w: r.w, h: bot - top })
+}
+
 fn badge_for(code: char) -> usize {
     match code {
         'A' => 1,
@@ -117,6 +124,9 @@ pub struct SourceControlPanel {
     ic_flat: TextLabel,
     ic_chevron: TextLabel,
     hovered_header: Option<bool>, // Some(true)=Staged header, Some(false)=Changes header
+    /// Scroll state of the groups area (headers + file lists) — the shared
+    /// ScrollView owns the offset, clamping, and the auto-hiding scrollbar.
+    pub scroll: ScrollView,
     root: PathBuf,
     change_count: usize, // unique changed files (for the activity-bar badge)
 }
@@ -173,6 +183,7 @@ impl SourceControlPanel {
             ic_flat: icon(fs, theme::ICON_LIST_FLAT),
             ic_chevron: icon(fs, theme::ICON_CHEVRON_DOWN),
             hovered_header: None,
+            scroll: ScrollView::new(ScrollOpts { vertical: true, horizontal: false, stick_to_end: false }),
             root,
             change_count: 0,
         }
@@ -274,6 +285,15 @@ impl SourceControlPanel {
         }
     }
 
+    /// Scroll the groups area by a wheel delta when the cursor is over it. Returns
+    /// true when the offset changed (caller redraws).
+    pub fn on_wheel(&mut self, pt: (f32, f32), region: Rect, dy: f32) -> bool {
+        if !Self::groups_viewport(region).contains(pt) {
+            return false;
+        }
+        self.scroll.on_wheel(0.0, dy)
+    }
+
     /// Re-ellipsize + re-shape the rows for the current sidebar width. Called from
     /// the render shape phase; only does work when the width actually changed, so
     /// the ellipsis stays correct as the sidebar is resized.
@@ -283,6 +303,12 @@ impl SourceControlPanel {
         }
         self.last_w = region.w;
         self.reflow(fs, region.w);
+        // Feed the scroll component the viewport + unscrolled content height (it
+        // clamps the offset and sizes the thumb from these).
+        let vp = Self::groups_viewport(region);
+        let ul = self.unstaged_list(region);
+        let content_h = (ul.y + ul.h + self.scroll.offset().1) - Self::groups_top(region) + theme::zpx(8.0);
+        self.scroll.set_metrics(vp, (vp.w, content_h));
     }
 
     fn reflow(&mut self, fs: &mut FontSystem, w: f32) {
@@ -435,13 +461,22 @@ impl SourceControlPanel {
         let m = Self::msg_rect(r);
         Rect { x: m.x, y: m.y + m.h + 6.0 * z, w: m.w, h: 28.0 * z }
     }
-    fn staged_hdr(r: Rect) -> Rect {
-        let z = theme::ui_zoom();
+    /// Top of the scrollable groups area (just under the commit button).
+    fn groups_top(r: Rect) -> f32 {
         let c = Self::commit_rect(r);
-        Rect { x: r.x + 8.0 * z, y: c.y + c.h + 10.0 * z, w: r.w - 16.0 * z, h: row_h() }
+        c.y + c.h + 10.0 * theme::ui_zoom()
+    }
+    /// Fixed viewport the group headers + file lists scroll within.
+    fn groups_viewport(r: Rect) -> Rect {
+        let top = Self::groups_top(r);
+        Rect { x: r.x, y: top, w: r.w, h: (r.y + r.h - top).max(0.0) }
+    }
+    fn staged_hdr(&self, r: Rect) -> Rect {
+        let z = theme::ui_zoom();
+        Rect { x: r.x + 8.0 * z, y: Self::groups_top(r) - self.scroll.offset().1, w: r.w - 16.0 * z, h: row_h() }
     }
     fn staged_list(&self, r: Rect) -> Rect {
-        let h = Self::staged_hdr(r);
+        let h = self.staged_hdr(r);
         Rect { x: r.x, y: h.y + row_h(), w: r.w, h: self.staged_vis.len() as f32 * row_h() }
     }
     fn unstaged_hdr(&self, r: Rect) -> Rect {
@@ -493,7 +528,7 @@ impl SourceControlPanel {
     /// All + Stage All.
     fn header_actions(&self, r: Rect, staged: bool) -> Vec<(Act, Rect)> {
         let (hdr, count) = if staged {
-            (Self::staged_hdr(r), &self.count_staged)
+            (self.staged_hdr(r), &self.count_staged)
         } else {
             (self.unstaged_hdr(r), &self.count_unstaged)
         };
@@ -507,7 +542,7 @@ impl SourceControlPanel {
     }
 
     // ---- Drawing ----
-    pub fn draw_quads(&self, region: Rect, blink: bool, bg: &mut Vec<Quad>, fg: &mut Vec<Quad>) {
+    pub fn draw_quads(&self, region: Rect, blink: bool, now: std::time::Instant, bg: &mut Vec<Quad>, fg: &mut Vec<Quad>) {
         let m = Self::msg_rect(region);
         let ir = theme::zpx(7.0);
         let border = Rect { x: m.x - 1.0, y: m.y - 1.0, w: m.w + 2.0, h: m.h + 2.0 };
@@ -524,7 +559,7 @@ impl SourceControlPanel {
         let cc = Self::commit_chevron(region);
         bg.push(Quad::new(cc.x, cc.y + theme::zpx(5.0), 1.0, cc.h - theme::zpx(10.0), [0.0, 0.0, 0.0, 0.25]));
         for (hdr, label, empty) in [
-            (Self::staged_hdr(region), &self.count_staged, self.staged_vis.is_empty()),
+            (self.staged_hdr(region), &self.count_staged, self.staged_vis.is_empty()),
             (self.unstaged_hdr(region), &self.count_unstaged, self.unstaged_vis.is_empty()),
         ] {
             if empty {
@@ -532,20 +567,30 @@ impl SourceControlPanel {
             }
             let w = label.width() + theme::zpx(12.0);
             let pill = Rect { x: hdr.x + hdr.w - w, y: hdr.y + theme::zpx(3.0), w, h: row_h() - theme::zpx(6.0) };
-            bg.push(pill.rounded_quad(theme::ACCENT_DIM(), pill.h * 0.5));
+            // Pills scroll with their headers — drop them once they leave the
+            // viewport instead of floating over the toolbar/commit button.
+            let vp = Self::groups_viewport(region);
+            if pill.y >= vp.y && pill.y + pill.h <= vp.y + vp.h {
+                bg.push(pill.rounded_quad(theme::ACCENT_DIM(), pill.h * 0.5));
+            }
         }
         // Hovered-row highlight (so the action icons read as part of an active row).
         if let Some((staged, idx)) = self.hovered {
             let lr = if staged { self.staged_list(region) } else { self.unstaged_list(region) };
             let y = lr.y + idx as f32 * row_h();
-            bg.push(Quad::new(region.x, y, region.w, row_h(), theme::TREE_HOVER()));
+            if let Some(r) = vclip(Rect { x: region.x, y, w: region.w, h: row_h() }, Self::groups_viewport(region)) {
+                bg.push(Quad::new(r.x, r.y, r.w, r.h, theme::TREE_HOVER()));
+            }
         }
         // Tree-mode indent guides: a faint vertical line per ancestor level, drawn
         // per row so consecutive rows form continuous lines (like VSCode).
         if self.tree_mode {
-            self.indent_guides(&self.staged, &self.staged_vis, self.staged_list(region), bg);
-            self.indent_guides(&self.unstaged, &self.unstaged_vis, self.unstaged_list(region), bg);
+            let vp = Self::groups_viewport(region);
+            self.indent_guides(&self.staged, &self.staged_vis, self.staged_list(region), vp, bg);
+            self.indent_guides(&self.unstaged, &self.unstaged_vis, self.unstaged_list(region), vp, bg);
         }
+        // Auto-hiding scrollbar for the groups area.
+        self.scroll.draw(now, fg);
     }
 
     fn vis_depth(v: &Vis) -> usize {
@@ -575,7 +620,7 @@ impl SourceControlPanel {
         centers
     }
 
-    fn indent_guides(&self, list: &ListView, vis: &[Vis], lr: Rect, bg: &mut Vec<Quad>) {
+    fn indent_guides(&self, list: &ListView, vis: &[Vis], lr: Rect, vp: Rect, bg: &mut Vec<Quad>) {
         if vis.is_empty() {
             return;
         }
@@ -598,7 +643,9 @@ impl SourceControlPanel {
             // whole pixel so the 1px line stays crisp (no anti-aliased smear).
             for k in 0..depth {
                 let x = (origin + base + k as f32 * unit).round();
-                bg.push(Quad::new(x, y, w, row_h(), color));
+                if let Some(r) = vclip(Rect { x, y, w, h: row_h() }, vp) {
+                    bg.push(Quad::new(r.x, r.y, r.w, r.h, color));
+                }
             }
         }
     }
@@ -622,10 +669,11 @@ impl SourceControlPanel {
         self.l_commit.push(cm.x + (cm.w - self.l_commit.width()) * 0.5, cm, theme::FG_TEXT(), areas);
         self.push_icon(&self.ic_chevron, Self::commit_chevron(region), theme::FG_TEXT(), areas);
 
-        let sh = Self::staged_hdr(region);
-        self.l_staged.push(sh.x, sh, theme::FG_TEXT(), areas);
+        let vp = Self::groups_viewport(region);
+        let sh = self.staged_hdr(region);
+        self.l_staged.push_in(sh.x, sh, vp, theme::FG_TEXT(), areas);
         if !self.staged_vis.is_empty() {
-            self.push_count(&self.count_staged, sh, areas);
+            self.push_count(&self.count_staged, sh, vp, areas);
         }
         if self.hovered_header == Some(true) {
             self.draw_header_actions(region, true, areas);
@@ -634,12 +682,12 @@ impl SourceControlPanel {
             Some((true, i)) => Some(i),
             _ => None,
         };
-        self.draw_rows(&self.staged, &self.staged_vis, &self.staged_rows, self.staged_list(region), true, sh_idx, areas);
+        self.draw_rows(&self.staged, &self.staged_vis, &self.staged_rows, self.staged_list(region), vp, true, sh_idx, areas);
 
         let uh = self.unstaged_hdr(region);
-        self.l_unstaged.push(uh.x, uh, theme::FG_TEXT(), areas);
+        self.l_unstaged.push_in(uh.x, uh, vp, theme::FG_TEXT(), areas);
         if !self.unstaged_vis.is_empty() {
-            self.push_count(&self.count_unstaged, uh, areas);
+            self.push_count(&self.count_unstaged, uh, vp, areas);
         }
         if self.hovered_header == Some(false) {
             self.draw_header_actions(region, false, areas);
@@ -648,24 +696,30 @@ impl SourceControlPanel {
             Some((false, i)) => Some(i),
             _ => None,
         };
-        self.draw_rows(&self.unstaged, &self.unstaged_vis, &self.unstaged_rows, self.unstaged_list(region), false, uh_idx, areas);
+        self.draw_rows(&self.unstaged, &self.unstaged_vis, &self.unstaged_rows, self.unstaged_list(region), vp, false, uh_idx, areas);
     }
 
     fn push_icon<'b>(&self, label: &'b TextLabel, r: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'b>>) {
         label.push(r.x + (r.w - label.width()) * 0.5, r, color, areas);
     }
 
+    /// `push_icon`, clipped to the scrollable groups viewport.
+    fn push_icon_in<'b>(&self, label: &'b TextLabel, r: Rect, vp: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'b>>) {
+        label.push_in(r.x + (r.w - label.width()) * 0.5, r, vp, color, areas);
+    }
+
     fn draw_header_actions<'b>(&'b self, region: Rect, staged: bool, areas: &mut Vec<TextArea<'b>>) {
+        let vp = Self::groups_viewport(region);
         for (act, ar) in self.header_actions(region, staged) {
-            self.push_icon(self.icon_for(act), ar, theme::FG_TEXT(), areas);
+            self.push_icon_in(self.icon_for(act), ar, vp, theme::FG_TEXT(), areas);
         }
     }
 
-    fn push_count<'b>(&self, label: &'b TextLabel, hdr: Rect, areas: &mut Vec<TextArea<'b>>) {
+    fn push_count<'b>(&self, label: &'b TextLabel, hdr: Rect, vp: Rect, areas: &mut Vec<TextArea<'b>>) {
         let w = label.width() + theme::zpx(12.0);
         let pill = Rect { x: hdr.x + hdr.w - w, y: hdr.y, w, h: row_h() };
         // Bright text on the count pill (FG_DIM was unreadable on the dark-blue pill).
-        label.push(pill.x + (pill.w - label.width()) * 0.5, pill, theme::FG_TEXT(), areas);
+        label.push_in(pill.x + (pill.w - label.width()) * 0.5, pill, vp, theme::FG_TEXT(), areas);
     }
 
     fn icon_for(&self, act: Act) -> &TextLabel {
@@ -678,12 +732,14 @@ impl SourceControlPanel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_rows<'b>(
         &'b self,
         list: &'b ListView,
         vis: &[Vis],
         rows: &[Row],
         region: Rect,
+        vp: Rect,
         staged: bool,
         hovered_idx: Option<usize>,
         areas: &mut Vec<TextArea<'b>>,
@@ -691,8 +747,10 @@ impl SourceControlPanel {
         if vis.is_empty() {
             return;
         }
-        // Clip the row text to leave the status/action column clear.
-        let text_clip = Rect { w: (region.w - status_w() - theme::zpx(4.0)).max(0.0), ..region };
+        // Clip the row text to leave the status/action column clear, intersected with
+        // the scroll viewport so scrolled rows can't bleed over the commit button.
+        let unclipped = Rect { w: (region.w - status_w() - theme::zpx(4.0)).max(0.0), ..region };
+        let Some(text_clip) = vclip(unclipped, vp) else { return };
         // Tree mode embeds its colors in the rich spans; list mode draws dim then a
         // bright band over each file-name prefix.
         let base = if self.tree_mode { theme::FG_TEXT() } else { theme::FG_DIM() };
@@ -706,19 +764,20 @@ impl SourceControlPanel {
                 // Bright file-name prefix (same origin, clipped to its width).
                 if let Some((_x0, x1)) = list.line_x_range(i, 0, r.fname_len) {
                     let w = (pad + x1).min(text_clip.w);
-                    let band = Rect { x: region.x, y, w, h: row_h() };
-                    list.draw_at(band, region.y, theme::FG_TEXT(), areas);
+                    if let Some(band) = vclip(Rect { x: region.x, y, w, h: row_h() }, vp) {
+                        list.draw_at(band, region.y, theme::FG_TEXT(), areas);
+                    }
                 }
             }
             // Status letter at the far right.
             let (rr, gg, bb) = BADGE_RGB[r.badge];
             let st = Rect { x: region.x + region.w - status_w(), y, w: status_w(), h: row_h() };
-            self.badges[r.badge].push(st.x, st, Color::rgb(rr, gg, bb), areas);
+            self.badges[r.badge].push_in(st.x, st, vp, Color::rgb(rr, gg, bb), areas);
             // Hover actions for this row.
             if hovered_idx == Some(i) {
                 for (act, ar) in Self::action_rects(region, y, staged) {
                     let lbl = self.icon_for(act);
-                    lbl.push(ar.x + (ar.w - lbl.width()) * 0.5, ar, theme::FG_TEXT(), areas);
+                    lbl.push_in(ar.x + (ar.w - lbl.width()) * 0.5, ar, vp, theme::FG_TEXT(), areas);
                 }
             }
         }
@@ -726,16 +785,21 @@ impl SourceControlPanel {
 
     // ---- Input ----
     pub fn hover(&mut self, pt: (f32, f32), region: Rect) -> bool {
+        let in_groups = Self::groups_viewport(region).contains(pt);
         let sl = self.staged_list(region);
         let ul = self.unstaged_list(region);
-        let new = if sl.contains(pt) {
+        let new = if !in_groups {
+            None
+        } else if sl.contains(pt) {
             self.staged.row_at(sl, pt, self.staged_vis.len()).map(|i| (true, i))
         } else if ul.contains(pt) {
             self.unstaged.row_at(ul, pt, self.unstaged_vis.len()).map(|i| (false, i))
         } else {
             None
         };
-        let new_hdr = if Self::staged_hdr(region).contains(pt) {
+        let new_hdr = if !in_groups {
+            None
+        } else if self.staged_hdr(region).contains(pt) {
             Some(true)
         } else if self.unstaged_hdr(region).contains(pt) {
             Some(false)
@@ -749,6 +813,10 @@ impl SourceControlPanel {
     }
 
     pub fn on_press(&mut self, pt: (f32, f32), region: Rect, out: &mut Vec<Intent>) -> bool {
+        // The groups scrollbar claims its presses (thumb drag / track jump).
+        if self.scroll.press(pt) {
+            return true;
+        }
         if Self::msg_rect(region).contains(pt) {
             self.msg_active = true;
             self.msg.focus(true);
@@ -787,6 +855,10 @@ impl SourceControlPanel {
                 out.push(Intent::GitCommit { msg, stage_all: self.nothing_staged() });
             }
             return true;
+        }
+        // Everything below lives in the scrollable groups area.
+        if !Self::groups_viewport(region).contains(pt) {
+            return false;
         }
         // Group-header composite actions (hit-tested by position; they only draw on
         // hover, but a click lands on the pointer, so don't gate on hover state).

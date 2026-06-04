@@ -632,6 +632,29 @@ pub fn file_icon(name: &str) -> (char, Color) {
     }
 }
 
+/// Icon + color for a symbol-kind string (from the symbol extractor or LSP),
+/// VSCode's scheme: methods purple, variables/fields blue, types orange, misc gray.
+pub fn symbol_icon(kind: &str) -> (char, Color) {
+    let purple = Color::rgb(0xB1, 0x80, 0xD7);
+    let blue = Color::rgb(0x75, 0xBE, 0xFF);
+    let orange = Color::rgb(0xEE, 0x9D, 0x28);
+    let gray = Color::rgb(0xC1, 0xC5, 0xCE);
+    match kind {
+        "fn" | "func" | "function" | "def" | "method" => (ICON_SYM_METHOD, purple),
+        "let" | "var" | "local" | "variable" => (ICON_SYM_VARIABLE, blue),
+        "const" | "static" | "constant" => (ICON_SYM_CONSTANT, gray),
+        "class" => (ICON_SYM_CLASS, orange),
+        "struct" => (ICON_SYM_STRUCT, blue),
+        "enum" => (ICON_SYM_ENUM, orange),
+        "interface" | "trait" => (ICON_SYM_INTERFACE, blue),
+        "field" | "property" | "prop" => (ICON_SYM_FIELD, blue),
+        "type" | "typedef" => (ICON_SYM_CLASS, orange),
+        "keyword" => (ICON_SYM_KEYWORD, gray),
+        "snippet" => (ICON_SYM_SNIPPET, gray),
+        _ => (ICON_SYM_MISC, gray),
+    }
+}
+
 /// Folder glyph (open/closed) + a color tinted by well-known folder names. We have
 /// only generic folder glyphs in codicon, so the name signal is carried by color.
 pub fn folder_icon(name: &str, open: bool) -> (char, Color) {
@@ -781,6 +804,19 @@ pub const ICON_TERMINAL_FILE: char = '\u{ea85}';
 pub const ICON_DATABASE: char = '\u{eace}';
 pub const ICON_RUBY: char = '\u{eb48}';
 pub const ICON_KEY: char = '\u{eb11}';
+// Symbol-kind glyphs (verified codicon codepoints) — the `@` symbol palette and the
+// completion popup show these instead of textual [const]/[let] tags.
+pub const ICON_SYM_METHOD: char = '\u{ea8c}';
+pub const ICON_SYM_VARIABLE: char = '\u{ea88}';
+pub const ICON_SYM_CONSTANT: char = '\u{eb5d}';
+pub const ICON_SYM_CLASS: char = '\u{eb5b}';
+pub const ICON_SYM_STRUCT: char = '\u{ea91}';
+pub const ICON_SYM_ENUM: char = '\u{ea95}';
+pub const ICON_SYM_INTERFACE: char = '\u{eb61}';
+pub const ICON_SYM_FIELD: char = '\u{eb5f}';
+pub const ICON_SYM_KEYWORD: char = '\u{eb62}';
+pub const ICON_SYM_SNIPPET: char = '\u{eb66}';
+pub const ICON_SYM_MISC: char = '\u{eb63}';
 
 pub const BLINK_MS: u64 = 530;
 

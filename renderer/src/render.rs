@@ -541,37 +541,63 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Palette list (the input owns its own text now). Rows come from the fixed
         // command set or, in quick-pick mode, the dynamic item list.
         if let Some(pal) = layout.palette.as_ref() {
-            let mut list_text = String::new();
-            match app.palette.mode {
-                crate::commands::PaletteMode::Commands => {
-                    for &i in app.palette.filtered.iter() {
-                        let (_, label, shortcut) = COMMANDS[i];
-                        if shortcut.is_empty() {
-                            list_text.push_str(&format!(" {}\n", label));
-                        } else {
-                            list_text.push_str(&format!(" {}   [{}]\n", label, shortcut));
-                        }
+            // Shape the FULL list height (not just the visible band) so scrolling
+            // reveals every row; draw_at clips to the visible region.
+            let content_h = (app.palette.filtered.len() as f32 * theme::PALETTE_ROW_HEIGHT() + theme::zpx(40.0)).max(pal.list.h);
+            if app.palette.mode == crate::commands::PaletteMode::Symbols {
+                // Rich rows: a colored kind icon (method/variable/const/…) + name,
+                // instead of textual [const]/[let] tags.
+                let ui_attrs = Attrs::new().family(Family::Name(theme::UI_FAMILY())).color(theme::FG_TEXT());
+                let mut key = String::from("SYM\n");
+                let mut spans: Vec<(String, Attrs)> = Vec::new();
+                for &i in app.palette.filtered.iter() {
+                    if let Some(it) = app.palette.items.get(i) {
+                        let (g, col) = theme::symbol_icon(&it.detail);
+                        spans.push((format!(" {}  ", g), Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(col)));
+                        spans.push((format!("{}\n", it.label), ui_attrs));
+                        key.push_str(&it.detail);
+                        key.push(' ');
+                        key.push_str(&it.label);
+                        key.push('\n');
                     }
                 }
-                // All item-based modes (files / symbols / go-to-line / quick-pick).
-                _ => {
-                    for &i in app.palette.filtered.iter() {
-                        if let Some(it) = app.palette.items.get(i) {
-                            if it.detail.is_empty() {
-                                list_text.push_str(&format!(" {}\n", it.label));
+                gpu.ui.palette_list.set_rich(fs, &key, &spans, pal.list.w, content_h);
+            } else {
+                let mut list_text = String::new();
+                match app.palette.mode {
+                    crate::commands::PaletteMode::Commands => {
+                        for &i in app.palette.filtered.iter() {
+                            let (_, label, shortcut) = COMMANDS[i];
+                            if shortcut.is_empty() {
+                                list_text.push_str(&format!(" {}\n", label));
                             } else {
-                                list_text.push_str(&format!(" {}   [{}]\n", it.label, it.detail));
+                                list_text.push_str(&format!(" {}   [{}]\n", label, shortcut));
+                            }
+                        }
+                    }
+                    // `%` rows already carry file:line in the label — no detail tag.
+                    crate::commands::PaletteMode::TextSearch => {
+                        for &i in app.palette.filtered.iter() {
+                            if let Some(it) = app.palette.items.get(i) {
+                                list_text.push_str(&format!(" {}\n", it.label));
+                            }
+                        }
+                    }
+                    // Other item-based modes (files / go-to-line / quick-pick).
+                    _ => {
+                        for &i in app.palette.filtered.iter() {
+                            if let Some(it) = app.palette.items.get(i) {
+                                if it.detail.is_empty() {
+                                    list_text.push_str(&format!(" {}\n", it.label));
+                                } else {
+                                    list_text.push_str(&format!(" {}   [{}]\n", it.label, it.detail));
+                                }
                             }
                         }
                     }
                 }
+                gpu.ui.palette_list.set_text(fs, &list_text, pal.list.w, content_h);
             }
-            // Shape the FULL list height (not just the visible band) so scrolling
-            // reveals every row; draw_at clips to the visible region.
-            let content_h = app.palette.filtered.len() as f32 * theme::PALETTE_ROW_HEIGHT() + theme::zpx(40.0);
-            gpu.ui
-                .palette_list
-                .set_text(fs, &list_text, pal.list.w, content_h.max(pal.list.h));
         }
 
         // Context menu items.
@@ -679,6 +705,14 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     bg_quads.push(rr.quad(theme::TREE_HOVER()));
                 }
             }
+            // Drag-and-drop target folder highlight (while dragging a tree entry).
+            if let Some(tp) = app.tree_drop_target.as_ref() {
+                if let Some(idx) = app.workspace.tree.nodes.iter().position(|n| n.is_dir && &n.path == tp) {
+                    if let Some(rr) = clip_row(gpu.ui.sidebar.row_rect(tr, idx)) {
+                        bg_quads.push(rr.quad(theme::ACCENT_DIM()));
+                    }
+                }
+            }
             // Auto-hiding file-tree scrollbar.
             if !modal_open {
                 app.explorer.scroll.draw(now, &mut fg_quads);
@@ -703,7 +737,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         } else if app.sidebar_view == SidebarView::SourceControl {
             if let Some(scp) = app.source_control.as_ref() {
-                scp.draw_quads(layout.panel_region(), app.cursor_blink_on, &mut bg_quads, &mut fg_quads);
+                scp.draw_quads(layout.panel_region(), app.cursor_blink_on, now, &mut bg_quads, &mut fg_quads);
             }
         }
         // Subtle right border.
@@ -808,6 +842,17 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let foff = |line: usize| -> f32 { fold_lh * d.hidden_above(line) as f32 };
 
         let (cur_line, _) = d.head_line_col();
+        // `@`-symbol preview: tint the whole previewed block (declaration → end of
+        // its body) so the region reads at a glance while arrowing through results.
+        if let Some((r0, r1)) = app.palette_preview_region {
+            let (top0, _) = d.line_visual_bounds(r0.min(r1));
+            let (top1, h1) = d.line_visual_bounds(r0.max(r1));
+            let y = layout.editor_text.y + theme::EDITOR_PAD() + top0 - d.scroll_y() - foff(r0.min(r1));
+            let h = (top1 + h1) - top0;
+            if let Some((qy, qh)) = clip_v(y, h) {
+                bg_quads.push(Quad::new(layout.editor_text.x, qy, layout.editor_text.w, qh, [0.35, 0.48, 0.95, 0.08]));
+            }
+        }
         // Current line highlight across full editor width (editor.renderLineHighlight).
         // Wrap-aware via the document's visual bounds (covers all wrapped rows).
         // Skipped in diff views (the per-line add/del backgrounds carry the meaning).
@@ -1013,6 +1058,26 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
+        // Text drag-and-drop: an insertion caret at the drop target while dragging.
+        if let Some(tm) = app.editor.text_move.as_ref() {
+            if tm.active {
+                if let Some(drop) = tm.drop {
+                    let (cx, cy, ch) = d.byte_visual(drop);
+                    let line = d.rope.byte_to_line(drop.min(d.rope.len_bytes()));
+                    let y0 = layout.editor_text.y + theme::EDITOR_PAD() + cy - d.scroll_y() - foff(line);
+                    if let Some((qy, qh)) = clip_v(y0, ch) {
+                        fg_quads.push(Quad::new(
+                            layout.editor_text.x + theme::EDITOR_PAD() + cx - d.scroll_x(),
+                            qy,
+                            theme::CURSOR_WIDTH(),
+                            qh,
+                            theme::ACCENT(),
+                        ));
+                    }
+                }
+            }
+        }
+
         // Anchor the completion popup just below the caret's line.
         if app.completion.active {
             let (cx, cy, ch) = d.caret_visual();
@@ -1155,6 +1220,28 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     }
     // (The Extensions and Search panels draw their selection highlights in their own draw_quads.)
 
+    // Drag ghost (quads + label shaping): the dragged entry's name floats beside the
+    // cursor so the grab is visible and the parent-folder drop highlight reads as
+    // "dropping into here". The label's text area is pushed in the areas section.
+    let mut drag_ghost_pill: Option<Rect> = None;
+    if let Some((path, _, true)) = app.tree_drag.as_ref() {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        gpu.ui.drag_ghost.set(&mut gpu.font_system, &name, theme::UI_FAMILY());
+        let mp = (app.mouse_pos.x as f32, app.mouse_pos.y as f32);
+        let pill = Rect {
+            x: mp.0 + theme::zpx(12.0),
+            y: mp.1 + theme::zpx(10.0),
+            w: gpu.ui.drag_ghost.width() + theme::zpx(16.0),
+            h: theme::TREE_ROW_HEIGHT(),
+        };
+        bg_quads.push(
+            Rect { x: pill.x - 1.0, y: pill.y - 1.0, w: pill.w + 2.0, h: pill.h + 2.0 }
+                .rounded_quad(theme::ACCENT_DIM(), theme::zpx(7.0)),
+        );
+        bg_quads.push(pill.rounded_quad(theme::SEARCH_BG(), theme::zpx(6.0)));
+        drag_ghost_pill = Some(pill);
+    }
+
     // ---- Build text areas ----
     let active_idx = app.workspace.active;
 
@@ -1194,7 +1281,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     if !cfg!(target_os = "macos") {
         gpu.menubar.draw(layout.menu_bar_rect(), &mut areas);
     }
-    gpu.search.draw(layout.header_search_rect(), &mut areas);
+    // The static search label hides while the palette types into the pill.
+    if layout.palette.is_none() {
+        gpu.search.draw(layout.header_search_rect(), &mut areas);
+    }
     let layout_rects = layout.layout_btn_rects();
     for (i, btn) in gpu.layout_btns.iter().enumerate() {
         btn.draw(layout_rects[i], theme::TITLE_FG(), &mut areas);
@@ -1473,6 +1563,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 }
             }
         }
+    }
+
+    // Drag ghost label (pill quads pushed before the quad prepare above).
+    if let Some(pill) = drag_ghost_pill {
+        ui.drag_ghost.push(pill.x + theme::zpx(8.0), pill, theme::FG_TEXT(), &mut areas);
     }
 
     // Status bar — left: path; right: position/encoding/etc. Both via the
@@ -1855,10 +1950,20 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         cq.push(crate::widgets::Rect { x: card.x + pad * 0.5, y: sy, w: card.w - pad, h: row_h }
             .rounded_quad(theme::MENU_HOVER(), theme::zpx(4.0)));
 
-        // Shape the labels into the shared list buffer (tall enough for all rows).
-        let labels = app.completion.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>().join("\n");
+        // Shape the rows into the shared list buffer (tall enough for all rows): a
+        // colored kind icon + the label, like VSCode's suggest widget.
+        let ui_attrs = Attrs::new().family(Family::Name(theme::UI_FAMILY())).color(theme::FG_TEXT());
+        let mut key = String::from("CMP\n");
+        let mut spans: Vec<(String, Attrs)> = Vec::new();
+        for it in &app.completion.items {
+            let (g, col) = crate::completion::kind_icon(it.kind);
+            spans.push((format!("{}  ", g), Attrs::new().family(Family::Name(theme::ICON_FAMILY)).color(col)));
+            spans.push((format!("{}\n", it.label), ui_attrs));
+            key.push_str(&it.label);
+            key.push('\n');
+        }
         let content_h = total as f32 * row_h + row_h;
-        gpu.ui.completion_list.set_text(&mut gpu.font_system, &labels, inner.w, content_h);
+        gpu.ui.completion_list.set_rich(&mut gpu.font_system, &key, &spans, inner.w, content_h);
         let scroll_px = app.completion.scroll as f32 * row_h;
 
         gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &cq, &[], (cfg_w, cfg_h));
@@ -2005,8 +2110,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         }
         pq.push(Rect { x: pal.box_.x - 1.0, y: pal.box_.y - 1.0, w: pal.box_.w + 2.0, h: pal.box_.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), radius + 1.0));
         pq.push(pal.box_.rounded_quad(theme::PALETTE_BG(), radius));
-        let ir = theme::zpx(7.0);
-        pq.push(Rect { x: pal.input.x - 1.0, y: pal.input.y - 1.0, w: pal.input.w + 2.0, h: pal.input.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), ir + 1.0));
+        // The input is the title-bar pill: re-skin it as a focused input (accent
+        // border + input bg) right where the static search label normally sits.
+        let ir = pal.input.h * 0.5;
+        pq.push(Rect { x: pal.input.x - 1.0, y: pal.input.y - 1.0, w: pal.input.w + 2.0, h: pal.input.h + 2.0 }.rounded_quad(theme::ACCENT_DIM(), ir + 1.0));
         pq.push(pal.input.rounded_quad(theme::PALETTE_INPUT_BG(), ir));
         // Scroll the list so the selection stays in view; clamp to content.
         let row_h = theme::PALETTE_ROW_HEIGHT();

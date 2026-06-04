@@ -115,26 +115,20 @@ impl Layout {
             let pw = theme::PALETTE_WIDTH().min(w - theme::zpx(40.0));
             let visible = 9usize;
             let pad = theme::zpx(10.0); // inner card padding
-            let gap = theme::zpx(8.0); // input ↔ list gap
-            let ph = pad
-                + theme::PALETTE_INPUT_HEIGHT()
-                + gap
-                + theme::PALETTE_ROW_HEIGHT() * visible as f32
-                + pad;
+            // The title-bar search pill IS the palette input (VSCode command-center
+            // style) — no second input field inside the card; the card is just the
+            // results list dropping down beneath the bar.
+            let z = theme::ui_zoom();
+            let iw = (w * 0.34).clamp(280.0 * z, 560.0 * z);
+            let ih = 22.0 * z;
+            let input = Rect { x: (w - iw) * 0.5, y: (theme::TITLE_BAR_H() - ih) * 0.5, w: iw, h: ih };
+            let ph = pad + theme::PALETTE_ROW_HEIGHT() * visible as f32 + pad;
             let bx = (w - pw) * 0.5;
-            // Drop down right below the top bar (which hosts the search that opens it),
-            // like VSCode's command center.
             let by = theme::TITLE_BAR_H() + theme::zpx(6.0);
             let box_ = Rect { x: bx, y: by, w: pw, h: ph };
-            let input = Rect {
-                x: box_.x + pad,
-                y: box_.y + pad,
-                w: box_.w - pad * 2.0,
-                h: theme::PALETTE_INPUT_HEIGHT(),
-            };
             let list = Rect {
                 x: box_.x + pad,
-                y: input.y + input.h + gap,
+                y: box_.y + pad,
                 w: box_.w - pad * 2.0,
                 h: theme::PALETTE_ROW_HEIGHT() * visible as f32,
             };

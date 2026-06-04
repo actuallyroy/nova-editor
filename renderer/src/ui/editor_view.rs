@@ -7,12 +7,23 @@ use crate::document::Document;
 use crate::layout::Layout;
 use crate::theme;
 
+/// Drag-move of the selected text: armed on a fresh press inside the selection,
+/// active once the pointer travels past a small threshold; `drop` is the byte the
+/// text will move to on release.
+pub struct TextMove {
+    pub armed_at: (f32, f32),
+    pub active: bool,
+    pub drop: Option<usize>,
+}
+
 #[derive(Default)]
 pub struct EditorView {
     /// A mouse drag-select is in progress.
     pub dragging: bool,
     /// Consecutive-click count: 1 = place, 2 = word, 3 = line, 4 = document (cycles).
     pub click_count: u32,
+    /// In-flight drag-move of the current selection (None = not dragging text).
+    pub text_move: Option<TextMove>,
 }
 
 impl EditorView {
@@ -22,18 +33,24 @@ impl EditorView {
 
     /// Hit-test `(x, y)` against the document's shaped buffer and move the caret
     /// there, extending the selection when `extend`.
-    fn place_caret(doc: &mut Document, layout: &Layout, x: f32, y: f32, extend: bool) {
+    pub fn place_caret(doc: &mut Document, layout: &Layout, x: f32, y: f32, extend: bool) {
+        if let Some(b) = Self::byte_at(doc, layout, x, y) {
+            doc.place(b, extend);
+        }
+    }
+
+    /// The document byte under `(x, y)`, if it hits the shaped buffer.
+    pub fn byte_at(doc: &Document, layout: &Layout, x: f32, y: f32) -> Option<usize> {
         let buf_x = x - (layout.editor_text.x + theme::EDITOR_PAD()) + doc.scroll_x();
         let buf_y = doc.expand_visual_y(y - (layout.editor_text.y + theme::EDITOR_PAD()) + doc.scroll_y());
-        if let Some(hit) = doc.buffer.hit(buf_x, buf_y) {
-            let line = hit.line;
-            if line < doc.rope.len_lines() {
-                let line_start = doc.rope.line_to_byte(line);
-                let line_len = doc.rope.line(line).len_bytes();
-                let col = hit.index.min(line_len);
-                doc.place(line_start + col, extend);
-            }
+        let hit = doc.buffer.hit(buf_x, buf_y)?;
+        let line = hit.line;
+        if line >= doc.rope.len_lines() {
+            return None;
         }
+        let line_start = doc.rope.line_to_byte(line);
+        let line_len = doc.rope.line(line).len_bytes();
+        Some(line_start + hit.index.min(line_len))
     }
 
     /// The buffer line under `(x, y)`, if any — used to hit-test diff file headers.
@@ -47,6 +64,20 @@ impl EditorView {
     /// Editor mouse-press: place the caret, then word/line/document-select on
     /// consecutive clicks (cycling). `consecutive` = within the double-click window.
     pub fn on_press(&mut self, doc: &mut Document, layout: &Layout, x: f32, y: f32, extend: bool, consecutive: bool) {
+        // A fresh single click INSIDE the current selection arms a drag-move of that
+        // text. Caret placement defers to release so the selection isn't destroyed
+        // before the user can drag it.
+        if !extend && !consecutive && !doc.sel.is_empty() && !doc.read_only {
+            if let Some(b) = Self::byte_at(doc, layout, x, y) {
+                let (lo, hi) = doc.sel.range();
+                if b > lo && b < hi {
+                    self.text_move = Some(TextMove { armed_at: (x, y), active: false, drop: None });
+                    self.dragging = false;
+                    self.click_count = 1;
+                    return;
+                }
+            }
+        }
         self.click_count = if consecutive { (self.click_count % 4) + 1 } else { 1 };
         Self::place_caret(doc, layout, x, y, extend);
         if self.click_count >= 2 {
@@ -65,6 +96,18 @@ impl EditorView {
     /// Drag-extend the selection while the mouse is held. Returns true if a drag
     /// was active (and thus the caret moved).
     pub fn on_drag(&mut self, doc: &mut Document, layout: &Layout, x: f32, y: f32) -> bool {
+        // Text drag-move: activate past a small threshold, then track the drop byte.
+        if let Some(tm) = self.text_move.as_mut() {
+            let (dx, dy) = (x - tm.armed_at.0, y - tm.armed_at.1);
+            if !tm.active && (dx * dx + dy * dy).sqrt() > 4.0 * theme::ui_zoom() {
+                tm.active = true;
+            }
+            if tm.active {
+                tm.drop = Self::byte_at(doc, layout, x, y);
+                return true;
+            }
+            return false;
+        }
         if !self.dragging {
             return false;
         }

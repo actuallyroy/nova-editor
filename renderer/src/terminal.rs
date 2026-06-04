@@ -156,6 +156,7 @@ pub struct Grid {
     cursor_visible: bool, // DECTCEM (CSI ?25h/l): TUIs hide the cursor while redrawing
     mouse_enabled: bool,  // DECSET 1000/1002/1003: app wants mouse events
     sgr_mouse: bool,      // DECSET 1006: SGR extended mouse encoding
+    bracketed_paste: bool, // DECSET 2004: wrap pastes in ESC[200~ / ESC[201~
     // Deferred autowrap (VT "pending wrap"): writing the last column does NOT wrap
     // immediately — it arms this flag, and the wrap only happens when the *next*
     // printable char arrives. Any cursor-positioning op disarms it, so an inline
@@ -185,6 +186,7 @@ impl Grid {
             cursor_visible: true,
             mouse_enabled: false,
             sgr_mouse: false,
+            bracketed_paste: false,
             wrap_pending: false,
         }
     }
@@ -505,6 +507,7 @@ impl Perform for Grid {
                         25 => self.cursor_visible = set, // DECTCEM show/hide cursor
                         1000 | 1002 | 1003 => self.mouse_enabled = set, // mouse reporting
                         1006 => self.sgr_mouse = set,                   // SGR mouse encoding
+                        2004 => self.bracketed_paste = set, // bracketed paste mode
                         _ => {} // 2004 (bracketed paste) etc. — ignored
                     }
                 }
@@ -551,6 +554,33 @@ impl Perform for Grid {
                     for c in row.iter_mut().skip(self.cur_col).take(n) {
                         *c = Cell::blank();
                     }
+                }
+            }
+            'P' => {
+                // DCH: delete n chars at the cursor — the tail shifts left and blanks
+                // fill the line end. Shells emit this for mid-line backspace/delete;
+                // without it the grid's tail never moves, so edits in the middle of a
+                // command LOOK like they chewed off the end of the line.
+                let cols = self.cols;
+                let cur = self.cur_col;
+                if let Some(row) = self.cells.get_mut(self.cur_row) {
+                    let col = cur.min(row.len());
+                    let k = n.min(row.len() - col);
+                    row.drain(col..col + k);
+                    row.resize(cols, Cell::blank());
+                }
+            }
+            '@' => {
+                // ICH: insert n blank cells at the cursor, pushing the tail right
+                // (typing in the middle of a line).
+                let cols = self.cols;
+                let cur = self.cur_col;
+                if let Some(row) = self.cells.get_mut(self.cur_row) {
+                    let col = cur.min(row.len());
+                    for _ in 0..n {
+                        row.insert(col, Cell::blank());
+                    }
+                    row.truncate(cols);
                 }
             }
             'r' => {
@@ -649,6 +679,11 @@ impl Terminal {
         for &b in data {
             self.parser.advance(&mut self.grid, b);
         }
+    }
+
+    /// Whether the running app asked for bracketed paste (mode 2004).
+    pub fn bracketed_paste(&self) -> bool {
+        self.grid.bracketed_paste
     }
 
     /// Send raw bytes (translated key input) to the shell via the daemon.
@@ -807,13 +842,22 @@ impl Terminal {
 pub(crate) fn translate_terminal_key(
     event: &winit::event::KeyEvent,
     ctrl: bool,
-    _shift: bool,
+    shift: bool,
+    alt: bool,
 ) -> Option<Vec<u8>> {
     use winit::keyboard::{Key, NamedKey};
     match event.logical_key.as_ref() {
+        // Shift/Alt+Enter → ESC CR: newline-without-submit in claude code & friends.
+        Key::Named(NamedKey::Enter) if shift || alt => return Some(b"\x1b\r".to_vec()),
         Key::Named(NamedKey::Enter) => return Some(b"\r".to_vec()),
+        // Alt+Backspace → ESC DEL (delete word back).
+        Key::Named(NamedKey::Backspace) if alt => return Some(vec![0x1b, 0x7f]),
         Key::Named(NamedKey::Backspace) => return Some(vec![0x7f]),
+        // Shift+Tab → backtab (claude code's mode toggle, completion cycling, …).
+        Key::Named(NamedKey::Tab) if shift => return Some(b"\x1b[Z".to_vec()),
         Key::Named(NamedKey::Tab) => return Some(b"\t".to_vec()),
+        Key::Named(NamedKey::PageUp) => return Some(b"\x1b[5~".to_vec()),
+        Key::Named(NamedKey::PageDown) => return Some(b"\x1b[6~".to_vec()),
         Key::Named(NamedKey::Escape) => return Some(vec![0x1b]),
         Key::Named(NamedKey::ArrowUp) => return Some(b"\x1b[A".to_vec()),
         Key::Named(NamedKey::ArrowDown) => return Some(b"\x1b[B".to_vec()),
@@ -825,8 +869,12 @@ pub(crate) fn translate_terminal_key(
         Key::Named(NamedKey::Space) => return Some(b" ".to_vec()),
         _ => {}
     }
-    // Ctrl+<letter> → control byte (Ctrl+C = 0x03, etc.).
-    if ctrl {
+    // Ctrl+<letter> → control byte (Ctrl+C = 0x03, …); Alt+<letter> → ESC <letter>
+    // (Option-as-Meta, e.g. Alt+B/F word movement). ALL letters map — TUIs bind
+    // arbitrary ones (claude code's Ctrl+O/R, nano's Ctrl+O/W/X, emacs everything);
+    // a whitelist silently swallows whatever it forgot. App-reserved combos are
+    // intercepted by the caller before this runs.
+    if ctrl || alt {
         if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
             use winit::keyboard::KeyCode;
             let letter = match code {
@@ -835,14 +883,32 @@ pub(crate) fn translate_terminal_key(
                 KeyCode::KeyC => Some(b'c'),
                 KeyCode::KeyD => Some(b'd'),
                 KeyCode::KeyE => Some(b'e'),
+                KeyCode::KeyF => Some(b'f'),
+                KeyCode::KeyG => Some(b'g'),
+                KeyCode::KeyH => Some(b'h'),
+                KeyCode::KeyI => Some(b'i'),
+                KeyCode::KeyJ => Some(b'j'),
                 KeyCode::KeyK => Some(b'k'),
                 KeyCode::KeyL => Some(b'l'),
+                KeyCode::KeyM => Some(b'm'),
+                KeyCode::KeyN => Some(b'n'),
+                KeyCode::KeyO => Some(b'o'),
+                KeyCode::KeyP => Some(b'p'),
+                KeyCode::KeyQ => Some(b'q'),
+                KeyCode::KeyR => Some(b'r'),
+                KeyCode::KeyS => Some(b's'),
+                KeyCode::KeyT => Some(b't'),
                 KeyCode::KeyU => Some(b'u'),
+                KeyCode::KeyV => Some(b'v'),
+                KeyCode::KeyW => Some(b'w'),
+                KeyCode::KeyX => Some(b'x'),
+                KeyCode::KeyY => Some(b'y'),
                 KeyCode::KeyZ => Some(b'z'),
+                KeyCode::Space => return Some(vec![0x00]), // Ctrl+Space (NUL)
                 _ => None,
             };
             if let Some(l) = letter {
-                return Some(vec![l & 0x1f]);
+                return Some(if ctrl { vec![l & 0x1f] } else { vec![0x1b, l] });
             }
         }
         return None;

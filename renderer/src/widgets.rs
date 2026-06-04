@@ -268,6 +268,12 @@ impl TextLabel {
         self.push(rect.x + pad, rect, color, areas);
     }
 
+    /// `push`, but clipped to `clip` instead of `rect` — for content positioned at
+    /// `rect` while scrolled inside a fixed viewport.
+    pub fn push_in<'a>(&'a self, left: f32, rect: Rect, clip: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
+        self.push_clipped(left, rect.text_top(theme::UI_LINE_HEIGHT(), self.align), clip, color, areas);
+    }
+
     /// Push with an explicit `top` (for vertical scroll) clipped to `clip`.
     pub fn push_clipped<'a>(&'a self, left: f32, top: f32, clip: Rect, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
         areas.push(TextArea {

@@ -105,6 +105,20 @@ impl Completion {
     }
 }
 
+/// Icon + color for a popup item's kind (delegates to the shared symbol scheme).
+pub fn kind_icon(kind: Kind) -> (char, glyphon::Color) {
+    crate::theme::symbol_icon(match kind {
+        Kind::Function => "fn",
+        Kind::Variable => "var",
+        Kind::Field => "field",
+        Kind::Type => "class",
+        Kind::Module => "mod",
+        Kind::Keyword => "keyword",
+        Kind::Snippet => "snippet",
+        Kind::Word => "",
+    })
+}
+
 /// Map LSP completion items (generic across servers) into popup items, translating
 /// the LSP `CompletionItemKind` number into our `Kind`.
 pub fn from_lsp(items: Vec<crate::lsp::CompletionItem>) -> Vec<Item> {
