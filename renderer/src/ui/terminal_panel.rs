@@ -233,6 +233,15 @@ impl TerminalPanel {
         }
     }
 
+    /// Is the FOCUSED pane's shell running a foreground process (e.g. claude code)?
+    pub fn focused_term_busy(&mut self) -> bool {
+        let id = match self.groups.get(self.active).and_then(|g| g.panes.get(g.focused)) {
+            Some(p) if p.term.id != 0 => p.term.id,
+            _ => return false,
+        };
+        self.client.as_mut().map_or(false, |c| c.term_busy(id))
+    }
+
     /// Send raw bytes to the focused pane's shell (e.g. a dropped file's path).
     pub fn write_focused(&mut self, bytes: &[u8]) {
         if let Some(g) = self.groups.get_mut(self.active) {

@@ -50,6 +50,7 @@ pub struct UiBuffers {
     pub completion_list: ListView,
     pub find: crate::ui::find_widget::FindWidget,
     pub menu: Menu,
+    pub ctx: Menu, // generic right-click context menu (editor / tabs / SCM / …)
     pub dialog: Dialog,
     pub diag_hover: HoverCard, // floating tooltip for the diagnostic under the pointer
     pub ext_detail: ExtensionDetail,
@@ -250,6 +251,7 @@ impl GpuState {
             ),
             find: crate::ui::find_widget::FindWidget::new(&mut font_system),
             menu: Menu::new(&mut font_system, 200.0),
+            ctx: Menu::new(&mut font_system, 280.0),
             menu_dropdown: Menu::new(&mut font_system, 220.0),
             scm_badge: TextLabel::new(&mut font_system, 40.0, theme::ACTIVITY_ICON_SIZE()),
             img_minus: {

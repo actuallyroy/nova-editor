@@ -2007,6 +2007,44 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.queue.submit(Some(encc.finish()));
     }
 
+    // ---- Generic right-click context menu (editor / tabs / SCM / …) ----
+    if let Some((anchor, _)) = app.ctx_menu {
+        let menu = gpu.ui.ctx.rect(anchor, (cfg_w as f32, cfg_h as f32));
+        let mut mq: Vec<Quad> = Vec::new();
+        gpu.ui.ctx.draw_bg(menu, app.ctx_hover, &mut mq);
+        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &mq, &[], (cfg_w, cfg_h));
+        let mut mareas: Vec<TextArea> = Vec::new();
+        gpu.ui.ctx.draw(menu, &mut mareas);
+        gpu.text_renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut gpu.font_system,
+            &mut gpu.atlas,
+            &gpu.viewport,
+            mareas,
+            &mut gpu.swash_cache,
+        )?;
+        let mut encx = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("aether-ctx-pass"),
+        });
+        {
+            let mut pass = encx.begin_render_pass(&RenderPassDescriptor {
+                label: Some("aether-ctx"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            gpu.quad_renderer.render_bg(&mut pass);
+            gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+        }
+        gpu.queue.submit(Some(encx.finish()));
+    }
+
     // ---- Context menu overlay (second pass, drawn over everything) ----
     if let Some(cm) = app.explorer.context_menu.as_ref() {
         let menu = gpu.ui.menu.rect(cm.anchor, (cfg_w as f32, cfg_h as f32));

@@ -190,6 +190,49 @@ pub(crate) struct DialogState {
     pub(crate) hovered: Option<usize>,
 }
 
+/// One row in the generic right-click context menu.
+#[derive(Clone)]
+pub(crate) struct CtxEntry {
+    pub label: String,
+    pub hint: &'static str,
+    pub action: CtxAction,
+}
+
+impl CtxEntry {
+    fn new(label: impl Into<String>, action: CtxAction) -> Self {
+        Self { label: label.into(), hint: "", action }
+    }
+    fn key(label: impl Into<String>, action: CtxAction, hint: &'static str) -> Self {
+        Self { label: label.into(), hint, action }
+    }
+    fn sep() -> Self {
+        Self { label: String::new(), hint: "", action: CtxAction::Separator }
+    }
+    fn stub(label: &'static str) -> Self {
+        Self { label: label.to_string(), hint: "", action: CtxAction::Stub(label) }
+    }
+}
+
+/// What a context-menu row does, across every surface that opens one.
+#[derive(Clone)]
+pub(crate) enum CtxAction {
+    Separator,
+    Stub(&'static str),
+    Command(Command),          // editor: cut/copy/paste/find/select-all/palette…
+    Cut,
+    Copy,
+    Paste,
+    Palette,
+    CloseTab(usize),
+    CloseOtherTabs(usize),
+    CloseTabsRight(usize),
+    CloseAllTabs,
+    CopyDocPath(usize),
+    RevealInOs(PathBuf),
+    ScmIntent(ui::Intent),     // stage/unstage/discard/open — reuses apply_intent
+    CopyText(String),          // copy an arbitrary string (paths)
+}
+
 pub(crate) struct App {
     pub(crate) cwd: PathBuf,
     pub(crate) initial_file: Option<PathBuf>,
@@ -272,6 +315,10 @@ pub(crate) struct App {
     pub(crate) palette_preview_region: Option<(usize, usize)>,
     /// Last lone-Shift press, for the double-Shift palette shortcut.
     pub(crate) last_shift: Option<Instant>,
+    // Generic right-click context menu (editor / tabs / SCM rows / …). The explorer
+    // keeps its older dedicated menu for now.
+    pub(crate) ctx_menu: Option<((f32, f32), Vec<CtxEntry>)>,
+    pub(crate) ctx_hover: Option<usize>,
     // Native macOS menu bar — kept alive here; map resolves a click to a MenuCmd.
     #[cfg(target_os = "macos")]
     pub(crate) macos_menu: Option<(muda::Menu, std::collections::HashMap<String, menus::MenuCmd>)>,
@@ -370,6 +417,8 @@ impl App {
             palette_search_gen: 1 << 32,
             palette_preview_region: None,
             last_shift: None,
+            ctx_menu: None,
+            ctx_hover: None,
             sel_matches: Vec::new(),
             sel_hl_text: String::new(),
             sel_hl_version: -1,
@@ -570,6 +619,17 @@ impl App {
         }
         // While a dropdown is open, hovering another title switches to it (VSCode
         // behaviour), and track the hovered entry for the highlight.
+        if let Some((anchor, _)) = self.ctx_menu {
+            let hov = self.gpu.as_ref().and_then(|g| {
+                let win = (g.config.width as f32, g.config.height as f32);
+                let rect = g.ui.ctx.rect(anchor, win);
+                g.ui.ctx.item_at(rect, p)
+            });
+            if hov != self.ctx_hover {
+                self.ctx_hover = hov;
+                self.redraw();
+            }
+        }
         if self.open_menu.is_some() {
             if let Some(t) = new_menu {
                 if self.open_menu != Some(t) {
@@ -1092,7 +1152,82 @@ impl App {
                 }
             }
         }
+        // Editor tabs: per-tab management menu.
+        if layout.tab_strip.contains((x, y)) {
+            let tab_rects = layout.tab_rects(self.tab_count());
+            if let Some(idx) = tab_rects.iter().position(|r| r.contains((x, y))) {
+                if Some(idx) != self.ext_tab_index() && idx < self.workspace.documents.len() {
+                    let path = self.workspace.documents[idx].path.clone();
+                    let mut items = vec![
+                        CtxEntry::key("Close", CtxAction::CloseTab(idx), "Ctrl+W"),
+                        CtxEntry::new("Close Others", CtxAction::CloseOtherTabs(idx)),
+                        CtxEntry::new("Close to the Right", CtxAction::CloseTabsRight(idx)),
+                        CtxEntry::new("Close All", CtxAction::CloseAllTabs),
+                        CtxEntry::sep(),
+                    ];
+                    if let Some(p) = path {
+                        items.push(CtxEntry::new("Copy Path", CtxAction::CopyText(p.to_string_lossy().to_string())));
+                        items.push(CtxEntry::new("Reveal in Finder", CtxAction::RevealInOs(p)));
+                        items.push(CtxEntry::sep());
+                    }
+                    items.push(CtxEntry::stub("Split Editor"));
+                    items.push(CtxEntry::stub("Pin"));
+                    self.open_ctx_menu((x, y), items);
+                }
+            }
+            return;
+        }
+
+        // Editor body: the standard editor menu.
+        if self.detail.open_extension.is_none()
+            && self.workspace.active_doc().is_some()
+            && render::editor_region(&layout).contains((x, y))
+        {
+            let items = vec![
+                CtxEntry::stub("Go to Definition"),
+                CtxEntry::stub("Go to References"),
+                CtxEntry::sep(),
+                CtxEntry::stub("Rename Symbol"),
+                CtxEntry::stub("Change All Occurrences"),
+                CtxEntry::stub("Format Document"),
+                CtxEntry::sep(),
+                CtxEntry::key("Cut", CtxAction::Cut, "Ctrl+X"),
+                CtxEntry::key("Copy", CtxAction::Copy, "Ctrl+C"),
+                CtxEntry::key("Paste", CtxAction::Paste, "Ctrl+V"),
+                CtxEntry::sep(),
+                CtxEntry::key("Command Palette…", CtxAction::Palette, "Ctrl+Shift+P"),
+            ];
+            self.open_ctx_menu((x, y), items);
+            return;
+        }
+
         if !self.sidebar_visible || !layout.sidebar.contains((x, y)) {
+            return;
+        }
+        // Source Control rows: stage/unstage/discard/open for the file under the cursor.
+        if self.sidebar_view == SidebarView::SourceControl {
+            let region = layout.panel_region();
+            if let Some((path, staged, untracked)) =
+                self.source_control.as_ref().and_then(|scp| scp.row_at_point((x, y), region))
+            {
+                let mut items = vec![
+                    CtxEntry::new("Open File", CtxAction::ScmIntent(ui::Intent::OpenFile { path: self.cwd.join(&path), line: 1, col: 0 })),
+                    CtxEntry::new("Open Changes", CtxAction::ScmIntent(ui::Intent::OpenDiff { path: path.clone(), staged, untracked })),
+                    CtxEntry::sep(),
+                ];
+                if staged {
+                    items.push(CtxEntry::new("Unstage Changes", CtxAction::ScmIntent(ui::Intent::GitUnstage(path.clone()))));
+                } else {
+                    items.push(CtxEntry::new("Stage Changes", CtxAction::ScmIntent(ui::Intent::GitStage(path.clone()))));
+                    items.push(CtxEntry::new("Discard Changes", CtxAction::ScmIntent(ui::Intent::GitDiscard { path: path.clone(), untracked })));
+                }
+                items.push(CtxEntry::sep());
+                items.push(CtxEntry::new("Copy Path", CtxAction::CopyText(self.cwd.join(&path).to_string_lossy().to_string())));
+                self.open_ctx_menu((x, y), items);
+            }
+            return;
+        }
+        if self.sidebar_view != SidebarView::Explorer {
             return;
         }
         let target = self.gpu.as_ref().and_then(|g| {
@@ -1113,14 +1248,96 @@ impl App {
         self.redraw();
     }
 
+    /// Open the generic context menu at `anchor` with `entries`.
+    fn open_ctx_menu(&mut self, anchor: (f32, f32), entries: Vec<CtxEntry>) {
+        let rows: Vec<(&str, &str, bool)> = entries
+            .iter()
+            .map(|e| (e.label.as_str(), e.hint, matches!(e.action, CtxAction::Separator)))
+            .collect();
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.ctx.set_entries(&mut g.font_system, &rows);
+        }
+        self.explorer.close_menu();
+        self.close_app_menu();
+        self.ctx_menu = Some((anchor, entries));
+        self.ctx_hover = None;
+        self.redraw();
+    }
+
+    fn close_ctx_menu(&mut self) {
+        if self.ctx_menu.take().is_some() {
+            self.ctx_hover = None;
+            self.redraw();
+        }
+    }
+
+    fn exec_ctx_action(&mut self, action: CtxAction) {
+        match action {
+            CtxAction::Separator => {}
+            CtxAction::Stub(name) => {
+                self.show_info_dialog(&format!("“{name}” isn’t implemented yet — it's on the roadmap."));
+            }
+            CtxAction::Command(c) => self.exec_command(c),
+            CtxAction::Cut => self.cut(),
+            CtxAction::Copy => self.copy(),
+            CtxAction::Paste => self.paste(),
+            CtxAction::Palette => self.open_palette(),
+            CtxAction::CloseTab(i) => self.request_close(i),
+            CtxAction::CloseOtherTabs(keep) => {
+                // Close every clean doc except `keep` (dirty ones stay, VSCode prompts
+                // per-file; we keep them open instead of risking data).
+                let paths: Vec<usize> = (0..self.workspace.documents.len()).rev().filter(|&i| i != keep).collect();
+                for i in paths {
+                    if !self.workspace.documents[i].dirty {
+                        self.workspace.close_idx(i);
+                    }
+                }
+                self.redraw();
+            }
+            CtxAction::CloseTabsRight(from) => {
+                for i in (from + 1..self.workspace.documents.len()).rev() {
+                    if !self.workspace.documents[i].dirty {
+                        self.workspace.close_idx(i);
+                    }
+                }
+                self.redraw();
+            }
+            CtxAction::CloseAllTabs => {
+                for i in (0..self.workspace.documents.len()).rev() {
+                    if !self.workspace.documents[i].dirty {
+                        self.workspace.close_idx(i);
+                    }
+                }
+                self.redraw();
+            }
+            CtxAction::CopyDocPath(i) => {
+                if let Some(p) = self.workspace.documents.get(i).and_then(|d| d.path.clone()) {
+                    if let Some(cb) = self.clipboard.as_mut() {
+                        let _ = cb.set_text(p.to_string_lossy().to_string());
+                    }
+                }
+            }
+            CtxAction::RevealInOs(path) => reveal_in_os(&path),
+            CtxAction::ScmIntent(intent) => self.apply_intent(intent),
+            CtxAction::CopyText(text) => {
+                if let Some(cb) = self.clipboard.as_mut() {
+                    let _ = cb.set_text(text);
+                }
+            }
+        }
+    }
+
     // ---- Top menu-bar dropdowns (File / Edit / …) ----
 
     /// Open the dropdown for top-level menu `idx`, loading its entries into the
     /// shared dropdown widget. Closes any open file-explorer context menu.
     fn open_app_menu(&mut self, idx: usize) {
-        let labels: Vec<&str> = menus::entries(idx).iter().map(|e| e.label).collect();
+        let rows: Vec<(&str, &str, bool)> = menus::entries(idx)
+            .iter()
+            .map(|e| (e.label, e.hint, matches!(e.cmd, menus::MenuCmd::Separator)))
+            .collect();
         if let Some(g) = self.gpu.as_mut() {
-            g.ui.menu_dropdown.set_items(&mut g.font_system, &labels);
+            g.ui.menu_dropdown.set_entries(&mut g.font_system, &rows);
         }
         self.explorer.close_menu();
         self.open_menu = Some(idx);
@@ -1178,12 +1395,117 @@ impl App {
                 ));
             }
             menus::MenuCmd::NewWindow => self.open_new_window(),
+            menus::MenuCmd::QuickOpen => self.open_quick_open(),
+            menus::MenuCmd::GotoSymbol => self.open_palette_with("@"),
+            menus::MenuCmd::GotoLine => self.open_palette_with(":"),
+            menus::MenuCmd::OpenFileDlg => {
+                let start = self.workspace.tree.root.clone();
+                if let Some(path) = rfd::FileDialog::new().set_directory(&start).pick_file() {
+                    self.open_file_at(path, 1, 0);
+                }
+            }
+            menus::MenuCmd::SaveAs => {
+                let start = self.workspace.tree.root.clone();
+                if let Some(path) = rfd::FileDialog::new().set_directory(&start).save_file() {
+                    if let (Some(g), Some(d)) = (self.gpu.as_mut(), self.workspace.active_doc_mut()) {
+                        d.set_path(path, &mut g.font_system);
+                        let _ = d.save();
+                    }
+                    self.refresh_source_control();
+                }
+            }
+            menus::MenuCmd::SaveAll => {
+                for d in self.workspace.documents.iter_mut() {
+                    if d.dirty && d.path.is_some() {
+                        let _ = d.save();
+                    }
+                }
+                self.refresh_source_control();
+            }
+            menus::MenuCmd::Cut => self.cut(),
+            menus::MenuCmd::Copy => self.copy(),
+            menus::MenuCmd::Paste => self.paste(),
+            menus::MenuCmd::Replace => {
+                self.find.active = true;
+                self.find.focused = true;
+                self.find.replace_open = true;
+                self.redraw();
+            }
+            menus::MenuCmd::FindInFiles => {
+                self.sidebar_visible = true;
+                self.sidebar_view = SidebarView::Search;
+                self.redraw();
+            }
+            menus::MenuCmd::ShowExplorer => self.show_sidebar_view(SidebarView::Explorer),
+            menus::MenuCmd::ShowSearch => self.show_sidebar_view(SidebarView::Search),
+            menus::MenuCmd::ShowScm => self.show_sidebar_view(SidebarView::SourceControl),
+            menus::MenuCmd::ShowExtensions => self.show_sidebar_view(SidebarView::Extensions),
+            menus::MenuCmd::FullScreen => {
+                if let Some(g) = self.gpu.as_ref() {
+                    let on = g.window.fullscreen().is_some();
+                    g.window.set_fullscreen(if on {
+                        None
+                    } else {
+                        Some(winit::window::Fullscreen::Borderless(None))
+                    });
+                }
+            }
+            menus::MenuCmd::ZoomIn => self.zoom_step(0.1),
+            menus::MenuCmd::ZoomOut => self.zoom_step(-0.1),
+            menus::MenuCmd::ZoomReset => self.set_zoom(1.0),
+            menus::MenuCmd::NewTerminal => {
+                if !self.terminal.visible {
+                    self.toggle_terminal(); // spawns the first tab when none exist
+                } else {
+                    let panel = self.layout().terminal_panel;
+                    self.terminal.new_terminal_tab(panel, self.terminal_cell_w);
+                }
+                self.redraw();
+            }
+            menus::MenuCmd::SplitTerminal => {
+                if !self.terminal.visible {
+                    self.toggle_terminal();
+                } else {
+                    let panel = self.layout().terminal_panel;
+                    self.terminal.split_terminal(panel, self.terminal_cell_w);
+                }
+                self.redraw();
+            }
+            menus::MenuCmd::KillTerminal => {
+                self.terminal.kill_terminal();
+                self.redraw();
+            }
+            menus::MenuCmd::OpenDocs => open_url("https://github.com/actuallyroy/aether-editor#readme"),
+            menus::MenuCmd::OpenReleases => open_url("https://github.com/actuallyroy/aether-editor/releases"),
+            menus::MenuCmd::Stub(name) => {
+                self.show_info_dialog(&format!("“{name}” isn’t implemented yet — it's on the roadmap."));
+            }
+            menus::MenuCmd::Separator => {} // not clickable; here for exhaustiveness
             menus::MenuCmd::Exit => {
                 if self.confirm_close_window() {
                     self.pending_close = true;
                 }
             }
         }
+    }
+
+    /// Show (and switch to) a sidebar view from the View menu, mirroring the
+    /// activity-bar behavior (SCM refreshes; Extensions scans on first open).
+    fn show_sidebar_view(&mut self, view: SidebarView) {
+        if view == SidebarView::Extensions {
+            if self.extensions.is_empty() {
+                self.extensions = extensions::scan();
+            }
+            self.rebuild_ext_rows();
+        }
+        if view == SidebarView::SourceControl {
+            if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
+                scp.refresh(&mut g.font_system);
+            }
+        }
+        self.sidebar_view = view;
+        self.sidebar_visible = true;
+        self.redraw();
     }
 
     /// Launch another app window: a fresh, folder-less `aether` instance (like
@@ -2802,6 +3124,23 @@ impl App {
             self.redraw();
         }
 
+        // Generic context menu: a click selects its item or dismisses it.
+        if let Some((anchor, entries)) = self.ctx_menu.clone() {
+            let hit = self.gpu.as_ref().and_then(|g| {
+                let win = (g.config.width as f32, g.config.height as f32);
+                let rect = g.ui.ctx.rect(anchor, win);
+                g.ui.ctx.item_at(rect, (x, y))
+            });
+            self.close_ctx_menu();
+            if let Some(i) = hit {
+                if let Some(e) = entries.get(i) {
+                    self.exec_ctx_action(e.action.clone());
+                }
+            }
+            self.redraw();
+            return;
+        }
+
         // The feedback form is modal: it swallows all clicks while open.
         if self.feedback_form.is_some() {
             let win = self.gpu.as_ref().map_or((1280.0, 800.0), |g| (g.config.width as f32, g.config.height as f32));
@@ -3846,6 +4185,10 @@ impl App {
         }
 
         // Escape closes an open context menu first.
+        if self.ctx_menu.is_some() && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+            self.close_ctx_menu();
+            return;
+        }
         if self.explorer.menu_open() && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
             self.close_context_menu();
             return;
@@ -3916,8 +4259,11 @@ impl App {
                 }
                 let alt = self.mods.alt_key();
                 if let Some(mut bytes) = translate_terminal_key(&event, ctrl, extend, alt) {
-                    // Escape at a normal shell prompt clears the typed input (kill-line,
-                    // Ctrl+U). Full-screen apps (vim, TUIs) still get the real ESC.
+                    // Escape at an IDLE shell prompt clears the typed input (kill-line,
+                    // Ctrl+U). Any running foreground process — alt-screen TUIs (vim)
+                    // AND inline ones (claude code) — gets the real ESC, so interrupt
+                    // and mode keys work. Busy-ness is asked of the pty-host, which
+                    // checks the shell for child processes.
                     if bytes == [0x1b] {
                         let in_alt = self
                             .terminal
@@ -3925,7 +4271,7 @@ impl App {
                             .get(self.terminal.active)
                             .and_then(|g| g.panes.get(g.focused))
                             .map_or(false, |p| p.term.is_alt());
-                        if !in_alt {
+                        if !in_alt && !self.terminal.focused_term_busy() {
                             bytes = vec![0x15]; // ^U — kill the whole input line
                         }
                     }
@@ -5026,6 +5372,16 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+}
+
+/// Reveal a path in the OS file manager (Finder / Explorer / file manager).
+fn reveal_in_os(path: &Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg("/select,").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn();
 }
 
 /// Shell-single-quote a path for pasting into a terminal (a trailing space lets

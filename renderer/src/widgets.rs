@@ -1237,6 +1237,7 @@ pub struct Menu {
     list: ListView,
     count: usize,
     base_w: f32, // unzoomed width; width() scales it so items don't wrap when zoomed
+    seps: Vec<usize>, // separator row indices — drawn as divider lines, not clickable
 }
 
 impl Menu {
@@ -1245,6 +1246,7 @@ impl Menu {
             list: ListView::new(fs, width, 400.0, theme::MENU_ITEM_H(), 12.0),
             count: 0,
             base_w: width / theme::ui_zoom(),
+            seps: Vec::new(),
         }
     }
 
@@ -1253,14 +1255,42 @@ impl Menu {
     }
 
     pub fn set_items(&mut self, fs: &mut FontSystem, labels: &[&str]) {
-        let mut t = String::new();
-        for l in labels {
-            t.push(' ');
-            t.push_str(l);
-            t.push('\n');
+        let rows: Vec<(&str, &str, bool)> = labels.iter().map(|l| (*l, "", false)).collect();
+        self.set_entries(fs, &rows);
+    }
+
+    /// Full rows: `(label, shortcut-hint, is_separator)`. Hints render dim after the
+    /// label; separator rows draw as divider lines and don't hover or click.
+    pub fn set_entries(&mut self, fs: &mut FontSystem, rows: &[(&str, &str, bool)]) {
+        let label_attrs = glyphon::Attrs::new()
+            .family(glyphon::Family::Name(theme::UI_FAMILY()))
+            .color(theme::FG_TEXT());
+        let hint_attrs = glyphon::Attrs::new()
+            .family(glyphon::Family::Name(theme::UI_FAMILY()))
+            .color(theme::FG_DIM());
+        let mut key = String::from("M\n");
+        let mut spans: Vec<(String, glyphon::Attrs<'static>)> = Vec::new();
+        self.seps.clear();
+        for (i, (label, hint, sep)) in rows.iter().enumerate() {
+            if *sep {
+                self.seps.push(i);
+                spans.push(("\n".to_string(), label_attrs));
+                key.push_str("--\n");
+                continue;
+            }
+            spans.push((format!(" {}", label), label_attrs));
+            if hint.is_empty() {
+                spans.push(("\n".to_string(), label_attrs));
+            } else {
+                spans.push((format!("    {}\n", hint), hint_attrs));
+            }
+            key.push_str(label);
+            key.push(' ');
+            key.push_str(hint);
+            key.push('\n');
         }
-        self.list.set_text(fs, &t, self.width(), 4000.0);
-        self.count = labels.len();
+        self.list.set_rich(fs, &key, &spans, self.width(), 4000.0);
+        self.count = rows.len();
     }
 
     /// The popup box rect for `anchor`, clamped within the window `win`.
@@ -1280,7 +1310,9 @@ impl Menu {
     }
 
     pub fn item_at(&self, menu: Rect, p: (f32, f32)) -> Option<usize> {
-        self.list.row_at(self.inner(menu), p, self.count)
+        self.list
+            .row_at(self.inner(menu), p, self.count)
+            .filter(|i| !self.seps.contains(i))
     }
 
     pub fn draw_bg(&self, menu: Rect, hovered: Option<usize>, quads: &mut Vec<Quad>) {
@@ -1299,10 +1331,18 @@ impl Menu {
                 .rounded_quad(theme::CONTEXT_BORDER(), r + 1.0),
         );
         quads.push(menu.rounded_quad(theme::CONTEXT_BG(), r));
-        if let Some(i) = hovered {
+        // Divider lines for separator rows.
+        for &i in &self.seps {
             let row = self.list.row_rect(self.inner(menu), i);
-            let pill = Rect { x: row.x + theme::zpx(4.0), y: row.y + theme::zpx(1.0), w: row.w - theme::zpx(8.0), h: (row.h - theme::zpx(2.0)).max(2.0) };
-            quads.push(pill.rounded_quad(theme::CONTEXT_SEL(), theme::zpx(5.0)));
+            let y = row.y + row.h * 0.5;
+            quads.push(Quad::new(row.x + theme::zpx(8.0), y, row.w - theme::zpx(16.0), 1.0, [1.0, 1.0, 1.0, 0.10]));
+        }
+        if let Some(i) = hovered {
+            if !self.seps.contains(&i) {
+                let row = self.list.row_rect(self.inner(menu), i);
+                let pill = Rect { x: row.x + theme::zpx(4.0), y: row.y + theme::zpx(1.0), w: row.w - theme::zpx(8.0), h: (row.h - theme::zpx(2.0)).max(2.0) };
+                quads.push(pill.rounded_quad(theme::CONTEXT_SEL(), theme::zpx(5.0)));
+            }
         }
     }
 

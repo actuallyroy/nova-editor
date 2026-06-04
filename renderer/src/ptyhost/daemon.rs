@@ -210,6 +210,10 @@ pub fn run() -> io::Result<()> {
                         let count = terms.values().filter(|t| t.owner == Some(cid) && shell_busy(t)).count();
                         send(&mut conns, cid, Frame::Control(Msg::BusyResult { count }));
                     }
+                    Frame::Control(Msg::QueryTermBusy { id }) => {
+                        let busy = terms.get(&id).map_or(false, shell_busy);
+                        send(&mut conns, cid, Frame::Control(Msg::TermBusyResult { id, busy }));
+                    }
                     Frame::Control(Msg::FocusWindow { workspace }) => {
                         // Single-window-per-folder: find another live window that has
                         // this workspace open and ask it to raise itself. Empty

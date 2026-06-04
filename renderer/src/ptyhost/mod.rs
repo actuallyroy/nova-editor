@@ -55,6 +55,11 @@ pub enum Msg {
     /// an idle prompt)? Used for the close-window warning. Replies `BusyResult`.
     QueryBusy,
     BusyResult { count: usize },
+    /// Is one specific terminal's shell running a foreground process? (Drives the
+    /// terminal's smart-Escape: a busy shell gets the real ESC, an idle prompt
+    /// clears the input line.) Replies `TermBusyResult`.
+    QueryTermBusy { id: TermId },
+    TermBusyResult { id: TermId, busy: bool },
     FocusResult { found: bool },
     /// Daemon→GUI: another instance asked for this window — raise it.
     Focus,

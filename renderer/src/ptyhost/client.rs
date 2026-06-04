@@ -98,6 +98,22 @@ impl Client {
         0 // no reply — don't block the close on a wedged daemon
     }
 
+    /// Is `id`'s shell running a foreground process? Blocking round-trip (bounded);
+    /// unrelated frames are stashed for `poll`. Defaults to BUSY on no reply, so a
+    /// wedged daemon never turns a TUI's ESC into a destructive kill-line.
+    pub fn term_busy(&mut self, id: TermId) -> bool {
+        send(&self.conn, Frame::Control(Msg::QueryTermBusy { id }));
+        let deadline = std::time::Instant::now() + Duration::from_millis(300);
+        while std::time::Instant::now() < deadline {
+            match self.rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Frame::Control(Msg::TermBusyResult { id: rid, busy })) if rid == id => return busy,
+                Ok(other) => self.stash.push_back(other),
+                Err(_) => {}
+            }
+        }
+        true
+    }
+
     /// Ask the daemon to focus another live window that already has `workspace`
     /// open. Returns true if one was found (so the caller should NOT open the folder
     /// here). Waits briefly for the reply; unrelated frames are stashed for `poll`.

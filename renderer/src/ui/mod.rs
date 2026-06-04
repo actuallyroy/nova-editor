@@ -26,6 +26,7 @@ use crate::extensions::OpenExt;
 /// A side-effect a panel requests of `App` — kept as data so cross-cutting actions
 /// (which touch shared state like the workspace) stay centralized in one place,
 /// applied by `App::apply_intent`.
+#[derive(Clone)]
 pub enum Intent {
     /// Open `path` and place the caret at (1-based `line`, byte `col`).
     OpenFile { path: PathBuf, line: usize, col: usize },

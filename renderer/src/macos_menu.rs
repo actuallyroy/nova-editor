@@ -40,6 +40,10 @@ pub fn install() -> (Menu, HashMap<String, MenuCmd>) {
             if matches!(entry.cmd, MenuCmd::Exit) {
                 continue;
             }
+            if matches!(entry.cmd, MenuCmd::Separator) {
+                let _ = sub.append(&PredefinedMenuItem::separator());
+                continue;
+            }
             let id = format!("m{i}_{j}");
             let item = MenuItem::with_id(id.clone(), entry.label, true, None);
             let _ = sub.append(&item);

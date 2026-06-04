@@ -812,6 +812,32 @@ impl SourceControlPanel {
         changed
     }
 
+    /// The file row under `pt` as (repo-relative path, in-staged-group, untracked) —
+    /// drives the right-click context menu.
+    pub fn row_at_point(&self, pt: (f32, f32), region: Rect) -> Option<(String, bool, bool)> {
+        if !Self::groups_viewport(region).contains(pt) {
+            return None;
+        }
+        for staged in [true, false] {
+            let (lr, vis, rows, list): (Rect, &[Vis], &[Row], &ListView) = if staged {
+                (self.staged_list(region), &self.staged_vis, &self.staged_rows, &self.staged)
+            } else {
+                (self.unstaged_list(region), &self.unstaged_vis, &self.unstaged_rows, &self.unstaged)
+            };
+            if !lr.contains(pt) {
+                continue;
+            }
+            if let Some(i) = list.row_at(lr, pt, vis.len()) {
+                if let Vis::File { row, .. } = &vis[i] {
+                    let r = &rows[*row];
+                    return Some((r.path.clone(), staged, r.untracked));
+                }
+            }
+            return None;
+        }
+        None
+    }
+
     pub fn on_press(&mut self, pt: (f32, f32), region: Rect, out: &mut Vec<Intent>) -> bool {
         // The groups scrollbar claims its presses (thumb drag / track jump).
         if self.scroll.press(pt) {
