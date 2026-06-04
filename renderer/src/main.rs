@@ -225,6 +225,10 @@ pub(crate) enum CtxAction {
     OpenAtHead(String),        // read-only tab with the file's HEAD version (repo-relative)
     RevealInTree(PathBuf),     // select + scroll this path in the explorer
     MoveToNewWindow(usize),    // reopen this tab's file in a fresh window, close it here
+    TermRename(usize),         // terminal tab: open the rename input
+    TermSplit(usize),          // terminal tab: split it
+    TermKill(usize),           // terminal tab: kill it (all panes)
+    TermNew,                   // terminal: new tab
 }
 
 pub(crate) struct App {
@@ -353,6 +357,7 @@ pub(crate) struct App {
     pub(crate) outline_open: bool,              // explorer OUTLINE section expanded
     pub(crate) chat: Option<ui::chat_panel::ChatPanel>, // right-sidebar AI chat (created with fs)
     pub(crate) pending_rename: Option<(String, &'static str, u32, u32)>, // (uri, lang, line, col) for the open rename input
+    pub(crate) pending_term_rename: Option<usize>, // terminal tab awaiting its rename input
     pub(crate) file_clipboard: Option<(PathBuf, bool)>, // explorer Cut/Copy: (path, is_cut)
     pub(crate) compare_select: Option<PathBuf>, // explorer "Select for Compare" anchor
     pub(crate) lsp_log: std::collections::VecDeque<String>, // ring buffer for the Output tab
@@ -457,6 +462,7 @@ impl App {
             nav: nav::NavState::default(),
             zen_saved: None,
             pending_rename: None,
+            pending_term_rename: None,
             file_clipboard: None,
             compare_select: None,
             lsp_log: std::collections::VecDeque::new(),
@@ -1217,6 +1223,19 @@ impl App {
 
     fn on_right_press(&mut self, x: f32, y: f32) {
         let layout = self.layout();
+        // Terminal tab list: per-tab management menu (rename / split / kill).
+        if let Some(i) = self.terminal.tab_at((x, y), &layout) {
+            let items = vec![
+                CtxEntry::new("Rename…", CtxAction::TermRename(i)),
+                CtxEntry::sep(),
+                CtxEntry::new("New Terminal", CtxAction::TermNew),
+                CtxEntry::new("Split Terminal", CtxAction::TermSplit(i)),
+                CtxEntry::sep(),
+                CtxEntry::new("Kill Terminal", CtxAction::TermKill(i)),
+            ];
+            self.open_ctx_menu((x, y), items);
+            return;
+        }
         // Windows-style terminal right-click: copy the selection if there is one,
         // otherwise paste the clipboard into the shell.
         if self.terminal.visible {
@@ -1516,6 +1535,22 @@ impl App {
             }
             CtxAction::OpenAtHead(rel) => self.open_file_at_head(rel),
             CtxAction::RevealInTree(p) => self.reveal_in_tree(p),
+            CtxAction::TermRename(i) => self.open_term_rename(i),
+            CtxAction::TermSplit(i) => {
+                self.terminal.switch_tab(i);
+                let panel = self.layout().terminal_panel;
+                self.terminal.split_terminal(panel, self.terminal_cell_w);
+                self.redraw();
+            }
+            CtxAction::TermKill(i) => {
+                self.terminal.kill_tab(i);
+                self.redraw();
+            }
+            CtxAction::TermNew => {
+                let panel = self.layout().terminal_panel;
+                self.terminal.new_terminal_tab(panel, self.terminal_cell_w);
+                self.redraw();
+            }
             CtxAction::MoveToNewWindow(i) => {
                 let path = self.workspace.documents.get(i).and_then(|d| d.path.clone());
                 if let (Some(path), Ok(exe)) = (path, std::env::current_exe()) {
@@ -2632,7 +2667,8 @@ impl App {
             }
             commands::PickKind::Problem
             | commands::PickKind::Location
-            | commands::PickKind::RenameSymbol => {} // handled at the commit site (need item/input)
+            | commands::PickKind::RenameSymbol
+            | commands::PickKind::RenameTerminal => {} // handled at the commit site (need item/input)
             commands::PickKind::SetColorTheme => {
                 self.apply_theme_by_name(label);
                 settings::set_color_theme(label); // persist across restarts
@@ -2825,6 +2861,21 @@ impl App {
                     if let Some((uri, lang, line, col)) = self.pending_rename.take() {
                         if !new_name.is_empty() && !self.lsp.request_rename(lang, &uri, line, col, &new_name) {
                             self.show_info_dialog("The language server isn't running yet.");
+                        }
+                    }
+                    return true;
+                }
+                // Terminal tab rename: same palette-as-input flow.
+                if matches!(self.palette.mode, commands::PaletteMode::QuickPick(commands::PickKind::RenameTerminal)) {
+                    let new_name = self
+                        .gpu
+                        .as_ref()
+                        .map(|g| g.ui.palette_input.text().trim().to_string())
+                        .unwrap_or_default();
+                    self.palette.close();
+                    if let Some(i) = self.pending_term_rename.take() {
+                        if !new_name.is_empty() {
+                            self.terminal.rename_tab(i, &new_name);
                         }
                     }
                     return true;
@@ -3156,6 +3207,23 @@ impl App {
         } else if files > 1 {
             // Single-file renames are self-evident; summarize multi-file ones.
             self.show_info_dialog(&format!("Renamed {total} occurrence(s) across {files} files (unsaved)."));
+        }
+        self.redraw();
+    }
+
+    /// Terminal tab rename: the palette becomes the input, seeded with the
+    /// current title (same flow as Rename Symbol).
+    fn open_term_rename(&mut self, i: usize) {
+        let Some(current) = self.terminal.tab_title(i) else { return };
+        self.pending_term_rename = Some(i);
+        self.palette.open_quick_pick(
+            commands::PickKind::RenameTerminal,
+            vec![commands::PickItem::new("Press Enter to rename the terminal, Esc to cancel", "")],
+        );
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.palette_input.set_text(&mut g.font_system, &current);
+            g.ui.palette_input.select_all();
+            g.ui.palette_input.focus(true);
         }
         self.redraw();
     }

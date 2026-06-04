@@ -75,6 +75,10 @@ impl Client {
     pub fn close(&self, id: TermId) {
         send(&self.conn, Frame::Control(Msg::Close { id }));
     }
+    /// Persist a tab rename in the daemon (restored on re-attach).
+    pub fn rename(&self, id: TermId, title: &str) {
+        send(&self.conn, Frame::Control(Msg::Rename { id, title: title.to_string() }));
+    }
     /// Release a terminal back to the daemon (kept running, reclaimable later).
     pub fn detach(&self, id: TermId) {
         send(&self.conn, Frame::Control(Msg::Detach { id }));

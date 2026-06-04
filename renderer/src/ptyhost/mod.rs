@@ -41,6 +41,9 @@ pub enum Msg {
     Resize { id: TermId, rows: u16, cols: u16 },
     /// Close (kill) a terminal.
     Close { id: TermId },
+    /// Set a terminal's display title (tab rename) — stored in the daemon so the
+    /// name survives a GUI restart / re-attach.
+    Rename { id: TermId, title: String },
     /// Release a terminal without killing it (window switched folders) — it becomes
     /// an orphan, reclaimable by the next window that opens its workspace.
     Detach { id: TermId },
@@ -168,7 +171,8 @@ pub fn info_path() -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         exe.hash(&mut h);
     }
-    crate::settings::config_dir().map(|d| d.join(format!("ptyhost-v2-{:08x}.json", h.finish() as u32)))
+    // v3: added Msg::Rename — old daemons can't parse it, so they keep their own file.
+    crate::settings::config_dir().map(|d| d.join(format!("ptyhost-v3-{:08x}.json", h.finish() as u32)))
 }
 
 /// Contents of the discovery file: where to connect + the auth token.

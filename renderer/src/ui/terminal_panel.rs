@@ -409,6 +409,43 @@ impl TerminalPanel {
         self.mark_dirty();
     }
 
+    /// Rename a tab: every pane in the group takes the title (the tab label reads
+    /// the focused pane's), and the daemon stores it so re-attach restores it.
+    pub fn rename_tab(&mut self, i: usize, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            return;
+        }
+        if let Some(g) = self.groups.get_mut(i) {
+            for p in g.panes.iter_mut() {
+                p.term.title = title.to_string();
+                if let Some(c) = self.client.as_ref() {
+                    c.rename(p.term.id, title);
+                }
+            }
+        }
+        self.mark_dirty();
+    }
+
+    /// The current title of tab `i` (rename-input seed).
+    pub fn tab_title(&self, i: usize) -> Option<String> {
+        self.groups.get(i).map(|g| g.title())
+    }
+
+    /// Tab-list row under `pt`, if the pointer is over the right-side tab list.
+    pub fn tab_at(&self, pt: (f32, f32), layout: &Layout) -> Option<usize> {
+        if !self.visible {
+            return None;
+        }
+        let content = terminal_content(layout.terminal_panel?);
+        let tl = terminal_tablist_rect(content, self.groups.len())?;
+        if !tl.contains(pt) {
+            return None;
+        }
+        let idx = ((pt.1 - tl.y) / theme::TREE_ROW_HEIGHT()) as usize;
+        (idx < self.groups.len()).then_some(idx)
+    }
+
     /// Header maximize: grow the panel to fill the whole content area (toggle).
     pub fn toggle_max(&mut self) {
         self.maximized = !self.maximized;

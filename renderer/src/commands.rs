@@ -92,6 +92,7 @@ pub enum PickKind {
     Problem,
     Location,     // jump targets from an LSP definition/references response
     RenameSymbol, // palette-as-input: the typed text is the new name
+    RenameTerminal, // palette-as-input: the typed text is the tab title
 }
 
 /// One row in a quick-pick list (dynamic, unlike the fixed `COMMANDS`).

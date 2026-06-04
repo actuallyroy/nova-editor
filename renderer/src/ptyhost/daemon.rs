@@ -199,6 +199,15 @@ pub fn run() -> io::Result<()> {
                             }
                         }
                     }
+                    Frame::Control(Msg::Rename { id, title }) => {
+                        // Tab rename: stored here so re-attach (Welcome/TermInfo)
+                        // restores the custom name after a GUI restart.
+                        if let Some(t) = terms.get_mut(&id) {
+                            if t.owner == Some(cid) {
+                                t.title = title;
+                            }
+                        }
+                    }
                     Frame::Control(Msg::Detach { id }) => {
                         if let Some(t) = terms.get_mut(&id) {
                             if t.owner == Some(cid) {
