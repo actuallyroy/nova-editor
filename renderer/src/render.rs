@@ -49,6 +49,19 @@ pub(crate) fn editor_region(layout: &Layout) -> Rect {
     }
 }
 
+/// Side-by-side diff geometry over the full editor region: the two gutters and
+/// two text panes `(left_gutter, left_text, right_gutter, right_text)`. Single
+/// source of truth shared by drawing, the scrollbars, and input hit-testing.
+pub(crate) fn diff_pane_rects(region: Rect) -> (Rect, Rect, Rect, Rect) {
+    let half = (region.w * 0.5).floor();
+    let g = theme::GUTTER_WIDTH();
+    let lg = Rect { x: region.x, y: region.y, w: g, h: region.h };
+    let lt = Rect { x: region.x + g, y: region.y, w: (half - g).max(0.0), h: region.h };
+    let rg = Rect { x: region.x + half, y: region.y, w: g, h: region.h };
+    let rt = Rect { x: region.x + half + g, y: region.y, w: (region.w - half - g).max(0.0), h: region.h };
+    (lg, lt, rg, rt)
+}
+
 /// Visible (non-collapsed) line ranges `[a, b]` inclusive, in order — the gaps are
 /// the folded regions. Used to render the editor text/gutter as fold-aware segments.
 pub(crate) fn fold_segments(d: &crate::document::Document, total: usize) -> Vec<(usize, usize)> {
@@ -254,16 +267,16 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Collapsed fold regions remove their hidden lines from the scrollable height.
         let hidden = d.hidden_above(d.rope.len_lines());
         let content_h = (d.rope.len_lines().saturating_sub(hidden)) as f32 * theme::LINE_HEIGHT() + theme::EDITOR_PAD() * 2.0;
-        let content_w = d.max_line_width() + theme::EDITOR_PAD() * 2.0;
-        // In a side-by-side diff each pane is ~half the editor width, so the
-        // horizontal scroll range must be measured against the pane width (else a
-        // line that fits the full editor but overflows a pane yields no scroll).
-        let vp = if d.diff.is_some() {
-            Rect { w: layout.editor_text.w * 0.5, ..layout.editor_text }
+        // Side-by-side diffs scroll each pane horizontally on its own (two scrollbars,
+        // see `diff_h*` on Document), so the document ScrollView only owns vertical
+        // here — content width 0 keeps its horizontal thumb hidden; the full-width
+        // viewport puts the vertical bar at the right edge.
+        let content_w = if d.diff.is_some() {
+            0.0
         } else {
-            layout.editor_text
+            d.max_line_width() + theme::EDITOR_PAD() * 2.0
         };
-        d.scroll.set_metrics(vp, (content_w, content_h));
+        d.scroll.set_metrics(layout.editor_text, (content_w, content_h));
         // Side-by-side diff: window both buffers to the viewport so glyphon only
         // processes visible rows (multi-file diffs were O(all lines) per frame).
         if d.diff.is_some() {
@@ -1067,6 +1080,48 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
         }
 
+        // Diff: indent guides on BOTH panes (VSCode shows them in the diff editor
+        // too). The right pane has no rope, so read indentation straight from each
+        // buffer's line text; guides scroll with their pane's own horizontal offset.
+        if let (Some(_), Some(right)) = (d.diff.as_ref(), d.diff_right.as_ref()) {
+            let tab = crate::settings::current().editor_tab_size.max(1);
+            let unit = d.indent_unit(tab).max(1);
+            let char_w = theme::FONT_SIZE() * 0.6;
+            let gw = theme::zpx(1.0).max(1.0);
+            let faint = [0.50, 0.52, 0.62, 0.14];
+            let (_, lt, _, rt) = diff_pane_rects(editor_full);
+            let leading_levels = |line: &str| -> usize {
+                let mut cols = 0usize;
+                for c in line.chars() {
+                    match c {
+                        ' ' => cols += 1,
+                        '\t' => cols += tab - (cols % tab),
+                        _ => break,
+                    }
+                }
+                cols / unit
+            };
+            for (pi, (buf, pane)) in [(&d.buffer, lt), (right, rt)].into_iter().enumerate() {
+                for run in buf.layout_runs() {
+                    let Some(bl) = buf.lines.get(run.line_i) else { continue };
+                    let levels = leading_levels(bl.text());
+                    if levels == 0 {
+                        continue;
+                    }
+                    // line_top is viewport-relative (window_diff sets the buffer scroll).
+                    let y = pane.y + theme::EDITOR_PAD() + run.line_top;
+                    let Some((qy, qh)) = clip_v(y, run.line_height) else { continue };
+                    for k in 0..levels {
+                        let gx = (pane.x + theme::EDITOR_PAD() + (k * unit) as f32 * char_w - d.diff_hx(pi)).round();
+                        if gx < pane.x || gx >= pane.x + pane.w {
+                            continue;
+                        }
+                        bg_quads.push(Quad::new(gx, qy, gw, qh, faint));
+                    }
+                }
+            }
+        }
+
         // Match highlights: every find result (when the find widget is open) OR
         // every occurrence of the current word-like selection (VSCode selection
         // highlight). A translucent box behind each; the current one shows via the
@@ -1283,6 +1338,47 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // Editor scrollbars (auto-hide overlay; vertical + horizontal).
         if !modal_open {
             d.scroll.draw(now, &mut fg_quads);
+        }
+        // Side-by-side diff: a horizontal scrollbar under each pane (independent —
+        // the right pane's long lines stay reachable when the left side is short).
+        if d.diff.is_some() && !modal_open {
+            let (_, lt, _, rt) = diff_pane_rects(editor_region(&layout));
+            for (i, pane) in [lt, rt].into_iter().enumerate() {
+                if let Some(th) = d.diff_hthumb(i, pane) {
+                    fg_quads.push(th.rounded_quad(theme::SCROLLBAR_THUMB(), th.h * 0.5));
+                }
+            }
+        }
+        // Diff overview ruler: a green/red mark on the vertical scrollbar track per
+        // added/removed row, so the distribution of changes across the whole file is
+        // visible at a glance (VSCode's diff overview ruler). Consecutive same-kind
+        // rows merge into one bar so a big diff stays a handful of quads.
+        if let Some(diff) = d.diff.as_ref() {
+            if !modal_open {
+                use crate::diff::RowKind;
+                let track = d.scroll.vtrack_rect();
+                let total = diff.rows.len().max(1) as f32;
+                let add = [0.26, 0.78, 0.40, 0.9];
+                let del = [0.92, 0.34, 0.34, 0.9];
+                let mut i = 0usize;
+                while i < diff.rows.len() {
+                    let kind = diff.rows[i].kind;
+                    let color = match kind {
+                        RowKind::Add => Some(add),
+                        RowKind::Del => Some(del),
+                        _ => None,
+                    };
+                    let Some(color) = color else { i += 1; continue };
+                    let start = i;
+                    while i < diff.rows.len() && diff.rows[i].kind == kind {
+                        i += 1;
+                    }
+                    let y0 = track.y + (start as f32 / total) * track.h;
+                    let y1 = track.y + (i as f32 / total) * track.h;
+                    let h = (y1 - y0).max(theme::zpx(2.0));
+                    fg_quads.push(Quad::new(track.x, y0, track.w, h, color));
+                }
+            }
         }
         // Overview markers: a tick on the scrollbar track per match — find results
         // (current one brighter) or selection occurrences — so you can see where
@@ -1725,10 +1821,14 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let rt = Rect { x: full.x + half + g, y: full.y, w: (full.w - half - g).max(0.0), h: full.h };
             ui.line_numbers.draw(lg, d.scroll_y(), theme::FG_GUTTER(), &mut areas);
             ui.line_numbers2.draw(rg, d.scroll_y(), theme::FG_GUTTER(), &mut areas);
-            for (buf, r) in [(&d.buffer, lt), (right, rt)] {
+            // Each pane scrolls horizontally on its own; clamp this frame (widths
+            // shift as rows window in/out) then offset the text by the pane's own x.
+            d.diff_clamp_h(0, lt.w);
+            d.diff_clamp_h(1, rt.w);
+            for (i, (buf, r)) in [(&d.buffer, lt), (right, rt)].into_iter().enumerate() {
                 areas.push(TextArea {
                     buffer: buf,
-                    left: r.x + theme::EDITOR_PAD() - d.scroll_x(),
+                    left: r.x + theme::EDITOR_PAD() - d.diff_hx(i),
                     // Vertical offset is handled by the buffer's own scroll (window_diff),
                     // so run positions are already viewport-relative.
                     top: r.y + theme::EDITOR_PAD(),

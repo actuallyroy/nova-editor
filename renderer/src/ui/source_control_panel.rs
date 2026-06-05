@@ -937,6 +937,19 @@ impl SourceControlPanel {
         self.last_w = -1.0; // force a reflow into the new mode next frame
     }
 
+    /// Current view mode (true = folder tree). Read to persist the choice.
+    pub fn tree_mode(&self) -> bool {
+        self.tree_mode
+    }
+
+    /// Restore the persisted view mode on launch.
+    pub fn set_tree_mode(&mut self, on: bool) {
+        if self.tree_mode != on {
+            self.tree_mode = on;
+            self.last_w = -1.0;
+        }
+    }
+
     /// Highlight (select) a row — persists until another is clicked or the changes
     /// refresh. The selected row's parent indent guide stays highlighted (the
     /// guides' persistent "active" guide), matching the editor's open-file behavior.
@@ -1031,8 +1044,9 @@ impl SourceControlPanel {
             return true;
         }
         if tree.contains(pt) {
-            self.tree_mode = !self.tree_mode;
-            self.last_w = -1.0; // force a reflow into the new mode on the next frame
+            // Route through the intent so the choice is toggled + persisted in one
+            // place (matching the … menu's View as Tree/List).
+            out.push(Intent::GitToggleView);
             return true;
         }
         if refresh.contains(pt) {

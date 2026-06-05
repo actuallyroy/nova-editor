@@ -8,7 +8,7 @@ use ropey::Rope;
 
 use crate::syntax::Lang;
 use crate::theme;
-use crate::widgets::{ScrollOpts, ScrollView};
+use crate::widgets::{Axis, Rect, Scrollbar, ScrollOpts, ScrollView};
 
 #[derive(Clone, Copy)]
 pub struct Selection {
@@ -77,6 +77,11 @@ pub struct Document {
     pub diff_right: Option<Buffer>,      // side-by-side: `buffer` = old/left, this = new/right
     pub diff_full: Option<crate::diff::Diff>, // combined view: the complete diff (pre-collapse)
     pub diff_collapsed: std::collections::HashSet<usize>, // collapsed file indices (combined view)
+    // Side-by-side diff: each pane scrolls horizontally on its own (the right pane's
+    // long lines must be reachable even when the left side is short). [0]=left/old,
+    // [1]=right/new. Cell so the &self render loop can clamp them per frame.
+    diff_hscroll: [std::cell::Cell<f32>; 2],
+    diff_hbar: [crate::widgets::Scrollbar; 2], // per-pane horizontal scrollbar drag state
     pub folds: std::collections::BTreeMap<usize, usize>, // folded regions: header line → last hidden line
     pub image: Option<String>,           // Some(media key) => this tab renders an image
     pub image_scale: Option<f32>,        // None = fit-to-window; Some(s) = absolute scale
@@ -329,6 +334,8 @@ impl Document {
             diff_right: None,
             diff_full: None,
             diff_collapsed: std::collections::HashSet::new(),
+            diff_hscroll: [std::cell::Cell::new(0.0), std::cell::Cell::new(0.0)],
+            diff_hbar: [Scrollbar::new(Axis::Horizontal), Scrollbar::new(Axis::Horizontal)],
             folds: std::collections::BTreeMap::new(),
             image: None,
             image_scale: None,
@@ -405,6 +412,8 @@ impl Document {
             diff_right: None,
             diff_full: None,
             diff_collapsed: std::collections::HashSet::new(),
+            diff_hscroll: [std::cell::Cell::new(0.0), std::cell::Cell::new(0.0)],
+            diff_hbar: [Scrollbar::new(Axis::Horizontal), Scrollbar::new(Axis::Horizontal)],
             folds: std::collections::BTreeMap::new(),
             image: Some(key),
             image_scale: None,
@@ -497,6 +506,8 @@ impl Document {
             diff_right,
             diff_full: full,
             diff_collapsed: std::collections::HashSet::new(),
+            diff_hscroll: [std::cell::Cell::new(0.0), std::cell::Cell::new(0.0)],
+            diff_hbar: [Scrollbar::new(Axis::Horizontal), Scrollbar::new(Axis::Horizontal)],
             folds: std::collections::BTreeMap::new(),
             image: None,
             image_scale: None,
@@ -610,8 +621,13 @@ impl Document {
         // Cache by (version, shape epoch): scanning every line of both diff buffers
         // each frame is the multi-file-diff scroll lag. Large-file mode isn't cached —
         // its windowed buffer reshapes (and its width changes) as you scroll.
+        // Diffs window their buffers (only visible rows are shaped), so a cache keyed
+        // by `version` would freeze the width to the first visible screenful and miss
+        // longer lines scrolled into view — recompute each frame like large mode. Both
+        // only ever scan the visible window, so this stays cheap.
+        let windowed = self.large || self.diff_right.is_some();
         let key = (self.version, theme::shape_epoch());
-        if !self.large {
+        if !windowed {
             if let Some((v, e, w)) = self.maxw_cache.get() {
                 if (v, e) == key {
                     return w;
@@ -625,7 +641,7 @@ impl Document {
             Some(right) => right.layout_runs().map(|r| r.line_w).fold(left, f32::max),
             None => left,
         };
-        if !self.large {
+        if !windowed {
             self.maxw_cache.set(Some((key.0, key.1, w)));
         }
         w
@@ -637,6 +653,90 @@ impl Document {
     }
     pub fn scroll_y(&self) -> f32 {
         self.scroll.offset().1
+    }
+
+    // ---- Side-by-side diff: independent per-pane horizontal scroll ----
+
+    /// Current horizontal offset (px) of diff pane `pane` (0=left, 1=right).
+    pub fn diff_hx(&self, pane: usize) -> f32 {
+        self.diff_hscroll[pane].get()
+    }
+
+    /// Widest shaped line (px, + padding) in diff pane `pane` — its scroll cap.
+    pub fn diff_pane_content_w(&self, pane: usize) -> f32 {
+        let widest = |buf: &Buffer| buf.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
+        let w = if pane == 0 {
+            widest(&self.buffer)
+        } else {
+            self.diff_right.as_ref().map_or(0.0, widest)
+        };
+        w + theme::EDITOR_PAD() * 2.0
+    }
+
+    /// Clamp a pane's horizontal offset to its content given the pane's visible
+    /// width — called each frame (content width shifts as rows window in/out).
+    pub fn diff_clamp_h(&self, pane: usize, view_w: f32) {
+        let max = (self.diff_pane_content_w(pane) - view_w).max(0.0);
+        self.diff_hscroll[pane].set(self.diff_hscroll[pane].get().clamp(0.0, max));
+    }
+
+    /// Wheel-scroll a diff pane horizontally by `dx` px (clamped). Returns true if
+    /// it moved.
+    pub fn diff_hwheel(&self, pane: usize, dx: f32, view_w: f32) -> bool {
+        let max = (self.diff_pane_content_w(pane) - view_w).max(0.0);
+        let before = self.diff_hscroll[pane].get();
+        let next = (before - dx).clamp(0.0, max);
+        self.diff_hscroll[pane].set(next);
+        next != before
+    }
+
+    /// Press on a diff pane's horizontal scrollbar track; begins a drag if hit.
+    pub fn diff_hbar_press(&mut self, p: (f32, f32), pane: usize, track: Rect, view_w: f32) -> bool {
+        let content = self.diff_pane_content_w(pane);
+        let cur = self.diff_hscroll[pane].get();
+        if let Some(s) = self.diff_hbar[pane].press_track(p, track, content, view_w, cur) {
+            self.diff_hscroll[pane].set(s.clamp(0.0, (content - view_w).max(0.0)));
+            return true;
+        }
+        false
+    }
+
+    pub fn diff_hbar_dragging(&self) -> bool {
+        self.diff_hbar.iter().any(|b| b.is_dragging())
+    }
+
+    /// Continue a diff scrollbar drag; returns true if a thumb moved.
+    pub fn diff_hbar_drag(&mut self, p: (f32, f32), panes: [Rect; 2]) -> bool {
+        let mut moved = false;
+        for pane in 0..2 {
+            if self.diff_hbar[pane].is_dragging() {
+                let content = self.diff_pane_content_w(pane);
+                let track = Self::diff_htrack(panes[pane]);
+                if let Some(s) = self.diff_hbar[pane].drag(p, track, content, panes[pane].w) {
+                    self.diff_hscroll[pane].set(s.clamp(0.0, (content - panes[pane].w).max(0.0)));
+                    moved = true;
+                }
+            }
+        }
+        moved
+    }
+
+    pub fn diff_release_hbars(&mut self) {
+        for b in &mut self.diff_hbar {
+            b.release();
+        }
+    }
+
+    /// The horizontal scrollbar track strip at the bottom of a diff pane's text rect.
+    pub fn diff_htrack(pane_text: Rect) -> Rect {
+        let h = theme::SCROLLBAR_WIDTH();
+        Rect { x: pane_text.x, y: pane_text.y + pane_text.h - h, w: pane_text.w, h }
+    }
+
+    /// Draw a pane's horizontal scrollbar thumb (returns the quad, if any).
+    pub fn diff_hthumb(&self, pane: usize, pane_text: Rect) -> Option<Rect> {
+        let track = Self::diff_htrack(pane_text);
+        self.diff_hbar[pane].thumb(track, self.diff_pane_content_w(pane), pane_text.w, self.diff_hscroll[pane].get())
     }
 
     // ---- Visual geometry (single source of truth for wrap-aware positions). ----

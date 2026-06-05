@@ -2157,6 +2157,10 @@ impl App {
             ui::Intent::GitToggleView => {
                 if let Some(scp) = self.source_control.as_mut() {
                     scp.toggle_view();
+                    // Persist the tree/list choice so it survives a restart.
+                    let mut st = state::State::load();
+                    st.scm_tree_view = scp.tree_mode();
+                    st.save();
                 }
                 self.redraw();
             }
@@ -4514,6 +4518,18 @@ impl App {
                     self.redraw();
                     return;
                 }
+            } else if self.workspace.active_doc().map_or(false, |d| d.diff.is_some()) {
+                // Diff: per-pane horizontal scrollbar drag, then the shared vertical bar.
+                let (_, lt, _, rt) = render::diff_pane_rects(render::editor_region(&layout));
+                if let Some(d) = self.workspace.active_doc_mut() {
+                    if d.diff_hbar_press((x, y), 1, crate::document::Document::diff_htrack(rt), rt.w)
+                        || d.diff_hbar_press((x, y), 0, crate::document::Document::diff_htrack(lt), lt.w)
+                        || d.scroll.press((x, y))
+                    {
+                        self.redraw();
+                        return;
+                    }
+                }
             } else if let Some(d) = self.workspace.active_doc_mut() {
                 if d.scroll.press((x, y)) {
                     self.redraw();
@@ -5151,6 +5167,16 @@ impl App {
             return;
         }
         if self.mouse_pressed {
+            // Diff per-pane horizontal scrollbar thumb drag.
+            if self.workspace.active_doc().map_or(false, |d| d.diff_hbar_dragging()) {
+                let (_, lt, _, rt) = render::diff_pane_rects(render::editor_region(&self.layout()));
+                if let Some(d) = self.workspace.active_doc_mut() {
+                    if d.diff_hbar_drag((x, y), [lt, rt]) {
+                        self.redraw();
+                    }
+                }
+                return;
+            }
             if let Some(d) = self.workspace.active_doc_mut() {
                 if d.scroll.is_dragging() {
                     if d.scroll.drag((x, y)) {
@@ -5333,6 +5359,7 @@ impl App {
         }
         if let Some(d) = self.workspace.active_doc_mut() {
             d.scroll.release();
+            d.diff_release_hbars();
         }
     }
 
@@ -5474,7 +5501,20 @@ impl App {
     }
 
     fn on_scroll_h(&mut self, dx: f32) {
+        let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+        let layout = self.layout();
         if let Some(d) = self.workspace.active_doc_mut() {
+            // Diff: scroll only the pane under the cursor (independent panes).
+            if d.diff.is_some() {
+                let (_, lt, _, rt) = render::diff_pane_rects(render::editor_region(&layout));
+                let pane = if rt.contains(p) { Some((1, rt.w)) } else if lt.contains(p) { Some((0, lt.w)) } else { None };
+                if let Some((i, vw)) = pane {
+                    if d.diff_hwheel(i, dx, vw) {
+                        self.redraw();
+                    }
+                }
+                return;
+            }
             if d.scroll.on_wheel(dx, 0.0) {
                 self.redraw();
             }
@@ -6792,10 +6832,13 @@ impl ApplicationHandler for App {
                     self.search = Some(ui::search_panel::SearchPanel::new(&mut g.font_system));
                     self.extensions_panel =
                         Some(ui::extensions_panel::ExtensionsPanel::new(&mut g.font_system));
-                    self.source_control = Some(ui::source_control_panel::SourceControlPanel::new(
+                    let mut scp = ui::source_control_panel::SourceControlPanel::new(
                         &mut g.font_system,
                         self.cwd.clone(),
-                    ));
+                    );
+                    // Restore the persisted tree/list view choice.
+                    scp.set_tree_mode(state::State::load().scm_tree_view);
+                    self.source_control = Some(scp);
                 }
                 self.open_initial();
                 // Populate the Source Control change-count badge at startup.

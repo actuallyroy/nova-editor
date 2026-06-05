@@ -20,6 +20,8 @@ pub struct State {
     pub last_workspace: Option<PathBuf>,
     /// Recently-opened workspace folders, newest first (File > Open Recent).
     pub recent: Vec<PathBuf>,
+    /// Source Control tree (true) vs flat-list (false) view, restored on launch.
+    pub scm_tree_view: bool,
 }
 
 fn state_path() -> Option<PathBuf> {
@@ -41,6 +43,9 @@ impl State {
             if !p.is_empty() {
                 s.last_workspace = Some(PathBuf::from(p));
             }
+        }
+        if let Some(t) = v.get("scmTreeView").and_then(|t| t.as_bool()) {
+            s.scm_tree_view = t;
         }
         if let Some(arr) = v.get("recentFolders").and_then(|r| r.as_array()) {
             s.recent = arr
@@ -73,6 +78,7 @@ impl State {
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect::<Vec<_>>(),
+            "scmTreeView": self.scm_tree_view,
         });
         if let Ok(text) = serde_json::to_string_pretty(&doc) {
             let _ = std::fs::write(&path, text);
