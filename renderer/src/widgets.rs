@@ -308,6 +308,13 @@ impl TextLabel {
     }
 }
 
+/// Caret bar width in physical px, scaled with UI zoom so the hairline stays
+/// visible at high zoom (a fixed 1.5px caret all but vanishes next to 2×-scaled
+/// glyphs).
+fn caret_w() -> f32 {
+    (1.5 * theme::ui_zoom()).max(1.5)
+}
+
 /// A real editable single-line text input. It OWNS its text, a caret byte index,
 /// and a selection anchor, plus all edit/navigation ops — so callers route
 /// keystrokes/mouse into it instead of keeping a parallel String. When empty it
@@ -852,12 +859,12 @@ impl TextInput {
             if y + h <= rect.y || y >= rect.y + rect.h {
                 return Quad::new(-10.0, -10.0, 0.0, 0.0, theme::CURSOR()); // off-screen
             }
-            return Quad::new(rect.x + pad_x + cx, y, 1.5, h, theme::CURSOR());
+            return Quad::new(rect.x + pad_x + cx, y, caret_w(), h, theme::CURSOR());
         }
         let x = rect.x + pad_x + self.x_for_byte(self.caret);
         let h = theme::UI_LINE_HEIGHT() - 6.0;
         let y = rect.text_top(h, self.align);
-        Quad::new(x, y, 1.5, h, theme::CURSOR())
+        Quad::new(x, y, caret_w(), h, theme::CURSOR())
     }
 
     /// Selection highlight rect(s) — one quad per shaped row the selection covers
@@ -888,10 +895,23 @@ impl TextInput {
             }
             if x1 > x0 {
                 let y = top0 + if self.multiline { run.line_top } else { 0.0 };
-                if self.multiline && (y + run.line_height <= rect.y || y >= rect.y + rect.h) {
-                    continue; // row scrolled out of the box
+                let mut top = y + 1.0;
+                let mut h = run.line_height - 2.0;
+                if self.multiline {
+                    // A row straddling the box edge must be clamped, not just
+                    // culled — otherwise its highlight bleeds above/below the box.
+                    let (lo, hi) = (rect.y, rect.y + rect.h);
+                    if top + h <= lo || top >= hi {
+                        continue; // fully outside the box
+                    }
+                    let bottom = (top + h).min(hi);
+                    top = top.max(lo);
+                    h = (bottom - top).max(0.0);
+                    if h <= 0.0 {
+                        continue;
+                    }
                 }
-                out.push(Quad::new(left + x0, y + 1.0, (x1 - x0).max(1.0), run.line_height - 2.0, theme::SELECTION()));
+                out.push(Quad::new(left + x0, top, (x1 - x0).max(1.0), h, theme::SELECTION()));
             }
         }
     }

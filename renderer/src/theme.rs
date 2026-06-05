@@ -790,6 +790,7 @@ pub const ICON_LIST_TREE: char = '\u{eb86}'; // codicon "list-tree" — view-as-
 pub const ICON_LIST_FLAT: char = '\u{eb84}'; // codicon "list-flat" — view-as-list toggle
 pub const ICON_STASH: char = '\u{ec26}'; // codicon "git-stash"
 pub const ICON_OPEN_CHANGES: char = '\u{eafd}'; // codicon "git-compare" — open diff
+pub const ICON_SPARKLE: char = '\u{ec10}'; // codicon "sparkle" — AI generate commit msg
 // Find/replace widget glyphs.
 pub const ICON_ARROW_UP: char = '\u{eaa1}'; // previous match
 pub const ICON_ARROW_DOWN: char = '\u{ea9a}'; // next match

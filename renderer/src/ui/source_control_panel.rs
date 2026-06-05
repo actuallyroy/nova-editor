@@ -130,6 +130,14 @@ pub struct SourceControlPanel {
     ic_tree: TextLabel,
     ic_flat: TextLabel,
     ic_chevron: TextLabel,
+    ic_sparkle: TextLabel,
+    /// AI commit-message generation is in flight (✨ shows a pending state, and we
+    /// drop a stale result if the user typed/committed meanwhile).
+    pub generating: bool,
+    /// When the current generation started — drives the pulsing-border phase.
+    gen_since: Option<std::time::Instant>,
+    /// A drag-select inside the commit message box is in progress.
+    msg_dragging: bool,
     hovered_header: Option<bool>, // Some(true)=Staged header, Some(false)=Changes header
     /// Scroll state of the groups area (headers + file lists) — the shared
     /// ScrollView owns the offset, clamping, and the auto-hiding scrollbar.
@@ -199,6 +207,10 @@ impl SourceControlPanel {
             ic_tree: icon(fs, theme::ICON_LIST_TREE),
             ic_flat: icon(fs, theme::ICON_LIST_FLAT),
             ic_chevron: icon(fs, theme::ICON_CHEVRON_DOWN),
+            ic_sparkle: icon(fs, theme::ICON_SPARKLE),
+            generating: false,
+            gen_since: None,
+            msg_dragging: false,
             hovered_header: None,
             scroll: ScrollView::new(ScrollOpts { vertical: true, horizontal: false, stick_to_end: false }),
             root,
@@ -232,6 +244,7 @@ impl SourceControlPanel {
             &mut self.ic_tree,
             &mut self.ic_flat,
             &mut self.ic_chevron,
+            &mut self.ic_sparkle,
         ] {
             l.reshape(fs);
         }
@@ -257,6 +270,21 @@ impl SourceControlPanel {
     }
     pub fn clear_message(&mut self, fs: &mut FontSystem) {
         self.msg.clear(fs);
+    }
+    /// Mark an AI commit-message generation as in flight (✨ dims, button ignores
+    /// further clicks until a result arrives).
+    pub fn begin_generating(&mut self) {
+        self.generating = true;
+        self.gen_since = Some(std::time::Instant::now());
+    }
+    /// Deliver a generated commit message (or just clear the pending state on
+    /// failure). Replaces whatever is in the box and re-wraps it.
+    pub fn set_generated_message(&mut self, fs: &mut FontSystem, msg: Option<&str>) {
+        self.generating = false;
+        self.gen_since = None;
+        if let Some(text) = msg {
+            self.msg.set_text(fs, text);
+        }
     }
     fn message(&self) -> String {
         self.msg.text().trim().to_string()
@@ -587,16 +615,17 @@ impl SourceControlPanel {
         key.splitn(2, '\u{0}').nth(1).unwrap_or("")
     }
 
-    /// [stash, tree-toggle, refresh, more] toolbar rects, right-aligned in the
-    /// CHANGES header row.
-    fn toolbar_rects(r: Rect) -> [Rect; 4] {
+    /// [sparkle, stash, tree-toggle, refresh, more] toolbar rects, right-aligned in
+    /// the CHANGES header row.
+    fn toolbar_rects(r: Rect) -> [Rect; 5] {
         let bw = 22.0 * theme::ui_zoom();
         let ch = Self::changes_hdr(r);
         let more = Rect { x: ch.x + ch.w - bw, y: ch.y, w: bw, h: row_h() };
         let refresh = Rect { x: more.x - bw, ..more };
         let tree = Rect { x: refresh.x - bw, ..more };
         let stash = Rect { x: tree.x - bw, ..more };
-        [stash, tree, refresh, more]
+        let sparkle = Rect { x: stash.x - bw, ..more };
+        [sparkle, stash, tree, refresh, more]
     }
     fn commit_main(r: Rect) -> Rect {
         let c = Self::commit_rect(r);
@@ -634,7 +663,20 @@ impl SourceControlPanel {
         let m = Self::msg_rect(region);
         let ir = theme::zpx(7.0);
         let border = Rect { x: m.x - 1.0, y: m.y - 1.0, w: m.w + 2.0, h: m.h + 2.0 };
-        bg.push(border.rounded_quad(theme::SEARCH_BORDER(), ir + 1.0));
+        // While the AI is generating, pulse a thicker accent border around the box
+        // as a loading affordance; otherwise the usual hairline border.
+        if self.generating {
+            let t = self.gen_since.map_or(0.0, |s| now.saturating_duration_since(s).as_secs_f32());
+            // ~1.1s period sine, eased to [0.35, 1.0] so it never fully fades.
+            let pulse = 0.5 - 0.5 * (t * std::f32::consts::TAU / 1.1).cos();
+            let a = 0.35 + 0.65 * pulse;
+            let glow = theme::zpx(2.5) * (0.6 + 0.4 * pulse); // border breathes in width too
+            let halo = Rect { x: m.x - glow, y: m.y - glow, w: m.w + glow * 2.0, h: m.h + glow * 2.0 };
+            let [r, g, b, _] = theme::ACCENT();
+            bg.push(halo.rounded_quad([r, g, b, a], ir + glow));
+        } else {
+            bg.push(border.rounded_quad(theme::SEARCH_BORDER(), ir + 1.0));
+        }
         bg.push(m.rounded_quad(theme::SEARCH_BG(), ir));
         if self.msg_active {
             self.msg.selection_quads(m, theme::zpx(6.0), bg);
@@ -699,8 +741,11 @@ impl SourceControlPanel {
     pub fn draw_text<'b>(&'b self, region: Rect, areas: &mut Vec<TextArea<'b>>) {
         let ch = Self::changes_hdr(region);
         self.l_changes.push(ch.x, ch, theme::FG_DIM(), areas);
-        // Top toolbar: stash · tree/list toggle · refresh · more.
-        let [stash, tree, refresh, more] = Self::toolbar_rects(region);
+        // Top toolbar: ✨ generate · stash · tree/list toggle · refresh · more.
+        let [sparkle, stash, tree, refresh, more] = Self::toolbar_rects(region);
+        // The sparkle accents when active, dims while a generation is in flight.
+        let spark_c = if self.generating { theme::FG_DIM() } else { theme::FG_ACTIVE() };
+        self.push_icon(&self.ic_sparkle, sparkle, spark_c, areas);
         self.push_icon(&self.ic_stash, stash, theme::FG_DIM(), areas);
         let toggle = if self.tree_mode { &self.ic_flat } else { &self.ic_tree };
         self.push_icon(toggle, tree, theme::FG_DIM(), areas);
@@ -941,19 +986,46 @@ impl SourceControlPanel {
         None
     }
 
-    pub fn on_press(&mut self, pt: (f32, f32), region: Rect, out: &mut Vec<Intent>) -> bool {
+    /// True when `pt` is over the commit message box — drives the I-beam cursor.
+    pub fn over_message(&self, pt: (f32, f32), region: Rect) -> bool {
+        Self::msg_rect(region).contains(pt)
+    }
+
+    /// Extend the commit-box selection while the mouse is dragged. Returns true
+    /// when a box drag-select is active (caller redraws).
+    pub fn on_drag(&mut self, pt: (f32, f32), region: Rect) -> bool {
+        if self.msg_dragging && self.msg_active {
+            self.msg.on_drag(Self::msg_rect(region), theme::zpx(6.0), pt.0, pt.1);
+            return true;
+        }
+        false
+    }
+
+    pub fn on_release(&mut self) {
+        self.msg_dragging = false;
+    }
+
+    pub fn on_press(&mut self, pt: (f32, f32), region: Rect, clicks: u32, out: &mut Vec<Intent>) -> bool {
         // The groups scrollbar claims its presses (thumb drag / track jump).
         if self.scroll.press(pt) {
             return true;
         }
         if Self::msg_rect(region).contains(pt) {
             self.msg_active = true;
-            self.msg.focus(true);
-            self.msg.set_caret_from_x(Self::msg_rect(region), theme::zpx(6.0), pt.0);
+            // on_click handles multiline caret-by-(x,y), double-click word, and
+            // triple-click select-all; it also sets focus.
+            self.msg.on_click(Self::msg_rect(region), theme::zpx(6.0), pt.0, pt.1, clicks);
+            self.msg_dragging = clicks <= 1; // a single press may start a drag-select
             return true;
         }
         // Top toolbar.
-        let [stash, tree, refresh, more] = Self::toolbar_rects(region);
+        let [sparkle, stash, tree, refresh, more] = Self::toolbar_rects(region);
+        if sparkle.contains(pt) {
+            if !self.generating {
+                out.push(Intent::GitGenerateCommitMessage);
+            }
+            return true;
+        }
         if stash.contains(pt) {
             out.push(Intent::GitStash);
             return true;
@@ -1196,7 +1268,7 @@ mod tests {
         let pt = (stage.x + stage.w * 0.5, stage.y + stage.h * 0.5);
 
         let mut out = Vec::new();
-        let consumed = p.on_press(pt, region, &mut out);
+        let consumed = p.on_press(pt, region, 1, &mut out);
         assert!(consumed, "press should be consumed");
         assert!(
             matches!(out.as_slice(), [Intent::GitStage(path)] if path == "src/main.rs"),
@@ -1224,7 +1296,7 @@ mod tests {
         let pt = (unstage.x + unstage.w * 0.5, unstage.y + unstage.h * 0.5);
 
         let mut out = Vec::new();
-        let consumed = p.on_press(pt, region, &mut out);
+        let consumed = p.on_press(pt, region, 1, &mut out);
         assert!(consumed, "press should be consumed");
         assert!(
             matches!(out.as_slice(), [Intent::GitUnstage(path)] if path == "src/main.rs"),
@@ -1260,7 +1332,7 @@ mod tests {
         let pt = (stage.x + stage.w * 0.5, stage.y + stage.h * 0.5);
 
         let mut out = Vec::new();
-        let consumed = p.on_press(pt, region, &mut out);
+        let consumed = p.on_press(pt, region, 1, &mut out);
         assert!(consumed, "press should be consumed");
         assert!(
             matches!(out.as_slice(), [Intent::GitStage(path)] if path == "src/ui/main.rs"),
@@ -1294,7 +1366,7 @@ mod tests {
         let pt = (stage.x + stage.w * 0.5, stage.y + stage.h * 0.5);
 
         let mut out = Vec::new();
-        let consumed = p.on_press(pt, region, &mut out);
+        let consumed = p.on_press(pt, region, 1, &mut out);
         theme::set_ui_zoom(1.0); // restore before asserting (so a panic still resets)
 
         assert!(consumed, "press should be consumed at zoom 2x");
@@ -1347,7 +1419,7 @@ mod tests {
         let pt = (stage.x + stage.w * 0.5, stage.y + stage.h * 0.5);
 
         let mut out = Vec::new();
-        let consumed = p.on_press(pt, region, &mut out);
+        let consumed = p.on_press(pt, region, 1, &mut out);
         assert!(consumed, "press should be consumed");
         let staged: Vec<&str> = out
             .iter()
@@ -1361,7 +1433,7 @@ mod tests {
         // Clicking the folder row BODY (left of the icons) toggles collapse instead.
         let body_pt = (lr.x + 10.0, lr.y + row_h() * 0.5);
         let mut out2 = Vec::new();
-        p.on_press(body_pt, region, &mut out2);
+        p.on_press(body_pt, region, 1, &mut out2);
         assert!(out2.is_empty(), "body click emits no intents");
         assert!(!p.collapsed.is_empty(), "body click collapsed the folder");
     }
@@ -1385,14 +1457,14 @@ mod tests {
         // Click the header body (left of any action icons / count pill).
         let uh = p.unstaged_hdr(region);
         let mut out = Vec::new();
-        assert!(p.on_press((uh.x + hdr_chev_w() + 4.0, uh.y + row_h() * 0.5), region, &mut out));
+        assert!(p.on_press((uh.x + hdr_chev_w() + 4.0, uh.y + row_h() * 0.5), region, 1, &mut out));
         assert!(out.is_empty(), "collapse emits no git intents");
         assert!(!p.unstaged_open, "group collapsed");
         assert_eq!(p.unstaged_list(region).h, 0.0, "collapsed group hides its rows");
 
         // A row click in the (now-hidden) list area does nothing.
         let mut out2 = Vec::new();
-        p.on_press((region.x + 20.0, uh.y + row_h() * 1.5), region, &mut out2);
+        p.on_press((region.x + 20.0, uh.y + row_h() * 1.5), region, 1, &mut out2);
         assert!(out2.is_empty(), "no row hits while collapsed");
     }
 }

@@ -31,6 +31,9 @@ pub enum WorkerMsg {
     // Feedback form: screenshot uploaded (if any) + GitHub issue created — Ok(url)
     // on success, Err(message) otherwise.
     FeedbackDone { result: Result<String, String> },
+    // AI commit-message generation (see ai.rs): the generated message on success,
+    // or an error to surface to the user.
+    CommitMessage { result: Result<String, String> },
     // ---- Language server (see lsp.rs) ----
     LspInitialized { sem_token_types: Vec<String> },            // initialize response (+ semantic legend)
     LspDiagnostics { server: &'static str, uri: String, diags: Vec<crate::lsp::Diagnostic> }, // push publishDiagnostics

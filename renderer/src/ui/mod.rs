@@ -58,6 +58,8 @@ pub enum Intent {
     /// Stash all working-tree changes (including untracked).
     GitStash,
     GitRefresh,
+    /// Generate a commit message from the current diff via Azure OpenAI (✨).
+    GitGenerateCommitMessage,
     /// Commit then push (the Commit button's split-dropdown action).
     GitCommitPush { msg: String, stage_all: bool },
     /// Open the commit split-button dropdown menu (Commit / Commit & Push) at

@@ -7,6 +7,7 @@
 // Activity bar, sidebar file tree, tab strip, editor (gutter + text),
 // status bar, command palette (Ctrl+Shift+P), find bar (Ctrl+F).
 
+mod ai;
 mod commands;
 mod completion;
 mod diff;
@@ -1049,6 +1050,14 @@ impl App {
             // The Extensions panel resolves its own cursor (filter = text, rows =
             // pointer, scrollbar/empty = arrow).
             c
+        } else if self.sidebar_visible
+            && self.sidebar_view == SidebarView::SourceControl
+            && self
+                .source_control
+                .as_ref()
+                .map_or(false, |scp| scp.over_message(p, layout.panel_region()))
+        {
+            CursorIcon::Text
         } else if self.focused_input_at(&layout, p).is_some() {
             CursorIcon::Text
         } else if new_page_install || new_detail_tab.is_some() || over_detail_link || over_diag_link {
@@ -1209,6 +1218,11 @@ impl App {
         consider(self.gpu.as_ref().and_then(|g| g.ui.sidebar.guides_next_wake(now)));
         if let Some(scp) = self.source_control.as_ref() {
             consider(scp.guides_next_wake(now));
+            // Keep ticking ~30fps while an AI commit message is generating so the
+            // pulsing commit-box animation runs.
+            if scp.generating {
+                consider(Some(now + Duration::from_millis(33)));
+            }
         }
         earliest
     }
@@ -2070,6 +2084,18 @@ impl App {
             }
             ui::Intent::GitStash => {
                 self.confirm_stash();
+            }
+            ui::Intent::GitGenerateCommitMessage => {
+                // Summarize the staged (or, if nothing staged, working-tree) diff
+                // into a commit message via Azure OpenAI, off the UI thread.
+                let diff = git::commit_diff(&self.cwd).unwrap_or_default();
+                if diff.trim().is_empty() {
+                    self.show_info_dialog("No changes to summarize — stage or edit some files first.");
+                } else if let Some(scp) = self.source_control.as_mut() {
+                    scp.begin_generating();
+                    ai::generate_commit_async(diff, self.worker_tx.clone());
+                }
+                self.redraw();
             }
             ui::Intent::GitRefresh => self.refresh_source_control(),
             ui::Intent::GitCommitPush { msg, stage_all } => {
@@ -4801,11 +4827,15 @@ impl App {
             && layout.sidebar.contains((x, y))
         {
             let region = layout.panel_region();
+            // Count consecutive clicks so the commit box gets double/triple-click
+            // word + select-all selection.
+            self.register_click(x, y);
+            let clicks = self.click_streak;
             let mut intents = Vec::new();
             let consumed = self
                 .source_control
                 .as_mut()
-                .map_or(false, |scp| scp.on_press((x, y), region, &mut intents));
+                .map_or(false, |scp| scp.on_press((x, y), region, clicks, &mut intents));
             for i in intents {
                 self.apply_intent(i);
             }
@@ -5098,6 +5128,15 @@ impl App {
                 }
             }
         }
+        if self.mouse_pressed && self.sidebar_view == SidebarView::SourceControl {
+            let region = self.layout().panel_region();
+            if let Some(scp) = self.source_control.as_mut() {
+                if scp.on_drag((x, y), region) {
+                    self.redraw();
+                    return;
+                }
+            }
+        }
         // File-tree scrollbar thumb drag.
         if self.mouse_pressed && self.explorer.scroll.is_dragging() {
             if self.explorer.scroll.drag((x, y)) {
@@ -5284,6 +5323,7 @@ impl App {
         self.explorer.scroll.release();
         if let Some(scp) = self.source_control.as_mut() {
             scp.scroll.release();
+            scp.on_release();
         }
         if let Some(ep) = self.extensions_panel.as_mut() {
             ep.on_release();
@@ -6541,6 +6581,26 @@ impl ApplicationHandler for App {
                         "Couldn't submit feedback. Check that GitHub CLI (gh) is installed and you're logged in.",
                     ),
                 },
+                WorkerMsg::CommitMessage { result } => {
+                    match result {
+                        Ok(msg) => {
+                            if let (Some(scp), Some(g)) =
+                                (self.source_control.as_mut(), self.gpu.as_mut())
+                            {
+                                scp.set_generated_message(&mut g.font_system, Some(&msg));
+                            }
+                        }
+                        Err(e) => {
+                            if let (Some(scp), Some(g)) =
+                                (self.source_control.as_mut(), self.gpu.as_mut())
+                            {
+                                scp.set_generated_message(&mut g.font_system, None);
+                            }
+                            self.show_info_dialog(&format!("Couldn't generate a commit message.\n\n{e}"));
+                        }
+                    }
+                    self.redraw();
+                }
             }
         }
 

@@ -114,6 +114,20 @@ pub fn stash(root: &Path) -> bool {
     git(root, &["stash", "push", "--include-untracked"]).is_some()
 }
 
+/// The diff that a commit would capture: staged changes (`git diff --cached`)
+/// when anything is staged, otherwise the whole working tree (`git diff` plus
+/// untracked file contents). Used to feed AI commit-message generation.
+pub fn commit_diff(root: &Path) -> Option<String> {
+    // `--cached` shows what's staged; if that's empty, fall back to the
+    // working-tree diff so "generate" works before staging anything.
+    let staged = git(root, &["diff", "--cached"]).unwrap_or_default();
+    if !staged.trim().is_empty() {
+        return Some(staged);
+    }
+    let unstaged = git(root, &["diff"]).unwrap_or_default();
+    Some(unstaged)
+}
+
 /// Push the current branch (`git push`). Returns true on success.
 pub fn push(root: &Path) -> bool {
     git(root, &["push"]).is_some()
