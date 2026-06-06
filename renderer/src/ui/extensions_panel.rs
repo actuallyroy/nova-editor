@@ -285,6 +285,10 @@ impl ExtensionsPanel {
 
     // ---- Input ----
     pub fn on_wheel(&mut self, p: (f32, f32), region: Rect, dy: f32) -> bool {
+        // Wheel over the filter box scrolls its (single-line) text horizontally.
+        if self.hwheel(p, region, dy) {
+            return true;
+        }
         if ext_list_region(region).contains(p) {
             self.scroll.on_wheel(0.0, dy);
             return true;
@@ -292,16 +296,24 @@ impl ExtensionsPanel {
         false
     }
 
+    /// Scroll the filter box under `p` horizontally by `d` px. Shared by vertical
+    /// and horizontal wheel routing.
+    pub fn hwheel(&self, p: (f32, f32), region: Rect, d: f32) -> bool {
+        if ext_filter_rect(region).contains(p) {
+            self.filter.scroll_h(-d);
+            return true;
+        }
+        false
+    }
+
     /// Mouse press inside the sidebar while the Extensions view is active.
-    pub fn on_press(&mut self, pt: (f32, f32), region: Rect, double: bool, out: &mut Vec<Intent>) -> bool {
+    pub fn on_press(&mut self, pt: (f32, f32), region: Rect, clicks: u32, out: &mut Vec<Intent>) -> bool {
         let fr = ext_filter_rect(region);
         if fr.contains(pt) {
             self.set_focus(true);
-            if double {
-                self.filter.select_word_at(fr, 6.0, pt.0);
-            } else {
-                self.filter.set_caret_from_x(fr, 6.0, pt.0);
-            }
+            // Route through the component's click handler so single/word/line
+            // (double/triple) selection all behave identically to other fields.
+            self.filter.on_click(fr, 6.0, pt.0, pt.1, clicks);
             self.dragging = true;
             return true;
         }

@@ -31,6 +31,8 @@ pub struct UiBuffers {
     pub tabs: Buffer,
     pub status: TextLabel,
     pub status_right: TextLabel,
+    pub branch_icon: TextLabel, // status-bar git-branch glyph (codicon)
+    pub branch: TextLabel,      // status-bar current branch name (clickable)
     pub line_numbers: Gutter,
     pub line_numbers2: Gutter, // right pane's gutter in a side-by-side diff
     pub diff_chev_down: TextLabel, // combined-diff file-header twistie (expanded)
@@ -52,6 +54,9 @@ pub struct UiBuffers {
     pub zoom_pct: TextLabel,
     pub drag_ghost: TextLabel, // file name floating at the cursor during a tree drag
     pub palette_input: TextInput,
+    pub settings_search: TextInput, // settings editor: search box
+    pub settings_input: TextInput,  // settings editor: inline number/text editor
+    pub settings_dropdowns: std::collections::HashMap<&'static str, crate::widgets::Dropdown>, // per-key enum/theme dropdowns
     pub palette_list: ListView,
     pub completion_list: ListView,
     pub find: crate::ui::find_widget::FindWidget,
@@ -234,6 +239,8 @@ impl GpuState {
             tabs: make_ui_buffer(&mut font_system, 4000.0, theme::TAB_HEIGHT()),
             status: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT()),
             status_right: TextLabel::new(&mut font_system, 4000.0, theme::STATUS_BAR_HEIGHT()),
+            branch_icon: TextLabel::new(&mut font_system, 32.0, theme::STATUS_BAR_HEIGHT()),
+            branch: TextLabel::new(&mut font_system, 600.0, theme::STATUS_BAR_HEIGHT()),
             line_numbers: Gutter::new(&mut font_system, theme::GUTTER_WIDTH()),
             line_numbers2: Gutter::new(&mut font_system, theme::GUTTER_WIDTH()),
             diff_chev_down: {
@@ -269,6 +276,9 @@ impl GpuState {
             block_tip: TextLabel::new(&mut font_system, 240.0, theme::UI_LINE_HEIGHT()),
             tab_icons: std::collections::HashMap::new(),
             palette_input: TextInput::new(&mut font_system, 600.0, theme::PALETTE_INPUT_HEIGHT()),
+            settings_search: TextInput::new(&mut font_system, 900.0, theme::zpx(34.0)),
+            settings_input: TextInput::new(&mut font_system, 360.0, theme::zpx(28.0)),
+            settings_dropdowns: std::collections::HashMap::new(),
             palette_list: ListView::new(
                 &mut font_system,
                 600.0,

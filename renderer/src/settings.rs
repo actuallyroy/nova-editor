@@ -264,6 +264,52 @@ fn strip_jsonc(src: &str) -> String {
             i += 1;
         }
     }
+    strip_trailing_commas(&out)
+}
+
+/// Drop trailing commas (`,` before a closing `}`/`]`) so hand-authored JSONC with
+/// a dangling comma still parses under strict `serde_json`. String-aware.
+fn strip_trailing_commas(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut in_str = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            out.push(c as char);
+            if c == b'\\' && i + 1 < b.len() {
+                out.push(b[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_str = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if c == b',' {
+            // Look ahead past whitespace: if the next significant char closes a
+            // container, this comma is trailing — drop it.
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < b.len() && (b[j] == b'}' || b[j] == b']') {
+                i += 1; // skip the comma
+                continue;
+            }
+        }
+        out.push(c as char);
+        i += 1;
+    }
     out
 }
 
@@ -399,6 +445,49 @@ pub fn set_auto_save(on: bool) {
     let value = if on { "afterDelay" } else { "off" };
     set_user_setting("files.autoSave", &format!("\"{value}\""));
     store().write().unwrap().files_auto_save = on;
+}
+
+/// Current value of one setting key, encoded as the JSON literal that would
+/// appear in settings.json (e.g. `12`, `true`, `"afterDelay"`). Used by the
+/// Settings editor to seed its controls. Unknown keys return `null`.
+pub fn value_json(key: &str) -> String {
+    let s = current();
+    match key {
+        "editor.fontSize" => format!("{}", s.editor_font_size as i64),
+        "editor.lineHeight" => format!("{}", s.editor_line_height as i64),
+        "editor.fontFamily" => format!("{:?}", s.editor_font_family),
+        "editor.tabSize" => format!("{}", s.editor_tab_size),
+        "editor.insertSpaces" => format!("{}", s.editor_insert_spaces),
+        "editor.wordWrap" => format!("{:?}", if s.editor_word_wrap { "on" } else { "off" }),
+        "editor.cursorBlinking" => format!("{:?}", if s.editor_cursor_blink { "blink" } else { "solid" }),
+        "editor.lineNumbers" => format!("{}", s.editor_line_numbers),
+        "editor.rulers" => format!("{}", s.editor_rulers),
+        "editor.renderLineHighlight" => format!("{}", s.editor_render_line_highlight),
+        "files.autoSave" => format!("{:?}", if s.files_auto_save { "afterDelay" } else { "off" }),
+        "files.eol" => format!("{:?}", s.files_eol),
+        "files.trimTrailingWhitespace" => format!("{}", s.files_trim_trailing),
+        "workbench.colorTheme" => format!("{:?}", s.workbench_color_theme),
+        "workbench.fontFamily" => format!("{:?}", s.workbench_font_family),
+        "workbench.activityBar.visible" => format!("{}", s.workbench_activitybar_visible),
+        "workbench.sideBar.visible" => format!("{}", s.workbench_sidebar_visible),
+        _ => "null".into(),
+    }
+}
+
+/// Write one key into the user settings.json (creating the file if needed),
+/// preserving the rest of the hand-authored document. The caller is responsible
+/// for reloading + re-applying afterwards.
+pub fn set_user_value(key: &str, value_json: &str) {
+    // Make sure the file exists so the first write has a `{ }` to insert into.
+    if let Some(path) = user_settings_path() {
+        if !path.exists() {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&path, "{\n}\n");
+        }
+    }
+    set_user_setting(key, value_json);
 }
 
 /// Rewrite (or insert) one `"key": value` line in the user settings.json,

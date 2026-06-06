@@ -334,6 +334,11 @@ impl SourceControlPanel {
         self.staged_rows.is_empty()
     }
 
+    /// Current branch name (for the status-bar indicator).
+    pub fn branch_name(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+
     pub fn refresh(&mut self, fs: &mut FontSystem) {
         self.branch = git::branch(&self.root);
         let changes = git::status(&self.root);

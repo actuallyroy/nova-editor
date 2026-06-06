@@ -337,6 +337,19 @@ pub struct TextInput {
     // view. Cell so `draw` can update it while staying `&self`.
     scroll_y: std::cell::Cell<f32>,
     last_caret: std::cell::Cell<usize>, // caret at the previous draw (caret-follow gate)
+    // Press x for the drag dead-zone: a drag only extends the selection after the
+    // pointer leaves a small zone, so the trailing move event from a click or
+    // double-click can't collapse the just-made selection. Set by every press path
+    // (on_click / set_caret_from_x / select_word_at), consumed by every drag path
+    // (on_drag / extend_to_x), cleared once the drag is armed.
+    press_x: Option<f32>,
+    // Single-line horizontal scroll (px), recomputed in `draw` to keep the caret in
+    // view so long text never bleeds past the box. Cell so `draw` stays `&self`.
+    scroll_x: std::cell::Cell<f32>,
+    // Content inset on the right (unzoomed px): reserves room for trailing controls
+    // drawn over the box (e.g. the Search field's Aa/\b/.* toggles) so text/caret
+    // never slide under them.
+    right_pad: f32,
 }
 
 impl TextInput {
@@ -356,7 +369,70 @@ impl TextInput {
             anchor: 0,
             scroll_y: std::cell::Cell::new(0.0),
             last_caret: std::cell::Cell::new(usize::MAX),
+            press_x: None,
+            scroll_x: std::cell::Cell::new(0.0),
+            right_pad: 0.0,
         }
+    }
+
+    /// Reserve `px` (unzoomed) of inset on the right edge for trailing controls
+    /// drawn over the field, so text/caret/selection never slide under them.
+    pub fn right_pad(mut self, px: f32) -> Self {
+        self.right_pad = px;
+        self
+    }
+
+    /// Width available for single-line text inside the box (rect minus the left pad
+    /// and the right inset).
+    fn avail_w(&self, rect: Rect, pad_x: f32) -> f32 {
+        (rect.w - pad_x - self.right_pad * theme::ui_zoom()).max(1.0)
+    }
+
+    /// Recompute the single-line horizontal scroll. Follows the caret only when it
+    /// moved (so wheel-scrolling isn't snapped back every frame), and always clamps
+    /// to the content. `&self` via the Cell.
+    fn update_scroll_x(&self, rect: Rect, pad_x: f32) {
+        if self.multiline {
+            return;
+        }
+        let avail = self.avail_w(rect, pad_x);
+        let mut sx = self.scroll_x.get();
+        let caret_moved = self.last_caret.get() != self.caret;
+        self.last_caret.set(self.caret);
+        if caret_moved {
+            let caret_x = self.x_for_byte(self.caret);
+            if caret_x - sx > avail {
+                sx = caret_x - avail;
+            }
+            if caret_x - sx < 0.0 {
+                sx = caret_x;
+            }
+        }
+        let total = self.x_for_byte(self.text.len());
+        let max = (total - avail).max(0.0);
+        self.scroll_x.set(sx.clamp(0.0, max));
+    }
+
+    /// Wheel-scroll a single-line field horizontally by `dx` px. The upper bound is
+    /// clamped on the next draw (which knows the box width).
+    pub fn scroll_h(&self, dx: f32) {
+        if self.multiline {
+            return;
+        }
+        self.scroll_x.set((self.scroll_x.get() + dx).max(0.0));
+    }
+
+    /// Should a drag to screen-space `x` be ignored because the pointer is still
+    /// inside the press dead-zone? Arms the drag (clears the gate) once it leaves.
+    /// Single source of truth shared by `on_drag` and `extend_to_x`.
+    fn drag_blocked(&mut self, x: f32) -> bool {
+        if let Some(px) = self.press_x {
+            if (x - px).abs() <= 4.0 * theme::ui_zoom() {
+                return true;
+            }
+            self.press_x = None; // armed — track freely from here on
+        }
+        false
     }
 
     /// Total shaped content height (px) — for sizing/scrolling a multiline field.
@@ -748,6 +824,8 @@ impl TextInput {
         if self.text.is_empty() {
             return 0;
         }
+        // Single-line: clicks are in box space, but the text may be scrolled.
+        let local_x = if self.multiline { local_x } else { local_x + self.scroll_x.get() };
         for run in self.buffer.layout_runs() {
             let on_row = !self.multiline
                 || (local_y >= run.line_top && local_y < run.line_top + run.line_height);
@@ -779,6 +857,7 @@ impl TextInput {
     /// — callers pass the click count and the field handles the rest.
     pub fn on_click(&mut self, rect: Rect, pad_x: f32, x: f32, y: f32, clicks: u32) {
         self.focused = true;
+        self.press_x = Some(x); // arm the drag dead-zone
         let b = self.byte_at_local(x - rect.x - pad_x, y - self.local_top(rect));
         match clicks {
             n if n >= 3 => self.select_all(),
@@ -790,13 +869,19 @@ impl TextInput {
         }
     }
 
-    /// Extend the selection to a click/drag position (mouse drag).
+    /// Extend the selection to a click/drag position (mouse drag). The press
+    /// dead-zone (see `drag_blocked`) keeps a double-click's word selection from
+    /// being collapsed by the trailing move event.
     pub fn on_drag(&mut self, rect: Rect, pad_x: f32, x: f32, y: f32) {
+        if self.drag_blocked(x) {
+            return;
+        }
         self.caret = self.byte_at_local(x - rect.x - pad_x, y - self.local_top(rect));
     }
 
     /// Place the caret (clearing selection) from a screen-space click.
     pub fn set_caret_from_x(&mut self, rect: Rect, pad_x: f32, x: f32) {
+        self.press_x = Some(x); // arm the drag dead-zone
         let b = self.byte_at_local_x(x - rect.x - pad_x);
         self.caret = b;
         self.anchor = b;
@@ -804,11 +889,15 @@ impl TextInput {
 
     /// Extend the selection to a screen-space x (mouse drag / shift-click).
     pub fn extend_to_x(&mut self, rect: Rect, pad_x: f32, x: f32) {
+        if self.drag_blocked(x) {
+            return;
+        }
         self.caret = self.byte_at_local_x(x - rect.x - pad_x);
     }
 
     /// Select the whole word under a screen-space x (double-click).
     pub fn select_word_at(&mut self, rect: Rect, pad_x: f32, x: f32) {
+        self.press_x = Some(x); // arm the drag dead-zone
         let b = self.byte_at_local_x(x - rect.x - pad_x);
         self.select_word_byte(b);
     }
@@ -861,7 +950,13 @@ impl TextInput {
             }
             return Quad::new(rect.x + pad_x + cx, y, caret_w(), h, theme::CURSOR());
         }
-        let x = rect.x + pad_x + self.x_for_byte(self.caret);
+        self.update_scroll_x(rect, pad_x);
+        let x = rect.x + pad_x + self.x_for_byte(self.caret) - self.scroll_x.get();
+        // Never let the caret render under a trailing control or outside the box.
+        let right = rect.x + rect.w - self.right_pad * theme::ui_zoom();
+        if x < rect.x + pad_x - 1.0 || x > right {
+            return Quad::new(-10.0, -10.0, 0.0, 0.0, theme::CURSOR());
+        }
         let h = theme::UI_LINE_HEIGHT() - 6.0;
         let y = rect.text_top(h, self.align);
         Quad::new(x, y, caret_w(), h, theme::CURSOR())
@@ -874,7 +969,12 @@ impl TextInput {
             return;
         }
         let (a, b) = self.sel_range();
-        let left = rect.x + pad_x;
+        // Single-line: shift by the horizontal scroll and clip to the box (minus the
+        // right inset) so a long selection never bleeds under trailing controls.
+        let sx = if self.multiline { 0.0 } else { self.scroll_x.get() };
+        let left = rect.x + pad_x - sx;
+        let clip_lo = rect.x + pad_x;
+        let clip_hi = rect.x + rect.w - self.right_pad * theme::ui_zoom();
         // Use the same fresh scroll as the text; for multiline keep highlights inside
         // the box so a scrolled-off selection doesn't bleed over panels below.
         let top0 = if self.multiline {
@@ -911,26 +1011,49 @@ impl TextInput {
                         continue;
                     }
                 }
-                out.push(Quad::new(left + x0, top, (x1 - x0).max(1.0), h, theme::SELECTION()));
+                let mut sx0 = left + x0;
+                let mut sx1 = left + x1;
+                if !self.multiline {
+                    sx0 = sx0.max(clip_lo);
+                    sx1 = sx1.min(clip_hi);
+                    if sx1 <= sx0 {
+                        continue;
+                    }
+                }
+                out.push(Quad::new(sx0, top, (sx1 - sx0).max(1.0), h, theme::SELECTION()));
             }
         }
     }
 
+    /// The pad and vertical placement a single-line field uses for its text, so a
+    /// static (non-focused) renderer can match this widget pixel-for-pixel.
+    pub const FIELD_PAD: f32 = 8.0;
+    pub fn field_text_top(rect: Rect) -> f32 {
+        rect.text_top(theme::UI_LINE_HEIGHT(), VAlign::Center)
+    }
+
     pub fn draw<'a>(&'a self, rect: Rect, pad_x: f32, color: glyphon::Color, areas: &mut Vec<TextArea<'a>>) {
-        let top = if self.multiline {
-            rect.y + theme::zpx(4.0) - self.scroll_for(rect)
+        let (top, left, right) = if self.multiline {
+            (rect.y + theme::zpx(4.0) - self.scroll_for(rect), rect.x + pad_x, rect.x + rect.w)
         } else {
-            rect.text_top(theme::UI_LINE_HEIGHT(), self.align)
+            // Keep the caret in view, scroll horizontally, and clip before any
+            // trailing control (right inset) so the text never bleeds under it.
+            self.update_scroll_x(rect, pad_x);
+            (
+                rect.text_top(theme::UI_LINE_HEIGHT(), self.align),
+                rect.x + pad_x - self.scroll_x.get(),
+                rect.x + rect.w - self.right_pad * theme::ui_zoom(),
+            )
         };
         areas.push(TextArea {
             buffer: &self.buffer,
-            left: rect.x + pad_x,
+            left,
             top,
             scale: 1.0,
             bounds: TextBounds {
-                left: rect.x as i32,
+                left: (rect.x + if self.multiline { 0.0 } else { pad_x }) as i32,
                 top: rect.y as i32,
-                right: (rect.x + rect.w) as i32,
+                right: right as i32,
                 bottom: (rect.y + rect.h) as i32,
             },
             default_color: color,
@@ -3172,6 +3295,55 @@ impl HoverCard {
 /// if the key wasn't consumed, or `Some(text_changed)` if it was (so callers can
 /// re-filter only when content actually changed). Shared by every input so
 /// selection, clipboard, and caret movement behave identically.
+/// A closed-state "select" control: a value-field box showing the current choice
+/// with a trailing chevron. The option list itself is opened through the shared
+/// context-menu overlay (the caller wires selection), so this owns only the closed
+/// control's rendering — one source of truth for every dropdown.
+///
+/// Drawing is split to match the renderer's two passes: `draw_box` in the quad
+/// phase, `draw_text` in the text/area phase.
+pub struct Dropdown {
+    value: TextLabel,
+    chevron: TextLabel,
+}
+
+impl Dropdown {
+    pub fn new(fs: &mut FontSystem) -> Self {
+        Self {
+            value: TextLabel::new(fs, 600.0, theme::UI_LINE_HEIGHT() * 2.0),
+            chevron: TextLabel::new(fs, 40.0, theme::UI_LINE_HEIGHT() * 2.0),
+        }
+    }
+
+    /// Set the displayed value. Re-shapes the chevron too so both track the current
+    /// zoom without a separate rezoom path.
+    pub fn set(&mut self, fs: &mut FontSystem, value: &str) {
+        self.value.set(fs, value, theme::UI_FAMILY());
+        self.chevron.set(fs, &theme::ICON_CHEVRON_DOWN.to_string(), theme::ICON_FAMILY);
+    }
+
+    /// Quad phase: the field-box chrome.
+    pub fn draw_box(&self, rect: Rect, radius: f32, quads: &mut Vec<Quad>) {
+        field_box(rect, radius, quads);
+    }
+
+    /// Text phase: value (left, clipped to the box interior so it can't run under
+    /// the chevron) + chevron (right). The box is only drawn when fully visible.
+    pub fn draw_text<'a>(&'a self, rect: Rect, pad: f32, areas: &mut Vec<TextArea<'a>>) {
+        let cw = theme::zpx(18.0);
+        let value_clip = Rect { x: rect.x, y: rect.y, w: (rect.w - cw - pad).max(1.0), h: rect.h };
+        self.value.push_in(rect.x + pad, rect, value_clip, theme::FG_TEXT(), areas);
+        self.chevron.push_in(rect.x + rect.w - cw, rect, rect, theme::FG_DIM(), areas);
+    }
+}
+
+/// Draw the chrome (1px border + input background) of a single-line value field.
+/// One source of truth for every box-style control in the Settings editor.
+pub fn field_box(rect: Rect, radius: f32, quads: &mut Vec<Quad>) {
+    quads.push(Rect { x: rect.x - 1.0, y: rect.y - 1.0, w: rect.w + 2.0, h: rect.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), radius));
+    quads.push(rect.rounded_quad(theme::PALETTE_INPUT_BG(), radius));
+}
+
 pub(crate) fn edit_input(
     input: &mut TextInput,
     fs: &mut FontSystem,

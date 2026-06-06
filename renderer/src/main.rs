@@ -214,6 +214,8 @@ pub(crate) enum CtxAction {
     Separator,
     Stub(&'static str),
     Command(Command),          // editor: cut/copy/paste/find/select-all/palette…
+    MenuCmd(menus::MenuCmd),    // reuse the menu-bar command routing (gear/manage menu)
+    SetSetting(&'static str, String), // settings-editor enum dropdown: write key = json value
     Cut,
     Copy,
     Paste,
@@ -314,6 +316,7 @@ pub(crate) struct App {
     // system exists, in `resumed`). Owns all of its own state + buffers.
     pub(crate) search: Option<ui::search_panel::SearchPanel>,
     pub(crate) source_control: Option<ui::source_control_panel::SourceControlPanel>,
+    pub(crate) settings_editor: ui::settings_editor::SettingsEditor,
     pub(crate) extensions_panel: Option<ui::extensions_panel::ExtensionsPanel>,
     pub(crate) extensions: Vec<Extension>,
     pub(crate) text_drag: Option<InputId>, // active mouse drag-selection in a text input
@@ -465,6 +468,7 @@ impl App {
             sidebar_view: SidebarView::Explorer,
             search: None, // built in `resumed` once the font system exists
             source_control: None, // built in `resumed`
+            settings_editor: ui::settings_editor::SettingsEditor::default(),
             extensions_panel: None, // built in `resumed`
             extensions: Vec::new(),
             text_drag: None,
@@ -1045,7 +1049,11 @@ impl App {
                 None
             }
         };
-        let new_cursor = if let Some(c) = over_overlay {
+        let new_cursor = if self.settings_editor.open {
+            // The Settings modal owns the whole screen — resolve its cursor here so
+            // background regions (editor I-beam, etc.) can't bleed through.
+            self.settings_cursor(p)
+        } else if let Some(c) = over_overlay {
             c
         } else if self.sidebar_split.is_dragging() || over_handle {
             self.sidebar_split.cursor()
@@ -1158,6 +1166,14 @@ impl App {
                 // Combined-diff file header / gutter fold chevron: clickable.
                 CursorIcon::Pointer
             } else if over_md_link {
+                CursorIcon::Pointer
+            } else if layout.status_bar.contains(p) && g.ui.branch.width() > 0.0 && {
+                // Status-bar branch indicator: clickable (geometry matches render.rs).
+                let icon_x = layout.status_bar.x + theme::zpx(10.0);
+                let name_x = icon_x + g.ui.branch_icon.width() + theme::zpx(2.0);
+                let block_w = (name_x + g.ui.branch.width() + theme::zpx(12.0)) - layout.status_bar.x;
+                p.0 < layout.status_bar.x + block_w
+            } {
                 CursorIcon::Pointer
             } else if layout.editor_text.contains(p)
                 && self.workspace.active_doc().map_or(false, |d| d.info.is_some())
@@ -1557,6 +1573,12 @@ impl App {
                 self.show_info_dialog(&format!("“{name}” isn’t implemented yet — it's on the roadmap."));
             }
             CtxAction::Command(c) => self.exec_command(c),
+            CtxAction::MenuCmd(m) => self.exec_menu_cmd(m),
+            CtxAction::SetSetting(key, value_json) => {
+                settings::set_user_value(key, &value_json);
+                self.apply_settings();
+                self.redraw();
+            }
             CtxAction::Cut => self.cut(),
             CtxAction::Copy => self.copy(),
             CtxAction::Paste => self.paste(),
@@ -2534,6 +2556,13 @@ impl App {
         self.click_streak >= 2
     }
 
+    /// Like `register_click`, but returns the full consecutive-click count (1, 2,
+    /// 3, …) so callers can distinguish double (word) from triple (line/all).
+    fn register_click_count(&mut self, x: f32, y: f32) -> u32 {
+        self.register_click(x, y);
+        self.click_streak as u32
+    }
+
     /// (rect, left-pad) of a given input, if it's currently shown.
     fn input_rect_for(&self, id: InputId, layout: &Layout) -> Option<(Rect, f32)> {
         match id {
@@ -3455,7 +3484,7 @@ impl App {
                     self.workspace.active = Some(self.workspace.documents.len() - 1);
                 }
             }
-            Command::OpenSettings => self.open_settings_file(settings::user_settings_path()),
+            Command::OpenSettings => self.open_settings_editor(),
             Command::OpenDefaultSettings => self.open_settings_file(settings::default_settings_path()),
             Command::ToggleTerminal => self.toggle_terminal(),
             Command::OpenFolder => {
@@ -4209,6 +4238,141 @@ impl App {
         // Unknown theme name — keep the current theme.
     }
 
+    /// Open the Settings editor modal.
+    fn open_settings_editor(&mut self) {
+        self.settings_editor.open = true;
+        self.settings_editor.edit_key = None;
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.settings_search.set_text(&mut g.font_system, &self.settings_editor.query);
+            g.ui.settings_search.focus(true);
+        }
+        self.redraw();
+    }
+
+    /// Close the Settings editor modal.
+    fn close_settings_editor(&mut self) {
+        self.settings_editor.open = false;
+        self.settings_editor.edit_key = None;
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.settings_search.focus(false);
+            g.ui.settings_input.focus(false);
+        }
+        self.redraw();
+    }
+
+    /// Commit an inline number/text edit to settings.json and re-apply.
+    fn commit_settings_input(&mut self) {
+        let Some(key) = self.settings_editor.edit_key.take() else { return };
+        let Some(def) = ui::settings_editor::SCHEMA.iter().find(|d| d.key == key) else { return };
+        let raw = self.gpu.as_ref().map(|g| g.ui.settings_input.text().trim().to_string()).unwrap_or_default();
+        let value_json = match def.control {
+            ui::settings_editor::Control::Number => {
+                // Accept integers; ignore garbage so a stray keystroke can't corrupt the file.
+                match raw.parse::<f64>() {
+                    Ok(n) => format!("{}", n as i64),
+                    Err(_) => return,
+                }
+            }
+            _ => format!("{:?}", raw), // quoted JSON string
+        };
+        settings::set_user_value(key, &value_json);
+        self.apply_settings();
+        if let Some(g) = self.gpu.as_mut() {
+            g.ui.settings_input.focus(false);
+        }
+        self.redraw();
+    }
+
+    /// Resolve the mouse cursor over the open Settings modal.
+    fn settings_cursor(&self, p: (f32, f32)) -> CursorIcon {
+        use ui::settings_editor as se;
+        let (sw, sh) = self.gpu.as_ref().map_or((1280.0, 800.0), |g| (g.config.width as f32, g.config.height as f32));
+        let lay = se::layout(Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+        if !lay.card.contains(p) {
+            return CursorIcon::Default; // scrim
+        }
+        if lay.search.contains(p) {
+            return CursorIcon::Text;
+        }
+        if lay.close.contains(p) {
+            return CursorIcon::Pointer;
+        }
+        if self.settings_editor.nav_cache.iter().any(|(r, _)| r.contains(p)) {
+            return CursorIcon::Pointer;
+        }
+        for h in &self.settings_editor.rows_cache {
+            if h.control.contains(p) {
+                return match se::SCHEMA[h.idx].control {
+                    se::Control::Number | se::Control::Text => CursorIcon::Text,
+                    _ => CursorIcon::Pointer,
+                };
+            }
+        }
+        CursorIcon::Default
+    }
+
+    /// Apply an `Action` returned by the Settings editor's click handler.
+    fn apply_settings_action(&mut self, action: ui::settings_editor::Action) {
+        use ui::settings_editor::Action;
+        match action {
+            Action::Close => self.close_settings_editor(),
+            Action::Navigate => self.redraw(),
+            Action::Toggle(key) => {
+                let cur = settings::value_json(key);
+                let next = if cur == "true" { "false" } else { "true" };
+                settings::set_user_value(key, next);
+                self.apply_settings();
+                self.redraw();
+            }
+            Action::OpenEnum(key, rect) => {
+                let Some(def) = ui::settings_editor::SCHEMA.iter().find(|d| d.key == key) else { return };
+                if let ui::settings_editor::Control::Enum(opts) = def.control {
+                    let items: Vec<CtxEntry> = opts
+                        .iter()
+                        .map(|(val, label)| {
+                            CtxEntry::new(*label, CtxAction::SetSetting(key, format!("{:?}", val)))
+                        })
+                        .collect();
+                    self.open_ctx_menu((rect.x, rect.y + rect.h), items);
+                }
+            }
+            Action::EditText(key) => {
+                // Seed the inline input with the current value (strip surrounding quotes).
+                let cur = settings::value_json(key);
+                let seed = cur.trim_matches('"').to_string();
+                self.settings_editor.edit_key = Some(key);
+                if let Some(g) = self.gpu.as_mut() {
+                    g.ui.settings_search.focus(false);
+                    g.ui.settings_input.set_text(&mut g.font_system, &seed);
+                    g.ui.settings_input.select_all();
+                    g.ui.settings_input.focus(true);
+                }
+                self.redraw();
+            }
+            Action::OpenTheme(rect) => {
+                // Open the theme list as an in-modal dropdown (the menu draws above the
+                // settings card now) so picking a theme applies in place — no eject to
+                // the command palette.
+                let mut labels: Vec<String> = vec!["Aether Dark".to_string()];
+                for e in &self.extensions {
+                    for t in &e.themes {
+                        if !labels.iter().any(|l| l.eq_ignore_ascii_case(&t.label)) {
+                            labels.push(t.label.clone());
+                        }
+                    }
+                }
+                let items: Vec<CtxEntry> = labels
+                    .into_iter()
+                    .map(|label| {
+                        let value = format!("{label:?}");
+                        CtxEntry::new(label, CtxAction::SetSetting("workbench.colorTheme", value))
+                    })
+                    .collect();
+                self.open_ctx_menu((rect.x, rect.y + rect.h), items);
+            }
+        }
+    }
+
     /// Open a settings file (user or default) as a document tab, dismissing any
     /// open extension page so it shows in the editor area.
     fn open_settings_file(&mut self, path: Option<PathBuf>) {
@@ -4529,6 +4693,56 @@ impl App {
                 }
             }
             self.redraw();
+            return;
+        }
+
+        // The Settings editor is modal: handle it before any region handler so a
+        // click outside the card dismisses it (rather than landing underneath).
+        if self.settings_editor.open {
+            let (sw, sh) = self.gpu.as_ref().map_or((1280.0, 800.0), |g| (g.config.width as f32, g.config.height as f32));
+            let lay = ui::settings_editor::layout(Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+            let p = (x, y);
+            if !lay.card.contains(p) {
+                self.close_settings_editor();
+                return;
+            }
+            let clicks = self.register_click_count(x, y);
+            // Search box: focus + place caret.
+            if lay.search.contains(p) {
+                self.settings_editor.edit_key = None;
+                if let Some(g) = self.gpu.as_mut() {
+                    g.ui.settings_input.focus(false);
+                    g.ui.settings_search.focus(true);
+                    g.ui.settings_search.on_click(lay.search, theme::zpx(10.0), x, y, clicks);
+                }
+                self.redraw();
+                return;
+            }
+            // An inline number/text edit in progress: clicks inside its box edit it,
+            // clicks elsewhere commit it first.
+            if let Some(key) = self.settings_editor.edit_key {
+                let hit = self
+                    .settings_editor
+                    .rows_cache
+                    .iter()
+                    .find(|h| ui::settings_editor::SCHEMA[h.idx].key == key)
+                    .copied();
+                if let Some(h) = hit {
+                    if h.control.contains(p) {
+                        if let Some(g) = self.gpu.as_mut() {
+                            g.ui.settings_input.on_click(h.control, theme::zpx(8.0), x, y, clicks);
+                        }
+                        self.redraw();
+                        return;
+                    }
+                }
+                self.commit_settings_input();
+            }
+            if let Some(act) = self.settings_editor.on_click(&lay, p) {
+                self.apply_settings_action(act);
+            } else if let Some(g) = self.gpu.as_mut() {
+                g.ui.settings_search.focus(false);
+            }
             return;
         }
 
@@ -4898,6 +5112,22 @@ impl App {
         }
 
         if layout.status_bar.contains((x, y)) {
+            // Branch indicator (far left): open the checkout quick-pick. Geometry must
+            // match render.rs's status-bar branch block.
+            let branch_block_w = self
+                .gpu
+                .as_ref()
+                .filter(|g| g.ui.branch.width() > 0.0)
+                .map(|g| {
+                    let icon_x = layout.status_bar.x + theme::zpx(10.0);
+                    let name_x = icon_x + g.ui.branch_icon.width() + theme::zpx(2.0);
+                    (name_x + g.ui.branch.width() + theme::zpx(12.0)) - layout.status_bar.x
+                })
+                .unwrap_or(0.0);
+            if branch_block_w > 0.0 && x < layout.status_bar.x + branch_block_w {
+                self.open_branch_pick(commands::PickKind::Checkout);
+                return;
+            }
             let cells = render::zoom_ctrl_cells(layout.status_bar);
             if cells[0].contains((x, y)) {
                 self.zoom_step(-0.1);
@@ -4949,6 +5179,28 @@ impl App {
                 }
                 self.redraw();
             }
+            // Bottom gear (idx 6): the "Manage" menu, VSCode-style.
+            if idx == 6 {
+                use menus::MenuCmd;
+                let r = layout.activity_rects()[6];
+                let items = vec![
+                    CtxEntry::key("Command Palette…", CtxAction::Palette, "Ctrl+Shift+P"),
+                    CtxEntry::sep(),
+                    CtxEntry::new("Profiles", CtxAction::Stub("Profiles")),
+                    CtxEntry::new("Settings", CtxAction::Command(Command::OpenSettings)),
+                    CtxEntry::key("Extensions", CtxAction::MenuCmd(MenuCmd::ShowExtensions), "Shift+Ctrl+X"),
+                    CtxEntry::new("Keyboard Shortcuts", CtxAction::MenuCmd(MenuCmd::ShortcutsRef)),
+                    CtxEntry::new("Snippets", CtxAction::Stub("Snippets")),
+                    CtxEntry::new("Tasks", CtxAction::Stub("Tasks")),
+                    CtxEntry::new("Color Theme", CtxAction::Command(Command::ColorTheme)),
+                    CtxEntry::sep(),
+                    CtxEntry::new("Backup and Sync Settings…", CtxAction::Stub("Backup and Sync Settings")),
+                    CtxEntry::new("Check for Updates…", CtxAction::MenuCmd(MenuCmd::CheckUpdate)),
+                ];
+                // Anchor just right of the gear; the menu renderer clamps it on-screen.
+                self.open_ctx_menu((r.x + r.w + theme::zpx(4.0), r.y), items);
+                self.redraw();
+            }
             return;
         }
 
@@ -4959,12 +5211,12 @@ impl App {
             && layout.sidebar.contains((x, y))
         {
             let region = layout.tree_region();
-            let double = self.register_click(x, y);
+            let clicks = self.register_click_count(x, y);
             let mut intents = Vec::new();
             let consumed = self
                 .extensions_panel
                 .as_mut()
-                .map_or(false, |ep| ep.on_press((x, y), region, double, &mut intents));
+                .map_or(false, |ep| ep.on_press((x, y), region, clicks, &mut intents));
             for i in intents {
                 self.apply_intent(i);
             }
@@ -4983,7 +5235,7 @@ impl App {
             && layout.sidebar.contains((x, y))
         {
             let region = layout.sidebar;
-            let double = self.register_click(x, y);
+            let clicks = self.register_click_count(x, y);
             let root = self.cwd.clone();
             let mut intents = Vec::new();
             let mut consumed = false;
@@ -4991,7 +5243,7 @@ impl App {
                 consumed = sp.on_press(
                     (x, y),
                     region,
-                    double,
+                    clicks,
                     &mut g.font_system,
                     root,
                     &self.worker_tx,
@@ -5267,6 +5519,28 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, x: f32, y: f32) {
+        // Settings editor: drag inside the focused field extends its selection. The
+        // TextInput component applies its own drag dead-zone, so a double-click's
+        // word selection survives the trailing move event.
+        if self.settings_editor.open && self.mouse_pressed {
+            if self.gpu.as_ref().map_or(false, |g| g.ui.settings_search.focused()) {
+                let (sw, sh) = self.gpu.as_ref().map_or((1280.0, 800.0), |g| (g.config.width as f32, g.config.height as f32));
+                let lay = ui::settings_editor::layout(Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+                if let Some(g) = self.gpu.as_mut() {
+                    g.ui.settings_search.on_drag(lay.search, theme::zpx(10.0), x, y);
+                }
+                self.redraw();
+                return;
+            }
+            if let Some(key) = self.settings_editor.edit_key {
+                let ctrl = self.settings_editor.rows_cache.iter().find(|h| ui::settings_editor::SCHEMA[h.idx].key == key).map(|h| h.control);
+                if let (Some(rect), Some(g)) = (ctrl, self.gpu.as_mut()) {
+                    g.ui.settings_input.on_drag(rect, theme::zpx(8.0), x, y);
+                    self.redraw();
+                    return;
+                }
+            }
+        }
         // Diff: drag a collapsed-unchanged separator to reveal lines progressively
         // (each line-height of travel reveals one hidden line from the top).
         if self.mouse_pressed {
@@ -5698,6 +5972,31 @@ impl App {
     fn on_scroll(&mut self, dy: f32) {
         let layout = self.layout();
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
+        // Settings editor: modal. Wheel over the search box or the focused field
+        // scrolls that text horizontally; elsewhere it scrolls the settings viewport.
+        if self.settings_editor.open {
+            let (sw, sh) = self.gpu.as_ref().map_or((1280.0, 800.0), |g| (g.config.width as f32, g.config.height as f32));
+            let lay = ui::settings_editor::layout(Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+            let edit_rect = self.settings_editor.edit_key.and_then(|key| {
+                self.settings_editor.rows_cache.iter().find(|h| ui::settings_editor::SCHEMA[h.idx].key == key).map(|h| h.control)
+            });
+            if let Some(g) = self.gpu.as_ref() {
+                if lay.search.contains(p) {
+                    g.ui.settings_search.scroll_h(-dy);
+                    self.redraw();
+                    return;
+                }
+                if edit_rect.map_or(false, |r| r.contains(p)) {
+                    g.ui.settings_input.scroll_h(-dy);
+                    self.redraw();
+                    return;
+                }
+            }
+            let max = (self.settings_editor.content_h - lay.right.h).max(0.0);
+            self.settings_editor.scroll = (self.settings_editor.scroll - dy).clamp(0.0, max);
+            self.redraw();
+            return;
+        }
         // Command palette: the wheel scrolls its list only when the pointer is over
         // the card; elsewhere the editor scrolls underneath (useful while previewing).
         if self.palette.active {
@@ -5805,9 +6104,53 @@ impl App {
         }
     }
 
+    /// Scroll the single-line input under `p` horizontally by `dx` px, if any. Used
+    /// by horizontal-wheel routing so inputs scroll the same as on a vertical wheel.
+    fn scroll_input_h(&mut self, p: (f32, f32), layout: &Layout, dx: f32) -> bool {
+        if self.settings_editor.open {
+            let (sw, sh) = self.gpu.as_ref().map_or((1280.0, 800.0), |g| (g.config.width as f32, g.config.height as f32));
+            let lay = ui::settings_editor::layout(Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+            let edit_rect = self.settings_editor.edit_key.and_then(|key| {
+                self.settings_editor.rows_cache.iter().find(|h| ui::settings_editor::SCHEMA[h.idx].key == key).map(|h| h.control)
+            });
+            if let Some(g) = self.gpu.as_ref() {
+                if lay.search.contains(p) {
+                    g.ui.settings_search.scroll_h(-dx);
+                    return true;
+                }
+                if edit_rect.map_or(false, |r| r.contains(p)) {
+                    g.ui.settings_input.scroll_h(-dx);
+                    return true;
+                }
+            }
+            return false;
+        }
+        if self.sidebar_visible && self.sidebar_view == SidebarView::Search {
+            if let Some(sp) = self.search.as_ref() {
+                if sp.hwheel(p, layout.sidebar, dx) {
+                    return true;
+                }
+            }
+        }
+        if self.sidebar_visible && self.sidebar_view == SidebarView::Extensions {
+            if let Some(ep) = self.extensions_panel.as_ref() {
+                if ep.hwheel(p, layout.tree_region(), dx) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn on_scroll_h(&mut self, dx: f32) {
         let p = (self.mouse_pos.x as f32, self.mouse_pos.y as f32);
         let layout = self.layout();
+        // Horizontal wheel (incl. Ctrl/Shift+wheel and trackpad) over an input box
+        // scrolls its text — same as a vertical wheel there.
+        if self.scroll_input_h(p, &layout, dx) {
+            self.redraw();
+            return;
+        }
         if let Some(d) = self.workspace.active_doc_mut() {
             // Diff: scroll only the pane under the cursor (independent panes).
             if d.diff.is_some() {
@@ -5870,6 +6213,45 @@ impl App {
             if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
                 self.close_dialog();
             }
+            return;
+        }
+
+        // The Settings editor is modal: route keys to its focused input.
+        if self.settings_editor.open && self.ctx_menu.is_none() {
+            let key = event.logical_key.as_ref();
+            if matches!(key, Key::Named(NamedKey::Escape)) {
+                if self.settings_editor.edit_key.is_some() {
+                    // Esc cancels an inline edit but keeps the modal open.
+                    self.settings_editor.edit_key = None;
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.ui.settings_input.focus(false);
+                        g.ui.settings_search.focus(true);
+                    }
+                    self.redraw();
+                } else {
+                    self.close_settings_editor();
+                }
+                return;
+            }
+            // Inline number/text editor focused: Enter commits, else edit the input.
+            if self.settings_editor.edit_key.is_some() {
+                if matches!(key, Key::Named(NamedKey::Enter)) {
+                    self.commit_settings_input();
+                    return;
+                }
+                if let Some(g) = self.gpu.as_mut() {
+                    edit_input(&mut g.ui.settings_input, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend);
+                }
+                self.redraw();
+                return;
+            }
+            // Otherwise the search box has focus.
+            if let Some(g) = self.gpu.as_mut() {
+                edit_input(&mut g.ui.settings_search, &mut g.font_system, self.clipboard.as_mut(), &event, ctrl, extend);
+                self.settings_editor.query = g.ui.settings_search.text().to_string();
+            }
+            self.settings_editor.scroll = 0.0;
+            self.redraw();
             return;
         }
 

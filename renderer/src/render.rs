@@ -520,6 +520,15 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         // not in the status bar — the status bar keeps showing the file path.
         gpu.ui.status.set(fs, &status_text, theme::UI_FAMILY());
         gpu.ui.status_right.set(fs, &status_right_text, theme::UI_FAMILY());
+        // Git-branch indicator (far left of the status bar). Empty when not a repo.
+        let branch_name = app
+            .source_control
+            .as_ref()
+            .and_then(|s| s.branch_name())
+            .unwrap_or("")
+            .to_string();
+        gpu.ui.branch_icon.set(fs, &theme::ICON_SOURCE_CONTROL.to_string(), theme::ICON_FAMILY);
+        gpu.ui.branch.set(fs, &branch_name, theme::UI_FAMILY());
         gpu.ui.zoom_pct.set(fs, &format!("{}%", (theme::ui_zoom() * 100.0).round() as i32), theme::UI_FAMILY());
 
         // Source Control change-count badge text (capped at 99+).
@@ -717,7 +726,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // A modal overlay (palette / dialog / feedback form) covers the center but not the
     // edges, so every underlying overlay quad (scrollbars, detail icon, link underlines)
     // must be suppressed while one is open — otherwise it bleeds through around the modal.
-    let modal_open = layout.palette.is_some() || app.dialog.is_some() || app.feedback_form.is_some();
+    let modal_open = layout.palette.is_some() || app.dialog.is_some() || app.feedback_form.is_some() || app.settings_editor.open;
 
     // Info-tab page chrome (zebra rows, keycap pills, section rules, link
     // underlines) — under the text, in the editor region.
@@ -2163,8 +2172,20 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
 
     // Status bar — left: path; right: position/encoding/etc. Both via the
     // reusable TextLabel (left-padded and right-padded alignment helpers).
+    // Git-branch indicator at the far left; the path is shifted right past it.
+    let sb = layout.status_bar;
+    let branch_block_w = if ui.branch.width() > 0.0 {
+        let icon_x = sb.x + theme::zpx(10.0);
+        let name_x = icon_x + ui.branch_icon.width() + theme::zpx(2.0);
+        let sfg0 = theme::STATUS_BAR_FG();
+        ui.branch_icon.push(icon_x, sb, sfg0, &mut areas);
+        ui.branch.push(name_x, sb, sfg0, &mut areas);
+        (name_x + ui.branch.width() + theme::zpx(12.0)) - sb.x
+    } else {
+        0.0
+    };
     ui.status
-        .draw_left(layout.status_bar, theme::zpx(12.0), theme::STATUS_BAR_FG(), &mut areas);
+        .draw_left(layout.status_bar, branch_block_w.max(theme::zpx(12.0)), theme::STATUS_BAR_FG(), &mut areas);
     // Window-zoom control (− % +) pinned to the right; status info is padded left of it.
     let zoom_cells = zoom_ctrl_cells(layout.status_bar);
     ui.status_right
@@ -2604,44 +2625,6 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.queue.submit(Some(encc.finish()));
     }
 
-    // ---- Generic right-click context menu (editor / tabs / SCM / …) ----
-    if let Some((anchor, _)) = app.ctx_menu {
-        let menu = gpu.ui.ctx.rect(anchor, (cfg_w as f32, cfg_h as f32));
-        let mut mq: Vec<Quad> = Vec::new();
-        gpu.ui.ctx.draw_bg(menu, app.ctx_hover, &mut mq);
-        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &mq, &[], (cfg_w, cfg_h));
-        let mut mareas: Vec<TextArea> = Vec::new();
-        gpu.ui.ctx.draw(menu, &mut mareas);
-        gpu.text_renderer.prepare(
-            &gpu.device,
-            &gpu.queue,
-            &mut gpu.font_system,
-            &mut gpu.atlas,
-            &gpu.viewport,
-            mareas,
-            &mut gpu.swash_cache,
-        )?;
-        let mut encx = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("aether-ctx-pass"),
-        });
-        {
-            let mut pass = encx.begin_render_pass(&RenderPassDescriptor {
-                label: Some("aether-ctx"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            gpu.quad_renderer.render_bg(&mut pass);
-            gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
-        }
-        gpu.queue.submit(Some(encx.finish()));
-    }
-
     // ---- Top menu-bar dropdown overlay (drawn over everything) ----
     if let Some(open) = app.open_menu {
         let rects = gpu.menubar.item_rects(layout.menu_bar_rect());
@@ -2797,10 +2780,15 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.queue.submit(Some(encp.finish()));
     }
 
+    // ---- Settings editor overlay ----
+    if app.settings_editor.open {
+        draw_settings_editor(&mut app.settings_editor, gpu, &view, cfg_w, cfg_h, app.cursor_blink_on)?;
+    }
+
     // ---- Find/replace widget overlay ----
     // Floats over the editor's top-right; its own pass so editor text never bleeds
     // over the card. Suppressed while a centered modal owns the screen.
-    if app.find.active && layout.palette.is_none() && app.dialog.is_none() && app.feedback_form.is_none() {
+    if app.find.active && layout.palette.is_none() && app.dialog.is_none() && app.feedback_form.is_none() && !app.settings_editor.open {
         let er = editor_region(&layout);
         let fl = crate::ui::find_widget::FindWidget::layout(er, app.find.replace_open);
         let opts = [app.find.opts.case_sensitive, app.find.opts.whole_word, app.find.opts.regex];
@@ -3046,6 +3034,45 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         gpu.queue.submit(Some(encf.finish()));
     }
 
+    // ---- Generic right-click context menu (editor / tabs / SCM / settings dropdowns) ----
+    // Drawn last so it sits above every modal (palette / settings / dialog / feedback).
+    if let Some((anchor, _)) = app.ctx_menu {
+        let menu = gpu.ui.ctx.rect(anchor, (cfg_w as f32, cfg_h as f32));
+        let mut mq: Vec<Quad> = Vec::new();
+        gpu.ui.ctx.draw_bg(menu, app.ctx_hover, &mut mq);
+        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &mq, &[], (cfg_w, cfg_h));
+        let mut mareas: Vec<TextArea> = Vec::new();
+        gpu.ui.ctx.draw(menu, &mut mareas);
+        gpu.text_renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut gpu.font_system,
+            &mut gpu.atlas,
+            &gpu.viewport,
+            mareas,
+            &mut gpu.swash_cache,
+        )?;
+        let mut encx = gpu.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("aether-ctx-pass"),
+        });
+        {
+            let mut pass = encx.begin_render_pass(&RenderPassDescriptor {
+                label: Some("aether-ctx"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            gpu.quad_renderer.render_bg(&mut pass);
+            gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+        }
+        gpu.queue.submit(Some(encx.finish()));
+    }
+
     // Feedback screenshot: read back the offscreen frame as PNG and hand it to the
     // off-thread uploader, then drop the (unrendered) surface frame and repaint
     // normally next frame. Otherwise present as usual.
@@ -3125,4 +3152,379 @@ fn capture_texture_png(gpu: &crate::gpu::GpuState, tex: &wgpu::Texture) -> Optio
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .ok()?;
     Some(png)
+}
+
+/// Draw the Settings editor modal in its own pass over the live frame. Mirrors the
+/// command-palette pass: builds its own quad + text lists, then submits a Load pass.
+/// Also writes back the per-frame hit geometry (`rows_cache`, `cat_cache`,
+/// `content_h`) the click handler reads.
+fn draw_settings_editor(
+    ed: &mut crate::ui::settings_editor::SettingsEditor,
+    gpu: &mut crate::gpu::GpuState,
+    view: &wgpu::TextureView,
+    cfg_w: u32,
+    cfg_h: u32,
+    blink: bool,
+) -> Result<()> {
+    use crate::ui::settings_editor as se;
+    use glyphon::{Buffer, Color, Metrics};
+
+    fn make_buf(fs: &mut glyphon::FontSystem, text: &str, family: &str, fz: f32, lh: f32, wrap: Option<f32>) -> Buffer {
+        let mut b = Buffer::new(fs, Metrics::new(fz, lh));
+        b.set_size(fs, wrap, None);
+        b.set_text(fs, text, Attrs::new().family(Family::Name(family)), Shaping::Advanced);
+        b.shape_until_scroll(fs, false);
+        b
+    }
+    fn buf_lines(b: &Buffer) -> usize {
+        b.layout_runs().count().max(1)
+    }
+
+    struct T {
+        buf: Buffer,
+        left: f32,
+        top: f32,
+        color: Color,
+        clip: TextBounds,
+    }
+
+    let screen = Rect { x: 0.0, y: 0.0, w: cfg_w as f32, h: cfg_h as f32 };
+    let lay = se::layout(screen);
+    let ui_fam = theme::UI_FAMILY();
+    let icon_fam = theme::ICON_FAMILY;
+    let fz = theme::UI_FONT_SIZE();
+    let lh = theme::UI_LINE_HEIGHT();
+    let fg_text = theme::FG_TEXT();
+    let fg_dim = theme::FG_DIM();
+    let radius = theme::zpx(10.0);
+
+    let bounds = |r: Rect| TextBounds {
+        left: r.x.floor() as i32,
+        top: r.y.floor() as i32,
+        right: (r.x + r.w).ceil() as i32,
+        bottom: (r.y + r.h).ceil() as i32,
+    };
+
+    let mut q: Vec<Quad> = Vec::new();
+    let fg: Vec<Quad> = Vec::new();
+    let mut texts: Vec<T> = Vec::new();
+
+    let fs = &mut gpu.font_system;
+
+    // Scrim + card shadow + border + fill.
+    q.push(screen.quad(theme::DIALOG_OVERLAY()));
+    for i in 1..=7 {
+        let s = i as f32 * theme::zpx(2.5);
+        let a = 0.22 * (1.0 - (i as f32 - 1.0) / 7.0);
+        q.push(
+            Rect { x: lay.card.x - s, y: lay.card.y - s + theme::zpx(4.0), w: lay.card.w + s * 2.0, h: lay.card.h + s * 2.0 }
+                .rounded_quad([0.0, 0.0, 0.0, a], radius + s),
+        );
+    }
+    q.push(Rect { x: lay.card.x - 1.0, y: lay.card.y - 1.0, w: lay.card.w + 2.0, h: lay.card.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), radius + 1.0));
+    q.push(lay.card.rounded_quad(theme::PALETTE_BG(), radius));
+
+    // Header: gear glyph + "Settings" title + close button.
+    let pad = theme::zpx(16.0);
+    let gear = make_buf(fs, &theme::ICON_SETTINGS.to_string(), icon_fam, fz, lh, None);
+    texts.push(T { buf: gear, left: lay.header.x + pad, top: lay.header.y + (lay.header.h - lh) * 0.5, color: fg_dim, clip: bounds(lay.header) });
+    let title = make_buf(fs, "Settings", ui_fam, fz, lh, None);
+    texts.push(T { buf: title, left: lay.header.x + pad + theme::zpx(22.0), top: lay.header.y + (lay.header.h - lh) * 0.5, color: fg_text, clip: bounds(lay.header) });
+    let close = make_buf(fs, &theme::ICON_CLOSE.to_string(), icon_fam, fz, lh, None);
+    texts.push(T { buf: close, left: lay.close.x + (lay.close.w - theme::zpx(14.0)) * 0.5, top: lay.close.y + (lay.close.h - lh) * 0.5, color: fg_dim, clip: bounds(lay.close) });
+
+    // Search box (background + border). Text/caret drawn from the widget below.
+    let sr = lay.search;
+    q.push(Rect { x: sr.x - 1.0, y: sr.y - 1.0, w: sr.w + 2.0, h: sr.h + 2.0 }.rounded_quad(theme::PALETTE_BORDER(), theme::zpx(5.0)));
+    q.push(sr.rounded_quad(theme::PALETTE_INPUT_BG(), theme::zpx(4.0)));
+
+    // Left accordion tree: collapsible category headers (chevron) + their settings
+    // as indented leaves, like the Explorer. Clipped to the left column.
+    let accent = theme::ACCENT();
+    let cats = se::categories();
+    let row_h = theme::zpx(26.0);
+    let querying = !ed.query.trim().is_empty();
+    let lclip = bounds(lay.left);
+    ed.nav_cache.clear();
+    let mut cy = lay.left.y;
+    for (ci, name) in cats.iter().enumerate() {
+        let has_children = ci != 0;
+        let expanded = ci == 0 || ed.expanded.get(ci).copied().unwrap_or(true);
+        let r = Rect { x: lay.left.x, y: cy, w: lay.left.w, h: row_h };
+        // A category header is "active" when it's the selected category and no leaf
+        // is the scroll target.
+        let active = ci == ed.category && !querying;
+        if active {
+            q.push(r.rounded_quad(theme::TREE_SELECTED(), theme::zpx(4.0)));
+        }
+        let color = if active { fg_text } else { fg_dim };
+        if has_children {
+            let chev = make_buf(fs, &if expanded { theme::ICON_CHEVRON_DOWN } else { theme::ICON_CHEVRON_RIGHT }.to_string(), icon_fam, fz * 0.85, row_h, None);
+            texts.push(T { buf: chev, left: r.x + theme::zpx(6.0), top: r.y + (row_h - lh) * 0.5, color: fg_dim, clip: lclip });
+        }
+        let nb = make_buf(fs, name, ui_fam, fz, row_h, None);
+        texts.push(T { buf: nb, left: r.x + theme::zpx(22.0), top: r.y + (row_h - lh) * 0.5, color, clip: lclip });
+        ed.nav_cache.push((r, se::Nav::Category(ci)));
+        cy += row_h;
+        if has_children && expanded {
+            for idx in se::settings_in(ci) {
+                let lr = Rect { x: lay.left.x, y: cy, w: lay.left.w, h: row_h };
+                let leaf_active = ed.selected_key == Some(se::SCHEMA[idx].key);
+                if leaf_active {
+                    q.push(lr.rounded_quad(theme::TREE_SELECTED(), theme::zpx(4.0)));
+                }
+                let lc = if leaf_active { fg_text } else { fg_dim };
+                // Strip the "Category: " prefix so the leaf reads like VSCode's short name.
+                let title = se::SCHEMA[idx].title.split_once(": ").map(|(_, t)| t).unwrap_or(se::SCHEMA[idx].title);
+                let lb = make_buf(fs, title, ui_fam, fz, row_h, None);
+                texts.push(T { buf: lb, left: lr.x + theme::zpx(38.0), top: lr.y + (row_h - lh) * 0.5, color: lc, clip: lclip });
+                ed.nav_cache.push((lr, se::Nav::Setting(idx)));
+                cy += row_h;
+            }
+        }
+    }
+
+    // Right viewport: heading + setting rows (scrolled, clipped to the viewport).
+    let right = lay.right;
+    let cx = right.x;
+    let content_w = right.w;
+    let rclip = bounds(right);
+    let mut yy = 0.0_f32; // content offset from the top of the scroll region
+    let screen_y = |off: f32| right.y - ed.scroll + off;
+
+    let heading = if querying { "Search Results".to_string() } else { cats[ed.category].to_string() };
+    let head_lh = lh * 1.7;
+    {
+        let sy = screen_y(yy);
+        if sy + head_lh > right.y && sy < right.y + right.h {
+            let b = make_buf(fs, &heading, ui_fam, fz * 1.5, head_lh, None);
+            texts.push(T { buf: b, left: cx, top: sy, color: fg_text, clip: rclip });
+        }
+    }
+    yy += head_lh + theme::zpx(6.0);
+
+    let visible = ed.visible();
+    ed.rows_cache.clear();
+    // Dropdowns (enum/theme) draw their box in the quad phase here and their text in
+    // the area phase below; collect which to draw + where.
+    let mut dd_draws: Vec<(&'static str, Rect)> = Vec::new();
+    // Content offset of a left-tree-clicked setting, so we can scroll it into view.
+    let mut scroll_target_off: Option<f32> = None;
+    let desc_w = content_w - theme::zpx(8.0);
+    let input_w = theme::zpx(300.0).min(content_w * 0.7);
+    let input_h = theme::zpx(28.0);
+    let box_radius = theme::zpx(4.0);
+
+    for &idx in &visible {
+        let d = &se::SCHEMA[idx];
+        let cur = crate::settings::value_json(d.key);
+        // Measure the description's wrapped height first so the control sits below it.
+        let desc_buf = make_buf(fs, d.desc, ui_fam, fz, lh, Some(desc_w));
+        let desc_h = buf_lines(&desc_buf) as f32 * lh;
+
+        let title_off = yy;
+        if ed.scroll_to == Some(d.key) {
+            scroll_target_off = Some(title_off);
+        }
+        let desc_off = title_off + lh + theme::zpx(2.0);
+        let control_off = desc_off + desc_h + theme::zpx(8.0);
+        let control_h = match d.control {
+            se::Control::Bool => theme::zpx(20.0),
+            _ => input_h,
+        };
+        let row_bottom_off = control_off + control_h + theme::zpx(20.0);
+
+        let row_top = screen_y(title_off);
+        let control_y = screen_y(control_off);
+        let visible_band = screen_y(row_bottom_off) > right.y && row_top < right.y + right.h;
+
+        // Control geometry (used both to draw and to hit-test).
+        let control_rect = match d.control {
+            se::Control::Bool => Rect { x: cx, y: control_y, w: theme::zpx(20.0), h: theme::zpx(20.0) },
+            _ => Rect { x: cx, y: control_y, w: input_w, h: input_h },
+        };
+
+        // The control's box is a quad (no per-quad clipping), so only draw it when
+        // fully inside the viewport — otherwise it bleeds past the card edges.
+        let control_visible = control_rect.y >= right.y && control_rect.y + control_rect.h <= right.y + right.h;
+
+        if visible_band {
+            // Title (brighter) + description (dim, wrapped).
+            let tb = make_buf(fs, d.title, ui_fam, fz, lh, None);
+            texts.push(T { buf: tb, left: cx, top: row_top, color: fg_text, clip: rclip });
+            texts.push(T { buf: desc_buf, left: cx, top: screen_y(desc_off), color: fg_dim, clip: rclip });
+        }
+        // A single-line value field's static text sits exactly where the TextInput
+        // component would draw its own — same pad + vertical centering — so display
+        // and edit modes don't drift.
+        let field_pad = theme::zpx(crate::widgets::TextInput::FIELD_PAD);
+        let field_text = |buf: glyphon::Buffer, rect: Rect, color: Color| T {
+            buf,
+            left: rect.x + field_pad,
+            top: crate::widgets::TextInput::field_text_top(rect),
+            color,
+            clip: rclip,
+        };
+        if control_visible {
+            match d.control {
+                se::Control::Bool => {
+                    let on = cur == "true";
+                    crate::widgets::field_box(control_rect, box_radius, &mut q);
+                    if on {
+                        q.push(control_rect.rounded_quad(accent, box_radius));
+                        let chk = make_buf(fs, &theme::ICON_CHECK.to_string(), icon_fam, fz, control_rect.h, None);
+                        texts.push(T { buf: chk, left: control_rect.x + theme::zpx(3.0), top: control_rect.y, color: Color::rgb(0xFF, 0xFF, 0xFF), clip: rclip });
+                    }
+                }
+                se::Control::Enum(opts) => {
+                    let label = opts.iter().find(|(v, _)| format!("{:?}", v) == cur).map(|(_, l)| *l).unwrap_or("");
+                    let dd = gpu.ui.settings_dropdowns.entry(d.key).or_insert_with(|| crate::widgets::Dropdown::new(fs));
+                    dd.set(fs, label);
+                    dd.draw_box(control_rect, box_radius, &mut q);
+                    dd_draws.push((d.key, control_rect));
+                }
+                se::Control::Theme => {
+                    let dd = gpu.ui.settings_dropdowns.entry(d.key).or_insert_with(|| crate::widgets::Dropdown::new(fs));
+                    dd.set(fs, cur.trim_matches('"'));
+                    dd.draw_box(control_rect, box_radius, &mut q);
+                    dd_draws.push((d.key, control_rect));
+                }
+                se::Control::Number | se::Control::Text => {
+                    crate::widgets::field_box(control_rect, box_radius, &mut q);
+                    // When editing this row, the TextInput component renders itself
+                    // (text + selection + caret) below; otherwise show the value.
+                    if ed.edit_key != Some(d.key) {
+                        let b = make_buf(fs, cur.trim_matches('"'), ui_fam, fz, lh, None);
+                        texts.push(field_text(b, control_rect, fg_text));
+                    }
+                }
+            }
+        }
+
+        ed.rows_cache.push(se::RowHit {
+            idx,
+            row: Rect { x: cx, y: row_top, w: content_w, h: screen_y(row_bottom_off) - row_top },
+            control: control_rect,
+        });
+        yy = row_bottom_off;
+    }
+    ed.content_h = yy;
+
+    // One-shot: scroll a left-tree-selected setting into view (clamped), then clear.
+    if ed.scroll_to.is_some() {
+        if let Some(off) = scroll_target_off {
+            let max = (ed.content_h - right.h).max(0.0);
+            ed.scroll = off.clamp(0.0, max);
+        }
+        ed.scroll_to = None;
+    }
+    // Clamp the scroll (content may have shrunk) and draw the viewport scrollbar.
+    let max_scroll = (ed.content_h - right.h).max(0.0);
+    ed.scroll = ed.scroll.clamp(0.0, max_scroll);
+    if ed.content_h > right.h {
+        let track_h = right.h;
+        let thumb_h = (track_h * (track_h / ed.content_h)).max(theme::zpx(24.0));
+        let thumb_y = right.y + (ed.scroll / max_scroll.max(1.0)) * (track_h - thumb_h);
+        let tw = theme::zpx(6.0);
+        q.push(Rect { x: right.x + right.w - tw, y: thumb_y, w: tw, h: thumb_h }.rounded_quad([0.6, 0.64, 0.78, 0.5], tw * 0.5));
+    }
+
+    // Done shaping owned buffers — release the font_system borrow.
+    let _ = fs;
+
+    // Selection highlights (drawn under the text, so they go in the bg quad list).
+    gpu.ui.settings_search.selection_quads(lay.search, theme::zpx(10.0), &mut q);
+    if let Some(key) = ed.edit_key {
+        if let Some(h) = ed.rows_cache.iter().find(|h| se::SCHEMA[h.idx].key == key) {
+            gpu.ui.settings_input.selection_quads(h.control, theme::zpx(8.0), &mut q);
+        }
+    }
+
+    gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &q, &fg, (cfg_w, cfg_h));
+
+    let mut sareas: Vec<TextArea> = texts
+        .iter()
+        .map(|t| TextArea {
+            buffer: &t.buf,
+            left: t.left,
+            top: t.top,
+            scale: 1.0,
+            bounds: t.clip,
+            default_color: t.color,
+            custom_glyphs: &[],
+        })
+        .collect();
+    // Search box widget (placeholder/text/caret/selection).
+    gpu.ui.settings_search.set_placeholder(&mut gpu.font_system, "Search settings");
+    gpu.ui.settings_search.draw(lay.search, theme::zpx(10.0), fg_text, &mut sareas);
+    // Inline number/text editor, when active, draws on top of its control box.
+    if let Some(key) = ed.edit_key {
+        if let Some(h) = ed.rows_cache.iter().find(|h| se::SCHEMA[h.idx].key == key) {
+            gpu.ui.settings_input.draw(h.control, theme::zpx(8.0), fg_text, &mut sareas);
+        }
+    }
+    // Dropdown value + chevron (their boxes were drawn in the quad phase).
+    for (key, rect) in &dd_draws {
+        if let Some(dd) = gpu.ui.settings_dropdowns.get(key) {
+            dd.draw_text(*rect, theme::zpx(8.0), &mut sareas);
+        }
+    }
+
+    gpu.text_renderer.prepare(&gpu.device, &gpu.queue, &mut gpu.font_system, &mut gpu.atlas, &gpu.viewport, sareas, &mut gpu.swash_cache)?;
+
+    // Carets (drawn as fg quads in a tiny second prepare so they sit over the text).
+    let mut caretq: Vec<Quad> = Vec::new();
+    if blink {
+        if gpu.ui.settings_search.focused() {
+            caretq.push(gpu.ui.settings_search.caret_quad(lay.search, theme::zpx(10.0)));
+        }
+        if let Some(key) = ed.edit_key {
+            if gpu.ui.settings_input.focused() {
+                if let Some(h) = ed.rows_cache.iter().find(|h| se::SCHEMA[h.idx].key == key) {
+                    caretq.push(gpu.ui.settings_input.caret_quad(h.control, theme::zpx(8.0)));
+                }
+            }
+        }
+    }
+
+    let mut enc = gpu.device.create_command_encoder(&CommandEncoderDescriptor { label: Some("aether-settings-pass") });
+    {
+        let mut pass = enc.begin_render_pass(&RenderPassDescriptor {
+            label: Some("aether-settings"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        gpu.quad_renderer.render_bg(&mut pass);
+        gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+    }
+    gpu.queue.submit(Some(enc.finish()));
+
+    // Caret pass on top.
+    if !caretq.is_empty() {
+        gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &[], &caretq, (cfg_w, cfg_h));
+        let mut enc2 = gpu.device.create_command_encoder(&CommandEncoderDescriptor { label: Some("aether-settings-caret") });
+        {
+            let mut pass = enc2.begin_render_pass(&RenderPassDescriptor {
+                label: Some("aether-settings-caret"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            gpu.quad_renderer.render_fg(&mut pass);
+        }
+        gpu.queue.submit(Some(enc2.finish()));
+    }
+
+    Ok(())
 }

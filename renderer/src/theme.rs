@@ -831,6 +831,7 @@ pub const ICON_EXTENSIONS: char = '\u{eae6}';
 pub const ICON_CLOSE: char = '\u{ea76}';
 pub const ICON_ACCOUNT: char = '\u{eb99}';
 pub const ICON_SETTINGS: char = '\u{eb51}';
+pub const ICON_CHECK: char = '\u{eab2}';
 pub const ICON_CHEVRON_DOWN: char = '\u{eab4}';
 pub const ICON_CHEVRON_RIGHT: char = '\u{eab6}';
 pub const ICON_CHEVRON_UP: char = '\u{eab7}';

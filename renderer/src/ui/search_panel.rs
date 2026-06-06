@@ -60,7 +60,9 @@ impl SearchPanel {
             l.set(fs, s, theme::UI_FAMILY());
             l
         };
-        let mut query = TextInput::new(fs, theme::SIDEBAR_WIDTH(), 30.0);
+        // Reserve room on the right for the Aa/\b/.* toggles drawn inside the box
+        // (3*OPT + 2 gaps + margin) so text/caret never slide under them.
+        let mut query = TextInput::new(fs, theme::SIDEBAR_WIDTH(), 30.0).right_pad(3.0 * OPT + 2.0 * 3.0 + 10.0);
         query.set_placeholder(fs, " Search");
         let mut replace = TextInput::new(fs, theme::SIDEBAR_WIDTH(), 30.0);
         replace.set_placeholder(fs, " Replace");
@@ -569,9 +571,30 @@ impl SearchPanel {
     }
 
     pub fn on_wheel(&mut self, p: (f32, f32), region: Rect, dy: f32) -> bool {
+        // Wheel over an input box scrolls its (single-line) text horizontally.
+        if self.hwheel(p, region, dy) {
+            return true;
+        }
         if self.results_region(region).contains(p) {
             self.scroll.on_wheel(0.0, dy);
             return true;
+        }
+        false
+    }
+
+    /// Scroll the input box under `p` horizontally by `d` px (shared by vertical and
+    /// horizontal wheel routing). Returns true if an input consumed it.
+    pub fn hwheel(&self, p: (f32, f32), region: Rect, d: f32) -> bool {
+        for (rect, input) in [
+            (self.query_rect(region), &self.query),
+            (self.replace_rect(region), &self.replace),
+            (self.include_rect(region), &self.include),
+            (self.exclude_rect(region), &self.exclude),
+        ] {
+            if rect.h > 0.0 && rect.contains(p) {
+                input.scroll_h(-d);
+                return true;
+            }
         }
         false
     }
@@ -581,7 +604,7 @@ impl SearchPanel {
         &mut self,
         pt: (f32, f32),
         region: Rect,
-        double: bool,
+        clicks: u32,
         _fs: &mut FontSystem,
         root: PathBuf,
         tx: &Sender<WorkerMsg>,
@@ -644,47 +667,33 @@ impl SearchPanel {
             return true;
         }
         // Query / replace / include / exclude boxes — focus + caret + drag-select.
+        // Each box routes its press through the TextInput component so single /
+        // word / line (1/2/3-click) selection is identical everywhere.
         let q = self.query_rect(region);
         if q.contains(pt) {
             self.focus_only(0);
-            if double {
-                self.query.select_word_at(q, theme::zpx(6.0), pt.0);
-            } else {
-                self.query.set_caret_from_x(q, theme::zpx(6.0), pt.0);
-            }
+            self.query.on_click(q, theme::zpx(6.0), pt.0, pt.1, clicks);
             self.dragging = Some(0);
             return true;
         }
         let rr = self.replace_rect(region);
         if rr.contains(pt) {
             self.focus_only(1);
-            if double {
-                self.replace.select_word_at(rr, theme::zpx(6.0), pt.0);
-            } else {
-                self.replace.set_caret_from_x(rr, theme::zpx(6.0), pt.0);
-            }
+            self.replace.on_click(rr, theme::zpx(6.0), pt.0, pt.1, clicks);
             self.dragging = Some(1);
             return true;
         }
         let inc = self.include_rect(region);
         if inc.contains(pt) {
             self.focus_only(2);
-            if double {
-                self.include.select_word_at(inc, theme::zpx(6.0), pt.0);
-            } else {
-                self.include.set_caret_from_x(inc, theme::zpx(6.0), pt.0);
-            }
+            self.include.on_click(inc, theme::zpx(6.0), pt.0, pt.1, clicks);
             self.dragging = Some(2);
             return true;
         }
         let exc = self.exclude_rect(region);
         if exc.contains(pt) {
             self.focus_only(3);
-            if double {
-                self.exclude.select_word_at(exc, theme::zpx(6.0), pt.0);
-            } else {
-                self.exclude.set_caret_from_x(exc, theme::zpx(6.0), pt.0);
-            }
+            self.exclude.on_click(exc, theme::zpx(6.0), pt.0, pt.1, clicks);
             self.dragging = Some(3);
             return true;
         }

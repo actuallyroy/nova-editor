@@ -20,6 +20,7 @@ pub mod outline_panel;
 pub mod ext_detail_view;
 pub mod extensions_panel;
 pub mod search_panel;
+pub mod settings_editor;
 pub mod source_control_panel;
 pub mod feedback_form;
 pub mod terminal_panel;
