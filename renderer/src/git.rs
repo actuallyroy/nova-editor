@@ -128,6 +128,51 @@ pub fn commit_diff(root: &Path) -> Option<String> {
     Some(unstaged)
 }
 
+/// Apply a unified-diff `patch` (built by `diff::block_patch`) via stdin. `cached`
+/// targets the index (stage/unstage), else the working tree; `reverse` applies it
+/// backwards (unstage / revert). Zero-context patches need `--unidiff-zero`.
+/// Returns true on success.
+pub fn apply_patch(root: &Path, patch: &str, cached: bool, reverse: bool) -> bool {
+    use std::io::Write;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(root).args(["apply", "--unidiff-zero"]);
+    if cached {
+        cmd.arg("--cached");
+    }
+    if reverse {
+        cmd.arg("--reverse");
+    }
+    cmd.arg("-");
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[git] apply failed to spawn: {e}");
+            return false;
+        }
+    };
+    if let Some(stdin) = child.stdin.as_mut() {
+        if stdin.write_all(patch.as_bytes()).is_err() {
+            return false;
+        }
+    }
+    match child.wait_with_output() {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            eprintln!("[git] apply rejected: {}", String::from_utf8_lossy(&o.stderr).trim());
+            false
+        }
+        Err(_) => false,
+    }
+}
+
 /// Push the current branch (`git push`). Returns true on success.
 pub fn push(root: &Path) -> bool {
     git(root, &["push"]).is_some()

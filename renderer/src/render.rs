@@ -49,16 +49,55 @@ pub(crate) fn editor_region(layout: &Layout) -> Rect {
     }
 }
 
-/// Side-by-side diff geometry over the full editor region: the two gutters and
-/// two text panes `(left_gutter, left_text, right_gutter, right_text)`. Single
+/// Width of the per-block action column reserved just right of the pane divider
+/// (holds the vertically-stacked Stage/Revert/Unstage buttons so they never
+/// overlap the diff text or line numbers).
+fn diff_block_col_w() -> f32 {
+    theme::zpx(22.0)
+}
+
+/// The action column rect (just right of the divider) for the diff at `region`.
+pub(crate) fn diff_block_col(region: Rect) -> Rect {
+    let half = (region.w * 0.5).floor();
+    Rect { x: region.x + half, y: region.y, w: diff_block_col_w(), h: region.h }
+}
+
+/// Per-block Stage/Revert button rects for the change block at visible rows
+/// `[vbs, vbe)`, stacked vertically (with a gap) inside the action column and
+/// centered on the block. `count` buttons (2 = revert+stage for a working-tree
+/// diff, 1 = unstage for an index diff). Returns None when the block is fully
+/// scrolled out of view.
+pub(crate) fn diff_block_btn_rects(region: Rect, vbs: usize, vbe: usize, scroll_y: f32, count: usize) -> Option<Vec<Rect>> {
+    let lh = theme::LINE_HEIGHT();
+    let block_top = region.y + theme::EDITOR_PAD() + vbs as f32 * lh - scroll_y;
+    let block_h = (vbe.saturating_sub(vbs)).max(1) as f32 * lh;
+    if block_top + block_h <= region.y || block_top >= region.y + region.h {
+        return None;
+    }
+    let col = diff_block_col(region);
+    let bw = theme::zpx(18.0);
+    let gap = theme::zpx(7.0);
+    let stack_h = count as f32 * bw + (count.saturating_sub(1)) as f32 * gap;
+    let start = block_top + (block_h - stack_h) * 0.5; // center the stack on the block
+    let x = col.x + (col.w - bw) * 0.5; // center horizontally in the column
+    Some((0..count).map(|i| Rect { x, y: start + i as f32 * (bw + gap), w: bw, h: bw }).collect())
+}
+
+/// Side-by-side diff geometry over the full editor region: the two gutters and two
+/// text panes `(left_gutter, left_text, right_gutter, right_text)`. The right side
+/// reserves a `diff_block_col_w()` action column just right of the divider (before
+/// the right line-numbers), so per-block buttons never cover the text. Single
 /// source of truth shared by drawing, the scrollbars, and input hit-testing.
 pub(crate) fn diff_pane_rects(region: Rect) -> (Rect, Rect, Rect, Rect) {
     let half = (region.w * 0.5).floor();
     let g = theme::GUTTER_WIDTH();
+    let bw = diff_block_col_w();
     let lg = Rect { x: region.x, y: region.y, w: g, h: region.h };
     let lt = Rect { x: region.x + g, y: region.y, w: (half - g).max(0.0), h: region.h };
-    let rg = Rect { x: region.x + half, y: region.y, w: g, h: region.h };
-    let rt = Rect { x: region.x + half + g, y: region.y, w: (region.w - half - g).max(0.0), h: region.h };
+    // Right side: [divider][action column bw][number gutter g][text].
+    let rt_x = region.x + half + bw + g;
+    let rt = Rect { x: rt_x, y: region.y, w: (region.x + region.w - rt_x).max(0.0), h: region.h };
+    let rg = Rect { x: rt_x - g, y: region.y, w: g, h: region.h };
     (lg, lt, rg, rt)
 }
 
@@ -969,8 +1008,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         if let Some(diff) = d.diff.as_ref() {
             use crate::diff::RowKind;
             let half = (editor_full.w * 0.5).floor();
-            let (lt_x, lt_w) = (editor_full.x + theme::GUTTER_WIDTH(), (half - theme::GUTTER_WIDTH()).max(0.0));
-            let (rt_x, rt_w) = (editor_full.x + half + theme::GUTTER_WIDTH(), (editor_full.w - half - theme::GUTTER_WIDTH()).max(0.0));
+            let (_, lt_rect, _, rt_rect) = diff_pane_rects(editor_full);
+            let (lt_x, lt_w) = (lt_rect.x, lt_rect.w);
+            let (rt_x, rt_w) = (rt_rect.x, rt_rect.w);
             for run in d.buffer.layout_runs() {
                 let Some(row) = diff.rows.get(run.line_i) else { continue };
                 // line_top is viewport-relative (window_diff sets the buffer scroll).
@@ -991,11 +1031,27 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     }
                     // Combined-view file header: a full-width band (clickable to collapse).
                     RowKind::File => bg_quads.push(Quad::new(editor_full.x, qy, editor_full.w, qh, theme::TAB_BAR_BG())),
+                    // Collapsed-unchanged separator: a full-width neutral gray band
+                    // (click to expand, drag to reveal) — lighter than the dark filler
+                    // so it stands out from the diff background.
+                    RowKind::Gap => bg_quads.push(Quad::new(editor_full.x, qy, editor_full.w, qh, theme::DIFF_GAP_BG())),
                     RowKind::Context => {}
                 }
             }
             // Vertical divider between the two panes.
             bg_quads.push(Quad::new(editor_full.x + half, editor_full.y, 1.0, editor_full.h, theme::BORDER()));
+            // Per-block Stage/Revert (or Unstage) button backgrounds for the hovered
+            // change block — packed against the divider at the block's top row.
+            if d.diff_path.is_some() {
+                if let Some((vbs, vbe)) = app.hovered_diff_block {
+                    let count = if d.diff_staged { 1 } else { 2 };
+                    if let Some(rects) = diff_block_btn_rects(editor_full, vbs, vbe, d.scroll_y(), count) {
+                        for r in &rects {
+                            bg_quads.push(r.rounded_quad(theme::ACCENT_DIM(), theme::zpx(3.0)));
+                        }
+                    }
+                }
+            }
         }
 
         // editor.rulers — vertical guide line(s) at N monospace columns.
@@ -1812,13 +1868,10 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             page.draw(body, d.scroll_y(), &mut areas);
         } else if let Some(right) = d.diff_right.as_ref() {
             // Side-by-side diff: two gutters + two text panes over the full region.
+            // Geometry (incl. the reserved per-block action column) comes from the
+            // shared helper so numbers/text never collide with the buttons.
             let full = editor_region(&layout);
-            let half = (full.w * 0.5).floor();
-            let g = theme::GUTTER_WIDTH();
-            let lg = Rect { x: full.x, y: full.y, w: g, h: full.h };
-            let lt = Rect { x: full.x + g, y: full.y, w: (half - g).max(0.0), h: full.h };
-            let rg = Rect { x: full.x + half, y: full.y, w: g, h: full.h };
-            let rt = Rect { x: full.x + half + g, y: full.y, w: (full.w - half - g).max(0.0), h: full.h };
+            let (lg, lt, rg, rt) = diff_pane_rects(full);
             ui.line_numbers.draw(lg, d.scroll_y(), theme::FG_GUTTER(), &mut areas);
             ui.line_numbers2.draw(rg, d.scroll_y(), theme::FG_GUTTER(), &mut areas);
             // Each pane scrolls horizontally on its own; clamp this frame (widths
@@ -1859,6 +1912,39 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                         };
                         let cr = Rect { x: lt.x + theme::EDITOR_PAD(), y, w: theme::zpx(18.0), h: run.line_height };
                         chev.push(cr.x, cr, theme::FG_TEXT(), &mut areas);
+                    }
+                }
+                // Single-file view: an "unfold" (expand-all) button centered in each
+                // gutter on a collapsed-gap separator row.
+                if !diff.combined {
+                    for run in d.buffer.layout_runs() {
+                        let y = lt.y + theme::EDITOR_PAD() + run.line_top;
+                        if y > lt.y + lt.h {
+                            break;
+                        }
+                        let Some(row) = diff.rows.get(run.line_i) else { continue };
+                        if row.kind != crate::diff::RowKind::Gap || y + run.line_height < lt.y {
+                            continue;
+                        }
+                        for gutter in [lg, rg] {
+                            let r = Rect { x: gutter.x, y, w: gutter.w, h: run.line_height };
+                            ui.diff_unfold.draw_center(r, theme::FG_GUTTER_ACTIVE(), &mut areas);
+                        }
+                    }
+                }
+            }
+            // Per-block Stage/Revert (or Unstage) button glyphs for the hovered block.
+            if d.diff_path.is_some() {
+                if let Some((vbs, vbe)) = app.hovered_diff_block {
+                    let icons: &[&crate::widgets::TextLabel] = if d.diff_staged {
+                        &[&ui.diff_unstage]
+                    } else {
+                        &[&ui.diff_revert, &ui.diff_stage]
+                    };
+                    if let Some(rects) = diff_block_btn_rects(full, vbs, vbe, d.scroll_y(), icons.len()) {
+                        for (icon, r) in icons.iter().zip(rects) {
+                            icon.draw_center(r, theme::FG_TEXT(), &mut areas);
+                        }
                     }
                 }
             }
@@ -2640,6 +2726,49 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             gpu.quad_renderer.render_fg(&mut pass);
         }
         gpu.queue.submit(Some(encf.finish()));
+    }
+
+    // ---- Per-block button tooltip ----
+    // A small label ("Stage Block" / "Revert Block" / "Unstage Block") next to the
+    // hovered diff-block button.
+    if app.dialog.is_none() && app.feedback_form.is_none() {
+        if let Some((text, ax, ay)) = app.block_tip.clone() {
+            gpu.ui.block_tip.set(&mut gpu.font_system, &text, theme::UI_FAMILY());
+            let padx = theme::zpx(7.0);
+            let w = gpu.ui.block_tip.width() + padx * 2.0;
+            let h = theme::UI_LINE_HEIGHT() + theme::zpx(4.0);
+            // Prefer to the right of the button; flip left if it would overflow.
+            let mut bx = ax + theme::zpx(6.0);
+            if bx + w > cfg_w as f32 {
+                bx = ax - theme::zpx(26.0) - w;
+            }
+            let box_ = Rect { x: bx, y: ay, w, h };
+            let mut tq: Vec<Quad> = Vec::new();
+            let ir = theme::zpx(5.0);
+            tq.push(Rect { x: box_.x - 1.0, y: box_.y - 1.0, w: box_.w + 2.0, h: box_.h + 2.0 }.rounded_quad(theme::SEARCH_BORDER(), ir + 1.0));
+            tq.push(box_.rounded_quad(theme::PANEL_BG(), ir));
+            gpu.quad_renderer.prepare(&gpu.device, &gpu.queue, &tq, &[], (cfg_w, cfg_h));
+            let mut tareas: Vec<TextArea> = Vec::new();
+            gpu.ui.block_tip.draw_left(box_, padx, theme::FG_TEXT(), &mut tareas);
+            gpu.text_renderer.prepare(&gpu.device, &gpu.queue, &mut gpu.font_system, &mut gpu.atlas, &gpu.viewport, tareas, &mut gpu.swash_cache)?;
+            let mut entt = gpu.device.create_command_encoder(&CommandEncoderDescriptor { label: Some("aether-blocktip-pass") });
+            {
+                let mut pass = entt.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("aether-blocktip"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                gpu.quad_renderer.render_bg(&mut pass);
+                gpu.text_renderer.render(&gpu.atlas, &gpu.viewport, &mut pass)?;
+            }
+            gpu.queue.submit(Some(entt.finish()));
+        }
     }
 
     // ---- Diagnostic hover card overlay ----

@@ -35,6 +35,11 @@ pub struct UiBuffers {
     pub line_numbers2: Gutter, // right pane's gutter in a side-by-side diff
     pub diff_chev_down: TextLabel, // combined-diff file-header twistie (expanded)
     pub diff_chev_right: TextLabel, // combined-diff file-header twistie (collapsed)
+    pub diff_unfold: TextLabel, // single-file diff: expand-all button in a gap's gutter
+    pub diff_stage: TextLabel, // per-block stage button (→)
+    pub diff_unstage: TextLabel, // per-block unstage button (←)
+    pub diff_revert: TextLabel, // per-block revert button (discard)
+    pub block_tip: TextLabel, // hover tooltip for the per-block buttons
     pub menu_dropdown: Menu,   // top menu-bar dropdown (File/Edit/…)
     pub scm_badge: TextLabel,  // change-count badge on the Source Control icon
     pub img_minus: TextLabel,  // image zoom-out control
@@ -234,6 +239,27 @@ impl GpuState {
                 l.set(&mut font_system, &theme::ICON_CHEVRON_RIGHT.to_string(), theme::ICON_FAMILY);
                 l
             },
+            diff_unfold: {
+                let mut l = TextLabel::new(&mut font_system, 32.0, theme::LINE_HEIGHT());
+                l.set(&mut font_system, &theme::ICON_UNFOLD.to_string(), theme::ICON_FAMILY);
+                l
+            },
+            diff_stage: {
+                let mut l = TextLabel::new(&mut font_system, 32.0, theme::LINE_HEIGHT());
+                l.set(&mut font_system, &theme::ICON_BLOCK_STAGE.to_string(), theme::ICON_FAMILY);
+                l
+            },
+            diff_unstage: {
+                let mut l = TextLabel::new(&mut font_system, 32.0, theme::LINE_HEIGHT());
+                l.set(&mut font_system, &theme::ICON_BLOCK_UNSTAGE.to_string(), theme::ICON_FAMILY);
+                l
+            },
+            diff_revert: {
+                let mut l = TextLabel::new(&mut font_system, 32.0, theme::LINE_HEIGHT());
+                l.set(&mut font_system, &theme::ICON_DISCARD.to_string(), theme::ICON_FAMILY);
+                l
+            },
+            block_tip: TextLabel::new(&mut font_system, 240.0, theme::UI_LINE_HEIGHT()),
             palette_input: TextInput::new(&mut font_system, 600.0, theme::PALETTE_INPUT_HEIGHT()),
             palette_list: ListView::new(
                 &mut font_system,

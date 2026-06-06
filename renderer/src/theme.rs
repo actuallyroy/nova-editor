@@ -579,6 +579,7 @@ pub fn DIFF_ADD_BG() -> [f32; 4] { [0.18, 0.43, 0.24, 0.30] }
 pub fn DIFF_DEL_BG() -> [f32; 4] { [0.50, 0.18, 0.18, 0.30] }
 pub fn DIFF_HUNK_BG() -> [f32; 4] { [0.20, 0.30, 0.42, 0.28] }
 pub fn DIFF_FILLER_BG() -> [f32; 4] { [0.0, 0.0, 0.0, 0.22] } // "no line here" on a side
+pub fn DIFF_GAP_BG() -> [f32; 4] { [0.40, 0.44, 0.56, 0.20] } // collapsed-unchanged separator band
 // Activity-bar count badge (e.g. Source Control changed-file count).
 pub fn BADGE_BG() -> [f32; 4] { [0.0, 0.48, 0.80, 1.0] }
 pub fn BADGE_FG() -> Color { Color::rgb(0xFF, 0xFF, 0xFF) }
@@ -790,6 +791,9 @@ pub const ICON_LIST_TREE: char = '\u{eb86}'; // codicon "list-tree" — view-as-
 pub const ICON_LIST_FLAT: char = '\u{eb84}'; // codicon "list-flat" — view-as-list toggle
 pub const ICON_STASH: char = '\u{ec26}'; // codicon "git-stash"
 pub const ICON_OPEN_CHANGES: char = '\u{eafd}'; // codicon "git-compare" — open diff
+pub const ICON_UNFOLD: char = '\u{eb73}'; // codicon "unfold" — expand collapsed diff region
+pub const ICON_BLOCK_STAGE: char = '\u{ea9c}'; // codicon "arrow-right" — stage this block
+pub const ICON_BLOCK_UNSTAGE: char = '\u{ea9b}'; // codicon "arrow-left" — unstage this block
 pub const ICON_SPARKLE: char = '\u{ec10}'; // codicon "sparkle" — AI generate commit msg
 // Find/replace widget glyphs.
 pub const ICON_ARROW_UP: char = '\u{eaa1}'; // previous match

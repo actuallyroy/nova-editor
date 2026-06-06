@@ -168,6 +168,8 @@ pub(crate) enum DialogAction {
     GitDiscard { path: String, untracked: bool },
     GitDiscardAll,
     GitStash,
+    /// Revert a single change block in the working tree (reverse-apply its patch).
+    RevertDiffBlock { patch: String },
     InstallUpdate,
     /// Closing the window while terminals have running processes: kill them, keep
     /// them running in the background (daemon), or cancel the close.
@@ -292,6 +294,16 @@ pub(crate) struct App {
     pub(crate) last_click: Instant,
     pub(crate) last_click_pos: (f32, f32),
     pub(crate) click_streak: u32, // 1=single, 2=double, 3=triple… (consecutive clicks)
+    // In-flight drag on a diff's collapsed-unchanged separator: (gap index, anchor
+    // cursor y, gap `top`+`bot` reveal at press, dragged-past-threshold). Drag down
+    // grows `top` (reveal after the upper block); drag up grows `bot` (reveal before
+    // the lower block).
+    pub(crate) gap_drag: Option<(usize, f32, usize, usize, bool)>,
+    // The diff change block under the cursor, as visible `[start, end)` rows — drives
+    // the per-block Stage/Revert hover buttons. None ⇒ not hovering a block.
+    pub(crate) hovered_diff_block: Option<(usize, usize)>,
+    // Tooltip for the hovered per-block button: (label, anchor x, anchor y).
+    pub(crate) block_tip: Option<(String, f32, f32)>,
     pub(crate) sidebar_view: SidebarView,
     // Find-in-files (Search view): a self-contained panel (built once the GPU/font
     // system exists, in `resumed`). Owns all of its own state + buffers.
@@ -440,6 +452,9 @@ impl App {
             last_click: Instant::now(),
             last_click_pos: (0.0, 0.0),
             click_streak: 1,
+            gap_drag: None,
+            hovered_diff_block: None,
+            block_tip: None,
             sidebar_view: SidebarView::Explorer,
             search: None, // built in `resumed` once the font system exists
             source_control: None, // built in `resumed`
@@ -970,6 +985,24 @@ impl App {
                         .and_then(|line| d.diff_file_at_line(line))
                         .is_some()
             });
+        // Collapsed-unchanged separator (band or gutter unfold button): click to
+        // expand, drag to reveal → resize cursor.
+        let diff_region = render::editor_region(&layout);
+        let over_diff_gap = diff_region.contains(p)
+            && self.workspace.active_doc().map_or(false, |d| d.diff_gap_at_y(diff_region, p.1).is_some());
+        // Per-block Stage/Revert/Unstage button → pointer.
+        let over_diff_block_btn = diff_region.contains(p)
+            && self.workspace.active_doc().map_or(false, |d| {
+                if d.diff_path.is_none() {
+                    return false;
+                }
+                d.diff_block_at_y(diff_region, p.1)
+                    .and_then(|(vbs, vbe)| {
+                        let count = if d.diff_staged { 1 } else { 2 };
+                        render::diff_block_btn_rects(diff_region, vbs, vbe, d.scroll_y(), count)
+                    })
+                    .map_or(false, |rects| rects.iter().any(|r| r.contains(p)))
+            });
         // Floating overlays claim the cursor FIRST — otherwise whatever sits UNDER
         // a menu / palette / popup picks the icon (e.g. the editor's I-beam showing
         // over a context menu).
@@ -1089,6 +1122,12 @@ impl App {
                 g.ui.sidebar.cursor()
             } else if over_scroll_thumb {
                 CursorIcon::Default
+            } else if over_diff_block_btn {
+                // Per-block Stage/Revert/Unstage button: clickable.
+                CursorIcon::Pointer
+            } else if over_diff_gap {
+                // Collapsed-unchanged separator: draggable to reveal lines.
+                CursorIcon::RowResize
             } else if over_diff_header || over_fold_chevron {
                 // Combined-diff file header / gutter fold chevron: clickable.
                 CursorIcon::Pointer
@@ -2027,6 +2066,14 @@ impl App {
                     let d = diff::compute(&self.cwd, &path, staged, untracked);
                     self.workspace.open_diff(d, &mut g.font_system);
                     self.detail.open_extension = None;
+                    // Record the source so per-block Stage/Unstage/Revert can patch it
+                    // (untracked files have no HEAD side to stage hunks against).
+                    if !untracked {
+                        if let Some(doc) = self.workspace.active_doc_mut() {
+                            doc.diff_path = Some(path.clone());
+                            doc.diff_staged = staged;
+                        }
+                    }
                 }
                 self.ensure_cursor_visible();
                 self.redraw();
@@ -2546,6 +2593,59 @@ impl App {
         self.redraw();
     }
 
+    /// Apply a per-block diff action. `staged` diffs offer Unstage (idx 0); working-
+    /// tree diffs offer Revert (idx 0, destructive → confirm) and Stage (idx 1).
+    fn apply_diff_block(&mut self, vbs: usize, staged: bool, idx: usize) {
+        let Some(patch) = self.workspace.active_doc().and_then(|d| d.diff_block_patch(vbs)) else {
+            return;
+        };
+        if staged {
+            git::apply_patch(&self.cwd, &patch, true, true); // unstage
+            self.after_block_action();
+        } else if idx == 1 {
+            git::apply_patch(&self.cwd, &patch, true, false); // stage
+            self.after_block_action();
+        } else {
+            // Revert discards working-tree changes — confirm first.
+            let msg = "Revert this change block? Your edits in this block will be discarded from the working tree (not recoverable).";
+            if let Some(g) = self.gpu.as_mut() {
+                g.ui.dialog.set(&mut g.font_system, msg, &["Revert Block", "Cancel"], None);
+            }
+            self.dialog = Some(DialogState {
+                action: DialogAction::RevertDiffBlock { patch },
+                has_check: false,
+                checked: false,
+                hovered: None,
+            });
+            self.redraw();
+        }
+    }
+
+    /// After staging/unstaging/reverting a block: refresh SCM and rebuild the diff
+    /// in place so the view reflects the new state.
+    fn after_block_action(&mut self) {
+        self.refresh_source_control();
+        let Some((path, staged)) = self
+            .workspace
+            .active_doc()
+            .and_then(|d| d.diff_path.clone().map(|p| (p, d.diff_staged)))
+        else {
+            self.redraw();
+            return;
+        };
+        let nd = diff::compute(&self.cwd, &path, staged, false);
+        if let Some(g) = self.gpu.as_mut() {
+            let mut doc = Document::new_diff(nd, &mut g.font_system);
+            doc.diff_path = Some(path);
+            doc.diff_staged = staged;
+            if let Some(slot) = self.workspace.active_doc_mut() {
+                *slot = doc;
+            }
+        }
+        self.hovered_diff_block = None;
+        self.redraw();
+    }
+
     fn confirm_stash(&mut self) {
         let msg = "Stash all changes? This moves your uncommitted changes onto the stash (recoverable with `git stash pop`).";
         if let Some(g) = self.gpu.as_mut() {
@@ -2660,6 +2760,13 @@ impl App {
                 if i == 0 {
                     git::discard(&self.cwd, &path, untracked);
                     self.refresh_source_control();
+                }
+            }
+            DialogAction::RevertDiffBlock { patch } => {
+                // 0 = Revert Block, 1 = Cancel
+                if i == 0 {
+                    git::apply_patch(&self.cwd, &patch, false, true); // reverse-apply to worktree
+                    self.after_block_action();
                 }
             }
             DialogAction::GitDiscardAll => {
@@ -3958,6 +4065,11 @@ impl App {
             g.ui.find.reshape(&mut g.font_system);
             g.ui.diff_chev_down.reshape(&mut g.font_system); // fold + combined-diff chevrons
             g.ui.diff_chev_right.reshape(&mut g.font_system);
+            g.ui.diff_unfold.reshape(&mut g.font_system); // diff gap expand-all button
+            g.ui.diff_stage.reshape(&mut g.font_system); // per-block stage/unstage/revert
+            g.ui.diff_unstage.reshape(&mut g.font_system);
+            g.ui.diff_revert.reshape(&mut g.font_system);
+            g.ui.block_tip.reshape(&mut g.font_system);
             g.ui.sidebar.reshape_icons(&mut g.font_system); // explorer tree icons
             g.create_input.rezoom(&mut g.font_system);
             for b in g.create_icons.iter_mut() {
@@ -5011,6 +5123,45 @@ impl App {
             }
         }
 
+        // Single-file diff: a per-block Stage/Revert/Unstage button click.
+        {
+            let region = render::editor_region(&layout);
+            if region.contains((x, y)) {
+                if let Some((vbs, vbe)) = self.workspace.active_doc().and_then(|d| d.diff_block_at_y(region, y)) {
+                    let staged = self.workspace.active_doc().map_or(false, |d| d.diff_staged);
+                    let sy = self.workspace.active_doc().map_or(0.0, |d| d.scroll_y());
+                    let count = if staged { 1 } else { 2 };
+                    if let Some(rects) = render::diff_block_btn_rects(region, vbs, vbe, sy, count) {
+                        if let Some(idx) = rects.iter().position(|r| r.contains((x, y))) {
+                            self.apply_diff_block(vbs, staged, idx);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Single-file diff: pressing a collapsed-unchanged separator (its band OR the
+        // unfold button in either gutter) arms a gap interaction — a plain click
+        // expands the whole region, a drag reveals lines (down = top, up = bottom).
+        // Diff rows are uniform-height so the row is derived arithmetically from y
+        // (buffer.hit mis-maps the windowed diff buffer). Covers the full editor
+        // region (gutters included), so it runs before the editor-text gate.
+        {
+            let region = render::editor_region(&layout);
+            if region.contains((x, y)) {
+                if let Some(gi) = self.workspace.active_doc().and_then(|d| d.diff_gap_at_y(region, y)) {
+                    let (top, bot) = self
+                        .workspace
+                        .active_doc()
+                        .and_then(|d| d.diff_gap_info(gi))
+                        .map_or((0, 0), |(t, b, _)| (t, b));
+                    self.gap_drag = Some((gi, y, top, bot, false));
+                    return;
+                }
+            }
+        }
+
         if layout.editor_text.contains((x, y)) {
             self.set_ext_filter_focus(false); // editor takes keyboard focus
             // Clicking the editor moves focus off the find widget (it stays open, but
@@ -5058,6 +5209,74 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, x: f32, y: f32) {
+        // Diff: drag a collapsed-unchanged separator to reveal lines progressively
+        // (each line-height of travel reveals one hidden line from the top).
+        if self.mouse_pressed {
+            if let Some((gi, anchor_y, anchor_top, anchor_bot, _)) = self.gap_drag {
+                let lh = theme::LINE_HEIGHT().max(1.0);
+                let delta = ((y - anchor_y) / lh).round() as i64;
+                if (y - anchor_y).abs() > 3.0 * theme::ui_zoom() {
+                    self.gap_drag = Some((gi, anchor_y, anchor_top, anchor_bot, true));
+                    // Drag down (delta > 0) reveals from the top of the run; drag up
+                    // (delta < 0) reveals from the bottom. The other end resets to its
+                    // press value so reversing direction collapses back symmetrically.
+                    let (top, bot) = if delta >= 0 {
+                        ((anchor_top as i64 + delta).max(0) as usize, anchor_bot)
+                    } else {
+                        (anchor_top, (anchor_bot as i64 - delta).max(0) as usize)
+                    };
+                    if let (Some(d), Some(g)) = (self.workspace.active_doc_mut(), self.gpu.as_mut()) {
+                        d.set_diff_gap_reveal(gi, top, bot, &mut g.font_system);
+                    }
+                    self.redraw();
+                }
+                return;
+            }
+        }
+        // Diff per-block hover: track the change block under the cursor so its
+        // Stage/Revert buttons show. Only meaningful for a file diff.
+        if !self.mouse_pressed {
+            let region = render::editor_region(&self.layout());
+            let (staged, sy, is_diff) = self
+                .workspace
+                .active_doc()
+                .map_or((false, 0.0, false), |d| (d.diff_staged, d.scroll_y(), d.diff_path.is_some()));
+            let count = if staged { 1 } else { 2 };
+            let label = |idx: usize| -> String {
+                if staged { "Unstage Block" } else if idx == 0 { "Revert Block" } else { "Stage Block" }.to_string()
+            };
+            // Keep the current block hovered if the cursor is over one of its buttons
+            // (a 1-line block's stacked buttons extend past the row, so y-based block
+            // detection alone would drop the hover the moment you reach the 2nd button).
+            let on_cur_btn = is_diff
+                .then(|| self.hovered_diff_block)
+                .flatten()
+                .and_then(|(vbs, vbe)| {
+                    let rects = render::diff_block_btn_rects(region, vbs, vbe, sy, count)?;
+                    let idx = rects.iter().position(|r| r.contains((x, y)))?;
+                    Some(((vbs, vbe), idx, rects[idx]))
+                });
+            let (nb, tip) = if let Some((block, idx, r)) = on_cur_btn {
+                (Some(block), Some((label(idx), r.x + r.w, r.y)))
+            } else if is_diff && region.contains((x, y)) {
+                match self.workspace.active_doc().and_then(|d| d.diff_block_at_y(region, y)) {
+                    Some((vbs, vbe)) => {
+                        let tip = render::diff_block_btn_rects(region, vbs, vbe, sy, count)
+                            .and_then(|rects| rects.iter().position(|r| r.contains((x, y))).map(|i| (i, rects[i])))
+                            .map(|(idx, r)| (label(idx), r.x + r.w, r.y));
+                        (Some((vbs, vbe)), tip)
+                    }
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+            if nb != self.hovered_diff_block || tip != self.block_tip {
+                self.hovered_diff_block = nb;
+                self.block_tip = tip;
+                self.redraw();
+            }
+        }
         // Feedback form: drag-select within the focused field.
         if self.mouse_pressed && self.feedback_form.is_some() {
             let win = self.gpu.as_ref().map_or((1280.0, 800.0), |g| (g.config.width as f32, g.config.height as f32));
@@ -5360,6 +5579,15 @@ impl App {
         if let Some(d) = self.workspace.active_doc_mut() {
             d.scroll.release();
             d.diff_release_hbars();
+        }
+        // A diff gap that was pressed but never dragged is a click → expand it fully.
+        if let Some((gi, _, _, _, dragged)) = self.gap_drag.take() {
+            if !dragged {
+                if let (Some(d), Some(g)) = (self.workspace.active_doc_mut(), self.gpu.as_mut()) {
+                    d.expand_diff_gap(gi, usize::MAX, true, &mut g.font_system);
+                }
+                self.redraw();
+            }
         }
     }
 

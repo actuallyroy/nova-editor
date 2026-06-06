@@ -82,6 +82,10 @@ pub struct Document {
     // [1]=right/new. Cell so the &self render loop can clamp them per frame.
     diff_hscroll: [std::cell::Cell<f32>; 2],
     diff_hbar: [crate::widgets::Scrollbar; 2], // per-pane horizontal scrollbar drag state
+    // Repo-relative path + staged flag of a single-file diff, so per-block
+    // Stage/Unstage/Revert can build and apply a patch. None ⇒ not a file diff.
+    pub diff_path: Option<String>,
+    pub diff_staged: bool,
     pub folds: std::collections::BTreeMap<usize, usize>, // folded regions: header line → last hidden line
     pub image: Option<String>,           // Some(media key) => this tab renders an image
     pub image_scale: Option<f32>,        // None = fit-to-window; Some(s) = absolute scale
@@ -336,6 +340,8 @@ impl Document {
             diff_collapsed: std::collections::HashSet::new(),
             diff_hscroll: [std::cell::Cell::new(0.0), std::cell::Cell::new(0.0)],
             diff_hbar: [Scrollbar::new(Axis::Horizontal), Scrollbar::new(Axis::Horizontal)],
+            diff_path: None,
+            diff_staged: false,
             folds: std::collections::BTreeMap::new(),
             image: None,
             image_scale: None,
@@ -414,6 +420,8 @@ impl Document {
             diff_collapsed: std::collections::HashSet::new(),
             diff_hscroll: [std::cell::Cell::new(0.0), std::cell::Cell::new(0.0)],
             diff_hbar: [Scrollbar::new(Axis::Horizontal), Scrollbar::new(Axis::Horizontal)],
+            diff_path: None,
+            diff_staged: false,
             folds: std::collections::BTreeMap::new(),
             image: Some(key),
             image_scale: None,
@@ -476,9 +484,13 @@ impl Document {
             b
         };
         // Combined views keep the full diff so collapse can re-project; the buffers
-        // and `diff` start from the fully-expanded projection.
+        // and `diff` start from the fully-expanded projection. Single-file diffs with
+        // collapsed unchanged regions likewise keep the full diff and start from the
+        // gap-projected view (separator rows in place of hidden runs).
         let (visible, full) = if diff.combined {
             (crate::diff::project(&diff, &std::collections::HashSet::new()), Some(diff))
+        } else if !diff.gaps.is_empty() {
+            (crate::diff::project_gaps(&diff), Some(diff))
         } else {
             (diff, None)
         };
@@ -508,6 +520,8 @@ impl Document {
             diff_collapsed: std::collections::HashSet::new(),
             diff_hscroll: [std::cell::Cell::new(0.0), std::cell::Cell::new(0.0)],
             diff_hbar: [Scrollbar::new(Axis::Horizontal), Scrollbar::new(Axis::Horizontal)],
+            diff_path: None,
+            diff_staged: false,
             folds: std::collections::BTreeMap::new(),
             image: None,
             image_scale: None,
@@ -561,6 +575,126 @@ impl Document {
         self.diff_right = Some(mk(fs, &vis.right_text));
         self.rope = Rope::from_str(&vis.left_text);
         self.diff = Some(vis);
+    }
+
+    /// Expand a collapsed unchanged region in a single-file diff. `lines` is how
+    /// many hidden rows to reveal (`usize::MAX` = all of them); `from_top` reveals
+    /// from the top edge of the gap (drag-down) or the bottom (drag-up). Rebuilds
+    /// the visible buffers from the re-projected diff.
+    pub fn expand_diff_gap(&mut self, gap_idx: usize, lines: usize, from_top: bool, fs: &mut FontSystem) {
+        let Some(full) = self.diff_full.as_mut() else { return };
+        let Some(gap) = full.gaps.get_mut(gap_idx) else { return };
+        let avail = gap.hidden();
+        if avail == 0 {
+            return;
+        }
+        let take = lines.min(avail);
+        if from_top {
+            gap.top += take;
+        } else {
+            gap.bot += take;
+        }
+        self.rebuild_diff_view(fs);
+    }
+
+    /// A gap's current (reveal-from-top, reveal-from-bottom, total span).
+    pub fn diff_gap_info(&self, gap_idx: usize) -> Option<(usize, usize, usize)> {
+        let g = self.diff_full.as_ref()?.gaps.get(gap_idx)?;
+        Some((g.top, g.bot, g.end - g.start))
+    }
+
+    /// Set a gap's reveal-from-top and -from-bottom (clamped so they can't overlap)
+    /// and rebuild the visible buffers. Drag-down grows `top`, drag-up grows `bot`.
+    pub fn set_diff_gap_reveal(&mut self, gap_idx: usize, top: usize, bot: usize, fs: &mut FontSystem) {
+        let Some(full) = self.diff_full.as_mut() else { return };
+        let Some(gap) = full.gaps.get_mut(gap_idx) else { return };
+        let span = gap.end - gap.start;
+        let bot = bot.min(span);
+        let top = top.min(span - bot);
+        if top == gap.top && bot == gap.bot {
+            return;
+        }
+        gap.top = top;
+        gap.bot = bot;
+        self.rebuild_diff_view(fs);
+    }
+
+    /// Re-project the full single-file diff (with its current gap state) and rebuild
+    /// both pane buffers + the left rope from it.
+    fn rebuild_diff_view(&mut self, fs: &mut FontSystem) {
+        let Some(full) = self.diff_full.as_ref() else { return };
+        let vis = crate::diff::project_gaps(full);
+        let mk = |fs: &mut FontSystem, text: &str| {
+            let mut b = Buffer::new(fs, Metrics::new(theme::FONT_SIZE(), theme::LINE_HEIGHT()));
+            let display = text.replace('\r', "");
+            apply_buffer_text(&mut b, fs, &display, display.matches('\n').count(), Lang::PlainText, "", None, None, &[]);
+            b
+        };
+        self.buffer = mk(fs, &vis.left_text);
+        self.diff_right = Some(mk(fs, &vis.right_text));
+        self.rope = Rope::from_str(&vis.left_text);
+        self.diff = Some(vis);
+    }
+
+    /// The gap index of a `Gap` separator row in the visible diff, if `vis_row` is
+    /// one (its index is carried in the row's `file` field).
+    pub fn diff_gap_at_row(&self, vis_row: usize) -> Option<usize> {
+        let d = self.diff.as_ref()?;
+        let row = d.rows.get(vis_row)?;
+        (row.kind == crate::diff::RowKind::Gap).then_some(row.file)
+    }
+
+    /// The gap index under screen-y `y` in a diff `region`. Diff rows are uniform
+    /// height, so derive the row arithmetically (the windowed buffer mis-maps under
+    /// `Buffer::hit`). Used by click/drag/cursor.
+    pub fn diff_gap_at_y(&self, region: Rect, y: f32) -> Option<usize> {
+        self.diff_full.as_ref()?;
+        let lh = theme::LINE_HEIGHT().max(1.0);
+        let rel = y - (region.y + theme::EDITOR_PAD()) + self.scroll_y();
+        if rel < 0.0 {
+            return None;
+        }
+        self.diff_gap_at_row((rel / lh) as usize)
+    }
+
+    /// The change block `[start, end)` (visible rows) under screen-y `y`, if `y`
+    /// falls on an Add/Del row. Drives the per-block Stage/Revert hover buttons.
+    pub fn diff_block_at_y(&self, region: Rect, y: f32) -> Option<(usize, usize)> {
+        let d = self.diff.as_ref()?;
+        self.diff_path.as_ref()?;
+        let lh = theme::LINE_HEIGHT().max(1.0);
+        let rel = y - (region.y + theme::EDITOR_PAD()) + self.scroll_y();
+        if rel < 0.0 {
+            return None;
+        }
+        let row = (rel / lh) as usize;
+        crate::diff::change_blocks(d).into_iter().find(|&(s, e)| row >= s && row < e)
+    }
+
+    /// Build the patch for a visible change block starting at row `vbs`, mapping it
+    /// to the full diff so context/line-numbers are correct even next to a gap.
+    pub fn diff_block_patch(&self, vbs: usize) -> Option<String> {
+        let vis = self.diff.as_ref()?;
+        let path = self.diff_path.as_ref()?;
+        let full = self.diff_full.as_ref().unwrap_or(vis);
+        let r0 = vis.rows.get(vbs)?;
+        let is_change = |k| matches!(k, crate::diff::RowKind::Add | crate::diff::RowKind::Del);
+        let del = r0.kind == crate::diff::RowKind::Del;
+        let key = if del { r0.left } else { r0.right };
+        key?;
+        let fi = full
+            .rows
+            .iter()
+            .position(|r| r.kind == r0.kind && (if del { r.left } else { r.right }) == key)?;
+        let mut fbs = fi;
+        while fbs > 0 && is_change(full.rows[fbs - 1].kind) {
+            fbs -= 1;
+        }
+        let mut fbe = fi;
+        while fbe < full.rows.len() && is_change(full.rows[fbe].kind) {
+            fbe += 1;
+        }
+        crate::diff::block_patch(full, path, fbs, fbe)
     }
 
     /// This file's line ending: "\n" or "\r\n".

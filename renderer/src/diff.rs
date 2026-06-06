@@ -20,7 +20,38 @@ pub enum RowKind {
     Del,     // removed: left side only (right is filler)
     Hunk,    // an "@@ ... @@" separator spanning both sides
     File,    // combined view: a per-file header row (collapsible)
+    Gap,     // a collapsed run of unchanged lines (click/drag to expand)
 }
+
+/// A collapsed run of unchanged lines in the FULL diff. `[start, end)` are row
+/// indices into `Diff.rows` (all of them Context). `top`/`bot` count how many of
+/// those rows have been revealed from each end; when `top + bot >= end - start`
+/// the whole run is showing and the gap disappears on the next projection.
+#[derive(Clone)]
+pub struct Gap {
+    pub start: usize,
+    pub end: usize,
+    pub top: usize,
+    pub bot: usize,
+}
+
+impl Gap {
+    /// Rows still hidden in this gap.
+    pub fn hidden(&self) -> usize {
+        (self.end - self.start).saturating_sub(self.top + self.bot)
+    }
+    fn hidden_range(&self) -> std::ops::Range<usize> {
+        (self.start + self.top)..(self.end - self.bot)
+    }
+}
+
+/// Lines of unchanged context kept adjacent to a change before collapsing the
+/// middle, and the smallest hidden run worth collapsing.
+const GAP_MARGIN: usize = 3;
+const GAP_MIN_HIDDEN: usize = 4;
+/// Context to request from git: effectively the whole file, so every unchanged
+/// line is present and expansion never needs to re-read the file.
+const FULL_CONTEXT: &str = "1000000";
 
 #[derive(Clone)]
 pub struct DiffRow {
@@ -38,6 +69,9 @@ pub struct Diff {
     pub rows: Vec<DiffRow>,
     pub combined: bool,     // true = multi-file view (has RowKind::File headers)
     pub files: Vec<String>, // display names per file index (combined view)
+    /// Collapsed unchanged regions (single-file view). Empty ⇒ nothing to expand;
+    /// this is the FULL diff, projected to the visible one via `project_gaps`.
+    pub gaps: Vec<Gap>,
 }
 
 /// Leading pad on a combined-view file-header line, leaving room for the codicon
@@ -71,15 +105,20 @@ pub fn compute(root: &Path, path: &str, staged: bool, untracked: bool) -> Diff {
     }
     let label = if staged { "Index" } else { "Working Tree" };
     let title = format!("{name} ({label})");
+    // Full context (-U<huge>) so every unchanged line is present — long unchanged
+    // runs are then collapsed into expandable gaps without re-reading the file.
+    let ctx = format!("-U{FULL_CONTEXT}");
     let args: Vec<&str> = if staged {
-        vec!["diff", "--no-color", "--cached", "--", path]
+        vec!["diff", "--no-color", &ctx, "--cached", "--", path]
     } else {
-        vec!["diff", "--no-color", "HEAD", "--", path]
+        vec!["diff", "--no-color", &ctx, "HEAD", "--", path]
     };
     let raw = git(root, &args).unwrap_or_default();
     let mut b = Builder::new(title);
     b.parse_into(&raw);
-    b.finish()
+    let mut diff = b.finish();
+    diff.collapse_unchanged();
+    diff
 }
 
 /// Compare two arbitrary files (explorer "Select for Compare" → "Compare with
@@ -171,6 +210,7 @@ pub fn project(full: &Diff, collapsed: &std::collections::HashSet<usize>) -> Dif
         rows,
         combined: true,
         files: full.files.clone(),
+        gaps: Vec::new(),
     }
 }
 
@@ -294,8 +334,164 @@ impl Builder {
             rows: self.rows,
             combined: self.combined,
             files: self.files,
+            gaps: Vec::new(),
         }
     }
+}
+
+impl Diff {
+    /// Find long runs of unchanged (Context) rows and mark their interiors as
+    /// collapsed gaps, keeping `GAP_MARGIN` context lines next to each change.
+    /// Single-file diffs only (the combined view collapses per file instead).
+    pub fn collapse_unchanged(&mut self) {
+        if self.combined {
+            return;
+        }
+        let mut gaps = Vec::new();
+        let mut i = 0;
+        while i < self.rows.len() {
+            if self.rows[i].kind != RowKind::Context {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < self.rows.len() && self.rows[i].kind == RowKind::Context {
+                i += 1;
+            }
+            // [start, i) is a Context run. Keep a margin at each end (but none at the
+            // file's very top/bottom — there's no change there to anchor to).
+            let top_margin = if start == 0 { 0 } else { GAP_MARGIN };
+            let bot_margin = if i == self.rows.len() { 0 } else { GAP_MARGIN };
+            let hidden_start = start + top_margin;
+            let hidden_end = i.saturating_sub(bot_margin);
+            if hidden_end > hidden_start && hidden_end - hidden_start >= GAP_MIN_HIDDEN {
+                gaps.push(Gap { start: hidden_start, end: hidden_end, top: 0, bot: 0 });
+            }
+        }
+        self.gaps = gaps;
+    }
+}
+
+/// Project a full single-file diff (with collapsed gaps) to the visible diff: each
+/// still-hidden gap interior becomes one `Gap` separator row (its `file` field
+/// carries the gap index so clicks/drags can find it); everything else passes
+/// through. No-op when there are no gaps.
+pub fn project_gaps(full: &Diff) -> Diff {
+    if full.gaps.is_empty() {
+        return full.clone();
+    }
+    let lefts: Vec<&str> = full.left_text.split('\n').collect();
+    let rights: Vec<&str> = full.right_text.split('\n').collect();
+    let mut left_text = String::new();
+    let mut right_text = String::new();
+    let mut rows = Vec::new();
+    let mut emit = |row: DiffRow, l: &str, r: &str, lt: &mut String, rt: &mut String, out: &mut Vec<DiffRow>| {
+        lt.push_str(l);
+        lt.push('\n');
+        rt.push_str(r);
+        rt.push('\n');
+        out.push(row);
+    };
+    let mut i = 0usize;
+    while i < full.rows.len() {
+        // A gap whose hidden range starts here?
+        if let Some((gi, gap)) = full.gaps.iter().enumerate().find(|(_, g)| g.hidden_range().start == i && g.hidden() > 0) {
+            let n = gap.hidden();
+            let label = format!("    ⋯  {n} unchanged line{}  ⋯", if n == 1 { "" } else { "s" });
+            // Label on BOTH sides so the collapsed band reads symmetrically.
+            emit(
+                DiffRow { kind: RowKind::Gap, left: None, right: None, file: gi },
+                &label,
+                &label,
+                &mut left_text,
+                &mut right_text,
+                &mut rows,
+            );
+            i = gap.hidden_range().end; // skip the hidden interior
+            continue;
+        }
+        emit(
+            full.rows[i].clone(),
+            lefts.get(i).copied().unwrap_or(""),
+            rights.get(i).copied().unwrap_or(""),
+            &mut left_text,
+            &mut right_text,
+            &mut rows,
+        );
+        i += 1;
+    }
+    Diff {
+        title: full.title.clone(),
+        left_text,
+        right_text,
+        rows,
+        combined: false,
+        files: full.files.clone(),
+        gaps: full.gaps.clone(),
+    }
+}
+
+/// Contiguous runs of changed rows (Add/Del) in `d` — one entry per change block,
+/// as `[start, end)` row indices. Drives the per-block Stage/Revert buttons.
+pub fn change_blocks(d: &Diff) -> Vec<(usize, usize)> {
+    let is_change = |k: RowKind| matches!(k, RowKind::Add | RowKind::Del);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < d.rows.len() {
+        if is_change(d.rows[i].kind) {
+            let s = i;
+            while i < d.rows.len() && is_change(d.rows[i].kind) {
+                i += 1;
+            }
+            out.push((s, i));
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Build a minimal unified-diff patch (zero-context, applied with `--unidiff-zero`)
+/// for the change block at `[bs, be)` of `full`. The `-` lines are the old (HEAD)
+/// side, `+` the new side. Used to stage / unstage / revert that single block.
+pub fn block_patch(full: &Diff, path: &str, bs: usize, be: usize) -> Option<String> {
+    let lefts: Vec<&str> = full.left_text.split('\n').collect();
+    let rights: Vec<&str> = full.right_text.split('\n').collect();
+    let (mut dels, mut adds): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    let (mut first_del_left, mut first_add_right) = (None, None);
+    for i in bs..be {
+        match full.rows[i].kind {
+            RowKind::Del => {
+                dels.push(lefts.get(i).copied().unwrap_or(""));
+                first_del_left = first_del_left.or(full.rows[i].left);
+            }
+            RowKind::Add => {
+                adds.push(rights.get(i).copied().unwrap_or(""));
+                first_add_right = first_add_right.or(full.rows[i].right);
+            }
+            _ => {}
+        }
+    }
+    if dels.is_empty() && adds.is_empty() {
+        return None;
+    }
+    // The unchanged line directly above the block anchors pure-add / pure-del hunks.
+    let prev = (0..bs).rev().map(|i| &full.rows[i]).find(|r| r.left.is_some() || r.right.is_some());
+    let old_start = first_del_left.or_else(|| prev.and_then(|r| r.left)).unwrap_or(0);
+    let new_start = first_add_right.or_else(|| prev.and_then(|r| r.right)).unwrap_or(0);
+    let mut p = format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n");
+    p.push_str(&format!("@@ -{},{} +{},{} @@\n", old_start, dels.len(), new_start, adds.len()));
+    for d in &dels {
+        p.push('-');
+        p.push_str(d);
+        p.push('\n');
+    }
+    for a in &adds {
+        p.push('+');
+        p.push_str(a);
+        p.push('\n');
+    }
+    Some(p)
 }
 
 /// Parse the starting line numbers out of "@@ -a,b +c,d @@". Returns (old, new).
