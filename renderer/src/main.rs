@@ -220,6 +220,8 @@ pub(crate) enum CtxAction {
     Command(Command),          // editor: cut/copy/paste/find/select-all/palette…
     MenuCmd(menus::MenuCmd),    // reuse the menu-bar command routing (gear/manage menu)
     SetSetting(&'static str, String), // settings-editor enum dropdown: write key = json value
+    MarkdownPreviewTab(usize),        // open a markdown preview of a specific tab
+    MarkdownPreviewPath(PathBuf),     // open a markdown preview of a tree file (open it first)
     Cut,
     Copy,
     Paste,
@@ -1465,6 +1467,10 @@ impl App {
                     ];
                     if let Some(p) = path {
                         let rel = p.strip_prefix(&self.cwd).unwrap_or(&p).to_string_lossy().to_string();
+                        if p.extension().map_or(false, |e| e.eq_ignore_ascii_case("md")) {
+                            items.push(CtxEntry::key("Open Preview", CtxAction::MarkdownPreviewTab(idx), "Ctrl+Shift+V"));
+                            items.push(CtxEntry::sep());
+                        }
                         items.push(CtxEntry::new("Copy Path", CtxAction::CopyText(p.to_string_lossy().to_string())));
                         items.push(CtxEntry::new("Copy Relative Path", CtxAction::CopyText(rel)));
                         items.push(CtxEntry::sep());
@@ -1490,7 +1496,17 @@ impl App {
             && self.workspace.active_doc().is_some()
             && render::editor_region(&layout).contains((x, y))
         {
-            let items = vec![
+            let is_md = self
+                .workspace
+                .active_doc()
+                .and_then(|d| d.path.as_ref())
+                .map_or(false, |p| p.extension().map_or(false, |e| e.eq_ignore_ascii_case("md")));
+            let mut items = Vec::new();
+            if is_md {
+                items.push(CtxEntry::key("Open Preview", CtxAction::Command(Command::MarkdownPreview), "Ctrl+Shift+V"));
+                items.push(CtxEntry::sep());
+            }
+            items.extend([
                 CtxEntry { label: "Go to Definition".into(), hint: "F12", action: CtxAction::Command(Command::GotoDefinition) },
                 CtxEntry { label: "Go to Declaration".into(), hint: "", action: CtxAction::Command(Command::GotoDeclaration) },
                 CtxEntry { label: "Go to Type Definition".into(), hint: "", action: CtxAction::Command(Command::GotoTypeDefinition) },
@@ -1513,7 +1529,7 @@ impl App {
                 CtxEntry::key("Paste", CtxAction::Paste, "Ctrl+V"),
                 CtxEntry::sep(),
                 CtxEntry::key("Command Palette…", CtxAction::Palette, "Ctrl+Shift+P"),
-            ];
+            ]);
             self.open_ctx_menu((x, y), items);
             return;
         }
@@ -1578,6 +1594,10 @@ impl App {
             items.push(CtxEntry::new("Open in Integrated Terminal", CtxAction::OpenTerminalAt(dir.clone())));
             items.push(CtxEntry::sep());
             if !is_dir {
+                if path.extension().map_or(false, |e| e.eq_ignore_ascii_case("md")) {
+                    items.push(CtxEntry::key("Open Preview", CtxAction::MarkdownPreviewPath(path.clone()), "Ctrl+Shift+V"));
+                    items.push(CtxEntry::sep());
+                }
                 items.push(CtxEntry::new("Select for Compare", CtxAction::SelectForCompare(path.clone())));
                 if let Some(sel) = self.compare_select.clone().filter(|s| s != &path) {
                     let name = sel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1641,6 +1661,20 @@ impl App {
                 settings::set_user_value(key, &value_json);
                 self.apply_settings();
                 self.redraw();
+            }
+            CtxAction::MarkdownPreviewTab(idx) => {
+                if idx < self.workspace.documents.len() {
+                    self.workspace.active = Some(idx);
+                    self.open_markdown_preview();
+                }
+            }
+            CtxAction::MarkdownPreviewPath(path) => {
+                if let Some(g) = self.gpu.as_mut() {
+                    if self.workspace.open_file(&path, &mut g.font_system).is_ok() {
+                        self.detail.open_extension = None;
+                        self.open_markdown_preview();
+                    }
+                }
             }
             CtxAction::Cut => self.cut(),
             CtxAction::Copy => self.copy(),
