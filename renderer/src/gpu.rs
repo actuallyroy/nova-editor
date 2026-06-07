@@ -44,6 +44,7 @@ pub struct UiBuffers {
     pub diff_unstage: TextLabel, // per-block unstage button (←)
     pub diff_revert: TextLabel, // per-block revert button (discard)
     pub block_tip: TextLabel, // hover tooltip for the per-block buttons
+    pub blame: TextLabel,     // inline git-blame annotation at the caret line's end
     pub tab_icons: std::collections::HashMap<char, crate::widgets::IconButton>, // per-tab file-type icon overlays
     pub menu_dropdown: Menu,   // top menu-bar dropdown (File/Edit/…)
     pub scm_badge: TextLabel,  // change-count badge on the Source Control icon
@@ -279,6 +280,7 @@ impl GpuState {
                 l
             },
             block_tip: TextLabel::new(&mut font_system, 240.0, theme::UI_LINE_HEIGHT()),
+            blame: TextLabel::new(&mut font_system, 1200.0, theme::UI_LINE_HEIGHT()),
             tab_icons: std::collections::HashMap::new(),
             palette_input: TextInput::new(&mut font_system, 600.0, theme::PALETTE_INPUT_HEIGHT()),
             settings_search: TextInput::new(&mut font_system, 900.0, theme::zpx(34.0)),

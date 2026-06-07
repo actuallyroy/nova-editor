@@ -89,6 +89,8 @@ use workspace::Workspace;
 /// How long the pointer must rest on a diagnostic before its hover card appears
 /// (matches VS Code's editor.hover.delay default; stops the card chasing the cursor).
 const HOVER_DELAY: Duration = Duration::from_millis(300);
+/// Rest time before the inline-blame full-commit card appears (GitLens-style).
+const BLAME_DELAY: Duration = Duration::from_millis(1000);
 
 pub(crate) struct UiCache {
     pub(crate) tabs: String,
@@ -315,6 +317,9 @@ pub(crate) struct App {
     pub(crate) block_tip: Option<(String, f32, f32)>,
     // Commit-graph: full message of the hovered commit row + anchor (x, y).
     pub(crate) commit_tip: Option<(String, f32, f32)>,
+    /// Inline-blame hover card staged while the pointer rests on the annotation;
+    /// promoted into `commit_tip` after `BLAME_DELAY`. (text, x, y, since.)
+    pub(crate) blame_pending: Option<(String, f32, f32, Instant)>,
     // Editor tab hover: full file name + anchor (x, y) — tabs truncate to fit.
     pub(crate) tab_tip: Option<(String, f32, f32)>,
     // Explorer / Source Control row hover: full path when the label is ellipsized.
@@ -324,6 +329,9 @@ pub(crate) struct App {
     // system exists, in `resumed`). Owns all of its own state + buffers.
     pub(crate) search: Option<ui::search_panel::SearchPanel>,
     pub(crate) source_control: Option<ui::source_control_panel::SourceControlPanel>,
+    /// Commit author name (`git config user.name`), resolved once — blame shows
+    /// "You" instead of this name. `None` = not a repo / git missing.
+    pub(crate) git_user: Option<String>,
     pub(crate) settings_editor: ui::settings_editor::SettingsEditor,
     pub(crate) debug: Option<ui::debug_panel::DebugPanel>,
     pub(crate) dap: Option<dap::DapClient>,
@@ -480,11 +488,13 @@ impl App {
             hovered_diff_block: None,
             block_tip: None,
             commit_tip: None,
+            blame_pending: None,
             tab_tip: None,
             row_tip: None,
             sidebar_view: SidebarView::Explorer,
             search: None, // built in `resumed` once the font system exists
             source_control: None, // built in `resumed`
+            git_user: None,       // resolved in `open_initial`
             settings_editor: ui::settings_editor::SettingsEditor::default(),
             debug: None, // built in `resumed`
             dap: None,
@@ -1309,6 +1319,10 @@ impl App {
         // Load user settings.
         let s = settings::reload();
         self.sidebar_visible = s.workbench_sidebar_visible;
+
+        // Resolve the commit author once so blame can render "You" for the user's
+        // own lines instead of their full name.
+        self.git_user = git::user_name(&git::repo_root(&self.cwd));
 
         // Scan installed extensions up front so "Installed" status is accurate from
         // the start and grammar extensions (rainbow-csv, …) activate on launch.
@@ -2329,6 +2343,80 @@ impl App {
     }
 
 
+    /// Fetch inline git blame for `path` off the UI thread; the result posts back
+    /// as `WorkerMsg::Blame` and attaches to the matching open document.
+    fn request_blame(&self, path: PathBuf) {
+        let root = git::repo_root(&self.cwd);
+        let tx = self.worker_tx.clone();
+        std::thread::spawn(move || {
+            let lines = git::blame(&root, &path);
+            if !lines.is_empty() {
+                let _ = tx.send(WorkerMsg::Blame { path, lines });
+            }
+        });
+    }
+
+    /// The full-commit hover card for the inline blame annotation: if `(x, y)` is
+    /// over the caret line's annotation (committed lines only), returns the card
+    /// text + anchor. Geometry mirrors the draw in `render.rs`.
+    fn blame_card_at(&self, x: f32, y: f32) -> Option<(String, f32, f32)> {
+        let d = self.workspace.active_doc()?;
+        if d.read_only
+            || d.diff.is_some()
+            || d.image.is_some()
+            || d.graph.is_some()
+            || d.info.is_some()
+            || d.markdown_preview.is_some()
+        {
+            return None;
+        }
+        let cur = d.head_line_col().0;
+        let bl = d.blame.get(cur)?;
+        if bl.uncommitted {
+            return None;
+        }
+        let layout = self.layout();
+        let et = layout.editor_text;
+        let line_w = d.buffer.layout_runs().find(|r| r.line_i == cur).map(|r| r.line_w).unwrap_or(0.0);
+        let (ltop, lh) = d.line_visual_bounds(cur);
+        let off = theme::LINE_HEIGHT() * d.hidden_above(cur) as f32;
+        let line_y = et.y + theme::EDITOR_PAD() + ltop - d.scroll_y() - off;
+        let bx = et.x + theme::EDITOR_PAD() - d.scroll_x() + line_w + theme::zpx(28.0);
+        let bw = self.gpu.as_ref().map_or(0.0, |g| g.ui.blame.width());
+        let rect = widgets::Rect { x: bx, y: line_y, w: bw, h: lh };
+        if !rect.contains((x, y)) {
+            return None;
+        }
+        Some((render::blame_card_text(bl, render::now_unix_secs()), bx, line_y + lh))
+    }
+
+    /// Kick off a blame fetch for the active document if it's a plain tracked file
+    /// and one hasn't been requested for the current content yet. Called every tick
+    /// so it covers opens, tab switches, and session restore uniformly.
+    fn maybe_request_blame(&mut self) {
+        let path = match self.workspace.active_doc() {
+            Some(d)
+                if !d.blame_requested
+                    && d.path.is_some()
+                    && !d.read_only
+                    && d.diff.is_none()
+                    && d.image.is_none()
+                    && d.graph.is_none()
+                    && d.info.is_none()
+                    && d.markdown_preview.is_none() =>
+            {
+                d.path.clone()
+            }
+            _ => return,
+        };
+        if let Some(d) = self.workspace.active_doc_mut() {
+            d.blame_requested = true;
+        }
+        if let Some(p) = path {
+            self.request_blame(p);
+        }
+    }
+
     /// Re-read git status into the Source Control panel and redraw.
     fn refresh_source_control(&mut self) {
         if let (Some(scp), Some(g)) = (self.source_control.as_mut(), self.gpu.as_mut()) {
@@ -2816,6 +2904,8 @@ impl App {
                 }
             }
         }
+        // Inline blame is fetched lazily for whichever doc is active (covers opens,
+        // tab switches, and session restore uniformly — see `maybe_request_blame`).
         self.ensure_cursor_visible();
         self.redraw();
     }
@@ -3913,6 +4003,11 @@ impl App {
                     }
                 }
                 self.refresh_source_control(); // a save changes git status → update badge
+                // Re-blame on next tick so edited lines flip to "Uncommitted".
+                if let Some(d) = self.workspace.active_doc_mut() {
+                    d.blame.clear();
+                    d.blame_requested = false;
+                }
             }
             Command::Close => {
                 self.request_close_active();
@@ -6346,20 +6441,34 @@ impl App {
                 self.redraw();
             }
         }
-        // Commit graph: full-message tooltip for the hovered commit row.
+        // Commit-message hover card. Two sources share `commit_tip` (mutually
+        // exclusive by view): the GRAPH shows instantly; the inline BLAME annotation
+        // waits ~2s of rest (GitLens-style) via `blame_pending`.
         if !self.mouse_pressed {
             let region = render::editor_region(&self.layout());
-            let ctip = if region.contains((x, y)) {
-                self.workspace
-                    .active_doc()
-                    .and_then(|d| d.graph_message_at_y(region, y))
-                    .map(|m| (m.to_string(), x, y))
+            let graph_tip = region
+                .contains((x, y))
+                .then(|| self.workspace.active_doc().and_then(|d| d.graph_message_at_y(region, y)).map(|m| (m.to_string(), x, y)))
+                .flatten();
+            if let Some(gt) = graph_tip {
+                self.blame_pending = None;
+                if self.commit_tip.as_ref() != Some(&gt) {
+                    self.commit_tip = Some(gt);
+                    self.redraw();
+                }
+            } else if let Some(card) = region.contains((x, y)).then(|| self.blame_card_at(x, y)).flatten() {
+                // Over the blame annotation: stage it; promote after the delay.
+                let showing = self.commit_tip.as_ref() == Some(&card);
+                let pending = self.blame_pending.as_ref().map_or(false, |(c, ..)| *c == card.0);
+                if !showing && !pending {
+                    self.blame_pending = Some((card.0, card.1, card.2, Instant::now()));
+                }
             } else {
-                None
-            };
-            if ctip != self.commit_tip {
-                self.commit_tip = ctip;
-                self.redraw();
+                // Off both → dismiss any card + pending timer.
+                self.blame_pending = None;
+                if self.commit_tip.take().is_some() {
+                    self.redraw();
+                }
             }
         }
         // Feedback form: drag-select within the focused field.
@@ -7882,6 +7991,9 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // Lazily fetch inline git blame for the active document (open / tab switch /
+        // session restore all land here).
+        self.maybe_request_blame();
         // Native macOS menu clicks → commands.
         #[cfg(target_os = "macos")]
         {
@@ -8107,6 +8219,14 @@ impl ApplicationHandler for App {
                     }
                     self.redraw();
                 }
+                WorkerMsg::Blame { path, lines } => {
+                    // Attach to the matching open document (by path); ignore if it
+                    // closed or its content changed enough that blame is stale-on-arrival.
+                    if let Some(d) = self.workspace.documents.iter_mut().find(|d| d.path.as_deref() == Some(path.as_path())) {
+                        d.blame = lines;
+                        self.redraw();
+                    }
+                }
                 // ---- Debug adapter events ----
                 WorkerMsg::DebugInitialized => {
                     self.debug_handshook = true;
@@ -8239,6 +8359,16 @@ impl ApplicationHandler for App {
         }
         let hover_wake = self.hover_pending.as_ref().map(|(.., t0)| *t0 + HOVER_DELAY);
 
+        // Promote a rested inline-blame annotation into its full-commit card.
+        if let Some((txt, bx, by, t0)) = self.blame_pending.clone() {
+            if now.duration_since(t0) >= BLAME_DELAY {
+                self.blame_pending = None;
+                self.commit_tip = Some((txt, bx, by));
+                self.redraw();
+            }
+        }
+        let blame_wake = self.blame_pending.as_ref().map(|(.., t0)| *t0 + BLAME_DELAY);
+
         // Debounced marketplace search: fire once the user pauses typing. While a search
         // is staged or in flight, keep ticking ~110ms so the loader spinner animates.
         let (debounce_wake, searching) = self
@@ -8351,7 +8481,10 @@ impl ApplicationHandler for App {
             // focus requests are drained even when this window is otherwise idle.
             let daemon_wake = self.terminal.connected().then(|| now + Duration::from_millis(500));
             let wake = min_instant(
-                min_instant(min_instant(min_instant(scroll_wake, autosave_wake), hover_wake), search_wake),
+                min_instant(
+                    min_instant(min_instant(min_instant(scroll_wake, autosave_wake), hover_wake), search_wake),
+                    blame_wake,
+                ),
                 daemon_wake,
             );
             el.set_control_flow(match wake {

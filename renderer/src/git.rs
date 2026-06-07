@@ -70,6 +70,63 @@ impl Change {
     }
 }
 
+/// Blame info for one source line (`git blame --line-porcelain`). Lines not yet
+/// committed (working-tree edits / new files) carry the all-zero hash, surfaced
+/// as `uncommitted` so the UI shows "You · Uncommitted changes".
+#[derive(Clone, Debug)]
+pub struct BlameLine {
+    pub commit: String, // short hash ("" when uncommitted)
+    pub author: String,
+    pub time: i64, // author time, unix seconds (0 when unknown)
+    pub summary: String,
+    pub uncommitted: bool,
+}
+
+/// Per-line blame for `file` (absolute path) at the working-tree state. Empty on
+/// any error (not a repo, untracked file, git missing). Synchronous — call from a
+/// worker thread; `git blame` can be slow on large files.
+pub fn blame(root: &Path, file: &Path) -> Vec<BlameLine> {
+    let path = file.to_string_lossy().to_string();
+    let Some(out) = git(root, &["blame", "--line-porcelain", "--", &path]) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    let (mut commit, mut author, mut time, mut summary) = (String::new(), String::new(), 0i64, String::new());
+    for raw in out.lines() {
+        if let Some(rest) = raw.strip_prefix("author ") {
+            author = rest.to_string();
+        } else if let Some(rest) = raw.strip_prefix("author-time ") {
+            time = rest.trim().parse().unwrap_or(0);
+        } else if let Some(rest) = raw.strip_prefix("summary ") {
+            summary = rest.to_string();
+        } else if raw.starts_with('\t') {
+            // The source line — closes this entry.
+            let uncommitted = commit.chars().all(|c| c == '0');
+            lines.push(BlameLine {
+                commit: if uncommitted { String::new() } else { commit.chars().take(7).collect() },
+                author: std::mem::take(&mut author),
+                time,
+                summary: std::mem::take(&mut summary),
+                uncommitted,
+            });
+            commit = String::new();
+            time = 0;
+        } else if let Some(hash) = raw.split(' ').next() {
+            // Header line "<40-hex> <orig> <final> [count]" starts a new entry.
+            if hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                commit = hash.to_string();
+            }
+        }
+    }
+    lines
+}
+
+/// The configured commit author name (`git config user.name`), used to show
+/// "You" instead of the literal name in blame annotations. Cached per repo root.
+pub fn user_name(root: &Path) -> Option<String> {
+    git(root, &["config", "user.name"]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 fn git(root: &Path, args: &[&str]) -> Option<String> {
     let root = toplevel(root);
     let mut cmd = Command::new("git");

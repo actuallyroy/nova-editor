@@ -40,6 +40,91 @@ pub(crate) fn panel_tab_rects(header: Rect, tabs: &[crate::widgets::TextLabel]) 
 
 /// The full editor area (gutter + text columns) — where the document or the
 /// extension detail page is drawn.
+/// Coarse "N minutes/hours/days ago" for blame annotations (GitLens-style).
+fn rel_time(secs_ago: i64) -> String {
+    let s = secs_ago.max(0);
+    let (n, unit) = if s < 60 {
+        return "just now".to_string();
+    } else if s < 3600 {
+        (s / 60, "minute")
+    } else if s < 86_400 {
+        (s / 3600, "hour")
+    } else if s < 86_400 * 30 {
+        (s / 86_400, "day")
+    } else if s < 86_400 * 365 {
+        (s / (86_400 * 30), "month")
+    } else {
+        (s / (86_400 * 365), "year")
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
+/// The inline git-blame annotation for the caret line, if any — only for plain
+/// editable text docs (not diffs/images/previews). "You" replaces the user's own
+/// name; uncommitted edits read "You · Uncommitted changes".
+fn blame_text(d: &crate::document::Document, git_user: Option<&str>, now_unix: i64) -> Option<String> {
+    if d.read_only
+        || d.diff.is_some()
+        || d.image.is_some()
+        || d.graph.is_some()
+        || d.info.is_some()
+        || d.markdown_preview.is_some()
+    {
+        return None;
+    }
+    let line = d.head_line_col().0;
+    let bl = d.blame.get(line)?;
+    if bl.uncommitted {
+        return Some("You · Uncommitted changes".to_string());
+    }
+    let who = match git_user {
+        Some(u) if u == bl.author => "You".to_string(),
+        _ => bl.author.clone(),
+    };
+    Some(format!("{}, {} • {}", who, rel_time(now_unix - bl.time), bl.summary))
+}
+
+/// UTC "YYYY-MM-DD HH:MM" from a unix timestamp (no chrono dep — civil-from-days).
+fn fmt_date(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let (h, mi) = (secs / 3600, (secs % 3600) / 60);
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{day:02} {h:02}:{mi:02} UTC")
+}
+
+/// Full-commit hover card body for a blame line (multi-line, fed to `commit_card`).
+pub(crate) fn blame_card_text(bl: &crate::git::BlameLine, now: i64) -> String {
+    format!(
+        "{}\n\n{} committed {} ({})\ncommit {}",
+        bl.summary,
+        bl.author,
+        rel_time(now - bl.time),
+        fmt_date(bl.time),
+        bl.commit
+    )
+}
+
+pub(crate) fn now_unix_secs() -> i64 {
+    now_unix()
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub(crate) fn editor_region(layout: &Layout) -> Rect {
     Rect {
         x: layout.gutter.x,
@@ -635,6 +720,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                     d.head_line_col().0,
                 ),
                 None => gpu.ui.line_numbers.set_from_buffer(fs, &d.buffer, d.head_line_col().0),
+            }
+            // Inline git-blame annotation text for the caret line (drawn in the
+            // areas phase). Set here so it doesn't conflict with `areas` borrows.
+            if let Some(txt) = blame_text(d, app.git_user.as_deref(), now_unix()) {
+                gpu.ui.blame.set(fs, &txt, theme::MONO_FAMILY());
             }
         }
 
@@ -2275,6 +2365,20 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let g_top = g.y + theme::EDITOR_PAD() - d.scroll_y() - off;
                 ui.line_numbers
                     .draw_clipped(Rect { x: g.x, y: cy0, w: g.w, h: cy1 - cy0 }, g_top, theme::FG_GUTTER(), &mut areas);
+            }
+            // Inline git blame at the caret line's end (GitLens-style), dimmed and
+            // clipped to the editor text area.
+            if blame_text(d, app.git_user.as_deref(), now_unix()).is_some() {
+                let cur = d.head_line_col().0;
+                let line_w = d.buffer.layout_runs().find(|r| r.line_i == cur).map(|r| r.line_w).unwrap_or(0.0);
+                let (ltop, lh2) = d.line_visual_bounds(cur);
+                let off2 = lh * d.hidden_above(cur) as f32;
+                let line_y = et.y + theme::EDITOR_PAD() + ltop - d.scroll_y() - off2;
+                if line_y >= et.y && line_y + lh2 <= et.y + et.h {
+                    let bx = et.x + theme::EDITOR_PAD() - d.scroll_x() + line_w + theme::zpx(28.0);
+                    let rect = Rect { x: bx, y: line_y, w: ui.blame.width(), h: lh2 };
+                    ui.blame.push_in(bx, rect, et, theme::FG_DIM(), &mut areas);
+                }
             }
             // Fold chevrons in the gutter: ▸ for folded headers, ▾ for foldable ones.
             // Walk the SAME visible segments the text is drawn in — folded lines take

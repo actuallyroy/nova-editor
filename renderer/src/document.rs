@@ -102,6 +102,8 @@ pub struct Document {
     pub version: i32,                    // LSP document version (bumped on every edit)
     pub diagnostics: Vec<crate::lsp::Diagnostic>, // current LSP diagnostics for this doc
     pub breakpoints: std::collections::HashSet<usize>, // debug breakpoints (0-based lines)
+    pub blame: Vec<crate::git::BlameLine>, // inline git blame, indexed by 0-based line (empty = none/pending)
+    pub blame_requested: bool, // a blame fetch has been kicked off for the current content
     pub execution_line: Option<usize>,   // current debug execution line (0-based), if stopped here
     pub lsp_dirty: bool,                 // text changed since the last didChange was sent
     pub lsp_servers: Vec<&'static str>,  // servers a didOpen has been sent to (open-state is per-server)
@@ -378,6 +380,8 @@ impl Document {
             version: 0,
             diagnostics: Vec::new(),
             breakpoints: std::collections::HashSet::new(),
+            blame: Vec::new(),
+            blame_requested: false,
             execution_line: None,
             lsp_dirty: false,
             lsp_servers: Vec::new(),
@@ -526,6 +530,8 @@ impl Document {
             version: 0,
             diagnostics: Vec::new(),
             breakpoints: std::collections::HashSet::new(),
+            blame: Vec::new(),
+            blame_requested: false,
             execution_line: None,
             lsp_dirty: false,
             lsp_servers: Vec::new(),
@@ -632,6 +638,8 @@ impl Document {
             version: 0,
             diagnostics: Vec::new(),
             breakpoints: std::collections::HashSet::new(),
+            blame: Vec::new(),
+            blame_requested: false,
             execution_line: None,
             lsp_dirty: false,
             lsp_servers: Vec::new(),

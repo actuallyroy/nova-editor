@@ -34,6 +34,8 @@ pub enum WorkerMsg {
     // AI commit-message generation (see ai.rs): the generated message on success,
     // or an error to surface to the user.
     CommitMessage { result: Result<String, String> },
+    // Inline git blame (GitLens-style): per-line authorship for `path`.
+    Blame { path: std::path::PathBuf, lines: Vec<crate::git::BlameLine> },
     // ---- Language server (see lsp.rs) ----
     LspInitialized { sem_token_types: Vec<String> },            // initialize response (+ semantic legend)
     LspDiagnostics { server: &'static str, uri: String, diags: Vec<crate::lsp::Diagnostic> }, // push publishDiagnostics
