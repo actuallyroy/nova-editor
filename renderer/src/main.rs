@@ -813,12 +813,18 @@ impl App {
 
         // Hovering a link row in an info page → pointer cursor.
         let over_md_link = if self.detail.open_extension.is_none() {
-            self.workspace.active_doc().map_or(false, |d| {
-                d.info.as_ref().map_or(false, |page| {
-                    let body = ui::info_page::InfoPage::body(render::editor_region(&layout));
-                    page.links(body, d.scroll_y()).iter().any(|(r, _)| r.contains(p))
+            let body = ui::info_page::InfoPage::body(render::editor_region(&layout));
+            let info_hit = self.workspace.active_doc().map_or(false, |d| {
+                d.info.as_ref().map_or(false, |page| page.links(body, d.scroll_y()).iter().any(|(r, _)| r.contains(p)))
+            });
+            let md_hit = self.gpu.as_ref().map_or(false, |g| {
+                self.workspace.active_doc().map_or(false, |d| {
+                    d.markdown_preview.as_ref().map_or(false, |md| {
+                        md.link_geometry(body, d.scroll_y(), &|k| g.media.size(k)).iter().any(|(r, _)| r.contains(p))
+                    })
                 })
-            })
+            });
+            info_hit || md_hit
         } else {
             false
         };
@@ -3765,6 +3771,7 @@ impl App {
             }
             Command::OpenSettings => self.open_settings_editor(),
             Command::OpenDefaultSettings => self.open_settings_file(settings::default_settings_path()),
+            Command::MarkdownPreview => self.open_markdown_preview(),
             Command::ToggleTerminal => self.toggle_terminal(),
             Command::OpenFolder => {
                 if let Some(folder) = rfd::FileDialog::new().pick_folder() {
@@ -4301,6 +4308,38 @@ impl App {
             d.read_only = true;
             self.workspace.documents.push(d);
             self.workspace.active = Some(self.workspace.documents.len() - 1);
+        }
+        self.redraw();
+    }
+
+    /// Open a rendered Markdown preview of the active document (a read-only tab).
+    /// Re-runs against the current text if the preview tab is already open.
+    fn open_markdown_preview(&mut self) {
+        // Source = the active editable document's text + name. Skip if the active tab
+        // is itself a preview/info/diff/etc.
+        let Some((src, base)) = self.workspace.active_doc().and_then(|d| {
+            if d.markdown_preview.is_some() || d.info.is_some() || d.diff.is_some() || d.image.is_some() {
+                return None;
+            }
+            Some((d.text(), d.name.clone()))
+        }) else {
+            self.show_info_dialog("Open a Markdown (.md) file first, then run Markdown: Open Preview.");
+            return;
+        };
+        let title = format!("Preview {base}");
+        if let Some(i) = self.workspace.documents.iter().position(|d| d.markdown_preview.is_some() && d.name == title) {
+            self.workspace.active = Some(i);
+            // Refresh the source so the preview reflects the latest edits.
+            if let Some(gpu) = self.gpu.as_mut() {
+                if let Some(d) = self.workspace.documents.get_mut(i) {
+                    d.set_text_external(&src, &mut gpu.font_system);
+                }
+            }
+        } else if let Some(gpu) = self.gpu.as_mut() {
+            let d = Document::new_markdown_preview(title, src, &mut gpu.font_system);
+            self.workspace.documents.push(d);
+            self.workspace.active = Some(self.workspace.documents.len() - 1);
+            self.terminal.maximized = false;
         }
         self.redraw();
     }
@@ -5289,6 +5328,33 @@ impl App {
                     Some(ui::info_page::Action::Url(url)) => open_url(&url),
                     Some(ui::info_page::Action::OpenFolder(p)) => self.open_folder(p),
                     None => {}
+                }
+                return;
+            }
+        }
+
+        // Markdown preview: a click on a link opens it (http → browser); otherwise
+        // the page is inert (read-only, no caret).
+        if self.detail.open_extension.is_none()
+            && self.workspace.active_doc().map_or(false, |d| d.markdown_preview.is_some())
+        {
+            let region = render::editor_region(&layout);
+            if region.contains((x, y)) {
+                let body = ui::info_page::InfoPage::body(region);
+                let url = self.gpu.as_ref().and_then(|g| {
+                    self.workspace.active_doc().and_then(|d| {
+                        d.markdown_preview.as_ref().and_then(|md| {
+                            md.link_geometry(body, d.scroll_y(), &|k| g.media.size(k))
+                                .into_iter()
+                                .find(|(r, _)| r.contains((x, y)))
+                                .map(|(_, u)| u)
+                        })
+                    })
+                });
+                if let Some(url) = url {
+                    if url.starts_with("http://") || url.starts_with("https://") {
+                        open_url(&url);
+                    }
                 }
                 return;
             }
@@ -7034,6 +7100,15 @@ impl App {
                         event.physical_key
                     {
                         self.exec_command(Command::FormatDocument);
+                        return;
+                    }
+                }
+                // Ctrl/Cmd+Shift+V: open a rendered Markdown preview of the active file.
+                if ctrl && self.mods.shift_key() {
+                    if let winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) =
+                        event.physical_key
+                    {
+                        self.exec_command(Command::MarkdownPreview);
                         return;
                     }
                 }

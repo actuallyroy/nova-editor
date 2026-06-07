@@ -317,6 +317,22 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 d.scroll.set_metrics(region, (region.w, ch + theme::zpx(64.0)));
             }
         }
+    } else if app.workspace.active_doc().map_or(false, |d| d.markdown_preview.is_some()) {
+        // Markdown preview: parse + shape the source (`rope`) at the reading-column
+        // width, then size the scroll viewport from the rendered height.
+        let region = editor_region(&layout);
+        let body = crate::ui::info_page::InfoPage::body(region);
+        let src = app.workspace.active_doc().map(|d| d.text()).unwrap_or_default();
+        let key = app.workspace.active_doc().map(|d| format!("{}#{}", d.name, d.version)).unwrap_or_default();
+        if let Some(d) = app.workspace.active_doc_mut() {
+            if let Some(md) = d.markdown_preview.as_mut() {
+                md.set(&mut gpu.font_system, &key, &src, body.w);
+            }
+        }
+        let ch = app.workspace.active_doc().and_then(|d| d.markdown_preview.as_ref()).map(|md| md.content_height(&|k| gpu.media.size(k))).unwrap_or(0.0);
+        if let Some(d) = app.workspace.active_doc_mut() {
+            d.scroll.set_metrics(region, (region.w, ch + theme::zpx(64.0)));
+        }
     } else if let Some(d) = app.workspace.active_doc_mut() {
         // Editor: size the document's scroll viewport (offset clamps here, thumbs
         // position from these metrics). Content height uses logical lines + padding.
@@ -1843,6 +1859,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // README image draw rects (collected during the detail-page text draw, drawn in
     // a clipped media pass after the main pass).
     let mut detail_img_rects: Vec<(String, Rect)> = Vec::new();
+    // Markdown-preview image draw rects (same media pass as the detail page).
+    let mut preview_img_rects: Vec<(String, Rect)> = Vec::new();
 
     // The command palette renders in its own late pass on top of the live
     // background (VSCode-style — the file stays visible so symbol/line navigation
@@ -2094,6 +2112,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             // reading column (its quads are added in the quad-build phase above).
             let body = crate::ui::info_page::InfoPage::body(editor_region(&layout));
             page.draw(body, d.scroll_y(), &mut areas);
+        } else if let Some(md) = d.markdown_preview.as_ref() {
+            // Markdown preview: render the parsed blocks in a centered reading column.
+            let body = crate::ui::info_page::InfoPage::body(editor_region(&layout));
+            let size_of = |k: &str| gpu.media.size(k);
+            md.draw(body, d.scroll_y(), &size_of, &mut areas, &mut preview_img_rects);
         } else if d.binary {
             // Binary / unsupported-encoding placeholder (its button quad was added
             // in the quad phase above). The widget owns its centered layout.

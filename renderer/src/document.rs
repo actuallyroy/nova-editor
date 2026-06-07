@@ -119,6 +119,7 @@ pub struct Document {
     // (version, shape epoch). Avoids an O(lines) scan of both diff buffers per frame.
     maxw_cache: std::cell::Cell<Option<(i32, u64, f32)>>,
     pub info: Option<crate::ui::info_page::InfoPage>, // Some ⇒ designed info page (Welcome / Tips / Shortcuts)
+    pub markdown_preview: Option<crate::markdown::Markdown>, // Some ⇒ rendered markdown preview of `rope`
     /// Large-file mode: only a sliding window of lines is shaped into `buffer`
     /// (shaping a 450k-line file whole takes ~50s). Highlighting, LSP, folding and
     /// word wrap are disabled; geometry helpers translate window↔document lines.
@@ -388,6 +389,7 @@ impl Document {
             indent_unit_cache: std::cell::Cell::new(None),
             maxw_cache: std::cell::Cell::new(None),
             info: None,
+            markdown_preview: None,
             large,
             buf_first: 0,
             buf_count,
@@ -401,6 +403,16 @@ impl Document {
         d.name = page.title.clone();
         d.read_only = true;
         d.info = Some(page);
+        d
+    }
+
+    /// A read-only rendered Markdown preview of `source`. `name` is the tab title.
+    /// The source text is kept in `rope` (re-rendered on width/zoom changes).
+    pub fn new_markdown_preview(name: String, source: String, fs: &mut FontSystem) -> Self {
+        let mut d = Document::new(None, source, fs);
+        d.name = name;
+        d.read_only = true;
+        d.markdown_preview = Some(crate::markdown::Markdown::new(fs));
         d
     }
 
@@ -525,6 +537,7 @@ impl Document {
             indent_unit_cache: std::cell::Cell::new(None),
             maxw_cache: std::cell::Cell::new(None),
             info: None,
+            markdown_preview: None,
             large: false,
             buf_first: 0,
             buf_count: 0,
@@ -630,6 +643,7 @@ impl Document {
             indent_unit_cache: std::cell::Cell::new(None),
             maxw_cache: std::cell::Cell::new(None),
             info: None,
+            markdown_preview: None,
             large: false,
             buf_first: 0,
             buf_count: 0,
