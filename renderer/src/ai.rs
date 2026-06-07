@@ -26,15 +26,38 @@ const MAX_DIFF_CHARS: usize = 24_000;
 
 fn endpoint() -> String {
     std::env::var("AETHER_AZURE_ENDPOINT")
-        .unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string())
+        .ok()
+        .or_else(|| option_env!("AETHER_AZURE_ENDPOINT").map(str::to_string))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string())
         .trim_end_matches('/')
         .to_string()
 }
 fn deployment() -> String {
-    std::env::var("AETHER_AZURE_DEPLOYMENT").unwrap_or_else(|_| DEFAULT_DEPLOYMENT.to_string())
+    std::env::var("AETHER_AZURE_DEPLOYMENT")
+        .ok()
+        .or_else(|| option_env!("AETHER_AZURE_DEPLOYMENT").map(str::to_string))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_DEPLOYMENT.to_string())
 }
 fn api_version() -> String {
-    std::env::var("AETHER_AZURE_API_VERSION").unwrap_or_else(|_| DEFAULT_API_VERSION.to_string())
+    std::env::var("AETHER_AZURE_API_VERSION")
+        .ok()
+        .or_else(|| option_env!("AETHER_AZURE_API_VERSION").map(str::to_string))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_API_VERSION.to_string())
+}
+
+/// Azure OpenAI API key. Release binaries bake it in from a GitHub Actions secret
+/// at compile time (`option_env!`); a runtime env var overrides it for local dev.
+/// When present, key auth is used and the Azure CLI is not needed — so the shipped
+/// app works out of the box. `None` ⇒ fall back to the `az` bearer-token flow.
+fn api_key() -> Option<String> {
+    std::env::var("AETHER_AZURE_API_KEY")
+        .ok()
+        .or_else(|| option_env!("AETHER_AZURE_API_KEY").map(str::to_string))
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
 }
 
 // Cached bearer token: `az` is slow to spawn (~1s), so reuse the token until it
@@ -92,8 +115,6 @@ fn get_token() -> Result<String, String> {
 /// Call the Azure OpenAI chat-completions endpoint to summarize `diff` into a
 /// commit message. Synchronous — call from a worker thread.
 fn request_message(diff: &str) -> Result<String, String> {
-    let token = get_token()?;
-
     let mut diff = diff.trim();
     if diff.is_empty() {
         return Err("no changes to summarize".to_string());
@@ -130,9 +151,14 @@ that are not in the diff.";
     });
 
     let body_str = serde_json::to_string(&body).map_err(|e| format!("bad request JSON: {e}"))?;
-    let resp = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Content-Type", "application/json")
+    // Prefer the baked/env API key (no external deps); fall back to an Azure CLI
+    // bearer token for local dev when no key is configured.
+    let req = ureq::post(&url).set("Content-Type", "application/json");
+    let req = match api_key() {
+        Some(key) => req.set("api-key", &key),
+        None => req.set("Authorization", &format!("Bearer {}", get_token()?)),
+    };
+    let resp = req
         .send_string(&body_str)
         .map_err(|e| match e {
             ureq::Error::Status(code, r) => {

@@ -317,6 +317,8 @@ pub(crate) struct App {
     pub(crate) commit_tip: Option<(String, f32, f32)>,
     // Editor tab hover: full file name + anchor (x, y) — tabs truncate to fit.
     pub(crate) tab_tip: Option<(String, f32, f32)>,
+    // Explorer / Source Control row hover: full path when the label is ellipsized.
+    pub(crate) row_tip: Option<(String, f32, f32)>,
     pub(crate) sidebar_view: SidebarView,
     // Find-in-files (Search view): a self-contained panel (built once the GPU/font
     // system exists, in `resumed`). Owns all of its own state + buffers.
@@ -479,6 +481,7 @@ impl App {
             block_tip: None,
             commit_tip: None,
             tab_tip: None,
+            row_tip: None,
             sidebar_view: SidebarView::Explorer,
             search: None, // built in `resumed` once the font system exists
             source_control: None, // built in `resumed`
@@ -644,7 +647,7 @@ impl App {
             changed = true;
         }
 
-        let new_tree = if self.sidebar_visible {
+        let new_tree = if self.sidebar_visible && self.sidebar_view == SidebarView::Explorer {
             self.gpu.as_ref().and_then(|gpu| {
                 gpu.ui.sidebar.row_at_scrolled(
                     layout.tree_region(),
@@ -690,6 +693,28 @@ impl App {
             });
         if tab_tip != self.tab_tip {
             self.tab_tip = tab_tip;
+            changed = true;
+        }
+        // Full-path tooltip for a hovered Explorer / Source Control row whose label
+        // is ellipsized (#40). Anchored just below-right of the pointer.
+        let anchor = (p.0 + theme::zpx(12.0), p.1 + theme::zpx(16.0));
+        let row_tip = if !self.sidebar_visible {
+            None
+        } else if self.sidebar_view == SidebarView::SourceControl {
+            self.source_control
+                .as_ref()
+                .and_then(|scp| scp.row_tip_at(p, layout.panel_region()))
+                .map(|full| (full, anchor.0, anchor.1))
+        } else if self.sidebar_view == SidebarView::Explorer {
+            new_tree
+                .filter(|&i| self.gpu.as_ref().map_or(false, |g| g.ui.sidebar.row_truncated(i)))
+                .and_then(|i| self.workspace.tree.nodes.get(i))
+                .map(|n| (n.name.clone(), anchor.0, anchor.1))
+        } else {
+            None
+        };
+        if row_tip != self.row_tip {
+            self.row_tip = row_tip;
             changed = true;
         }
         if new_close != self.hovered_tab_close {
@@ -1185,6 +1210,15 @@ impl App {
                 .map_or(false, |scp| scp.over_message(p, layout.panel_region()))
         {
             CursorIcon::Text
+        } else if self.sidebar_visible
+            && self.sidebar_view == SidebarView::SourceControl
+            && self
+                .source_control
+                .as_ref()
+                .map_or(false, |scp| scp.over_row(p, layout.panel_region()))
+        {
+            // A changed-file row or collapsible folder header is clickable.
+            CursorIcon::Pointer
         } else if self.focused_input_at(&layout, p).is_some() {
             CursorIcon::Text
         } else if new_page_install || new_detail_tab.is_some() || over_detail_link || over_diag_link {
@@ -1308,6 +1342,101 @@ impl App {
         }
         // No welcome/Untitled doc on launch — if nothing was opened, show an empty
         // editor. The user opens files from the sidebar or command palette.
+    }
+
+    /// Map the active sidebar view to/from its persisted string tag.
+    fn sidebar_view_tag(view: SidebarView) -> &'static str {
+        match view {
+            SidebarView::Explorer => "explorer",
+            SidebarView::Search => "search",
+            SidebarView::SourceControl => "scm",
+            SidebarView::Debug => "debug",
+            SidebarView::Extensions => "extensions",
+        }
+    }
+
+    /// Snapshot the current window/layout into the per-workspace session store, so
+    /// the next launch in this folder restores open files + panels + sizes.
+    fn save_session(&self) {
+        // Only plain file tabs are restorable (diff/image/graph/info/preview views
+        // are derived and can't be reopened by path).
+        let files: Vec<PathBuf> = self
+            .workspace
+            .documents
+            .iter()
+            .filter(|d| {
+                d.path.is_some()
+                    && d.diff.is_none()
+                    && d.image.is_none()
+                    && d.graph.is_none()
+                    && d.info.is_none()
+                    && d.markdown_preview.is_none()
+            })
+            .filter_map(|d| d.path.clone())
+            .collect();
+        let active = self
+            .workspace
+            .active_doc()
+            .and_then(|d| d.path.clone())
+            .and_then(|ap| files.iter().position(|f| *f == ap));
+        let session = state::Session {
+            files,
+            active,
+            sidebar_visible: self.sidebar_visible,
+            sidebar_view: Self::sidebar_view_tag(self.sidebar_view).to_string(),
+            sidebar_width: self.sidebar_split.size(),
+            terminal_visible: self.terminal.visible,
+            terminal_maximized: self.terminal.maximized,
+            terminal_height: self.terminal.split.size(),
+            panel_tab: self.panel_tab,
+            right_visible: self.right_sidebar_visible,
+            right_width: self.right_split.size(),
+            window: self.gpu.as_ref().map(|g| (g.config.width, g.config.height)),
+        };
+        state::State::save_session(&self.cwd, session);
+    }
+
+    /// Reopen the files + restore the panel layout saved for this workspace. Called
+    /// once at startup after `open_initial` and the panels are built. Window size is
+    /// restored separately at window-creation time.
+    fn restore_session(&mut self) {
+        let Some(sess) = state::State::load().session_for(&self.cwd).cloned() else {
+            return;
+        };
+        if let Some(gpu) = self.gpu.as_mut() {
+            for f in &sess.files {
+                if f.exists() && !self.workspace.documents.iter().any(|d| d.path.as_ref() == Some(f)) {
+                    let _ = self.workspace.open_file(f, &mut gpu.font_system);
+                }
+            }
+        }
+        // Restore the active tab by path (indices shift if a file went missing).
+        if let Some(target) = sess.active.and_then(|i| sess.files.get(i)) {
+            if let Some(idx) = self.workspace.documents.iter().position(|d| d.path.as_ref() == Some(target)) {
+                self.workspace.active = Some(idx);
+            }
+        }
+        // Sidebar: width + visibility + which view. The panels were all built in
+        // `resumed`, so setting the field directly is safe (no lazy init needed).
+        self.sidebar_split.set_size(sess.sidebar_width);
+        self.sidebar_visible = sess.sidebar_visible;
+        self.sidebar_view = match sess.sidebar_view.as_str() {
+            "search" => SidebarView::Search,
+            "scm" => SidebarView::SourceControl,
+            "debug" => SidebarView::Debug,
+            "extensions" => SidebarView::Extensions,
+            _ => SidebarView::Explorer,
+        };
+        // Right (AI chat) sidebar.
+        self.right_split.set_size(sess.right_width);
+        self.right_sidebar_visible = sess.right_visible;
+        // Bottom panel: height + active tab, then spawn the terminal if it was open.
+        self.terminal.split.set_size(sess.terminal_height);
+        self.panel_tab = sess.panel_tab;
+        if sess.terminal_visible && !self.terminal.visible {
+            self.terminal.maximized = sess.terminal_maximized;
+            self.toggle_terminal();
+        }
     }
 
     fn layout(&self) -> Layout {
@@ -7743,6 +7872,15 @@ fn min_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
 // ---------- winit glue ----------
 
 impl ApplicationHandler for App {
+    /// The event loop is shutting down (Cmd/Ctrl+Q, menu Quit, or a `CloseRequested`
+    /// that reached `el.exit()`): persist the window/layout one last time. Idempotent
+    /// with the `CloseRequested` save above.
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        if self.gpu.is_some() {
+            self.save_session();
+        }
+    }
+
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         // Native macOS menu clicks → commands.
         #[cfg(target_os = "macos")]
@@ -8244,10 +8382,16 @@ impl ApplicationHandler for App {
         if self.gpu.is_some() {
             return;
         }
+        // Restore the saved window size for this workspace, else the default.
+        let saved_window = state::State::load().session_for(&self.cwd).and_then(|s| s.window);
+        let inner: winit::dpi::Size = match saved_window {
+            Some((w, h)) if w >= 480 && h >= 360 => winit::dpi::PhysicalSize::new(w, h).into(),
+            _ => LogicalSize::new(1400.0, 900.0).into(),
+        };
         let mut attrs = Window::default_attributes()
             .with_title(window_title(&self.cwd))
             .with_window_icon(app_icon())
-            .with_inner_size(LogicalSize::new(1400.0, 900.0));
+            .with_inner_size(inner);
         // macOS: keep the native traffic lights (top-left) but let our content fill
         // the window behind a transparent titlebar — so we render our own header but
         // the OS draws min/zoom/close. Other platforms: fully borderless (we draw the
@@ -8291,10 +8435,15 @@ impl ApplicationHandler for App {
                     self.source_control = Some(scp);
                 }
                 self.open_initial();
+                // Restore the prior window/layout for this workspace (open files,
+                // panels, terminal height) — after panels are built, before first draw.
+                self.restore_session();
                 // Populate the Source Control change-count badge at startup.
                 self.refresh_source_control();
-                // Check GitHub for a newer release in the background.
+                // Check GitHub for a newer release now, then re-check every 6 hours so
+                // a long-running window still learns about new releases.
                 update::check_async(self.worker_tx.clone(), false);
+                update::check_periodic(self.worker_tx.clone(), std::time::Duration::from_secs(6 * 3600));
                 // Register this window with the pty-host (single-window-per-folder):
                 // if another live window already has this workspace open, it raises
                 // itself and this duplicate instance closes.
@@ -8315,7 +8464,15 @@ impl ApplicationHandler for App {
             // then closes via `pending_close`.
             WindowEvent::CloseRequested => {
                 if self.confirm_close_window() {
+                    self.save_session();
                     el.exit();
+                }
+            }
+            // Persist the layout when the window loses focus, so a later force-quit
+            // (no clean exit) still restores the most recent arrangement.
+            WindowEvent::Focused(false) => {
+                if self.gpu.is_some() {
+                    self.save_session();
                 }
             }
             WindowEvent::ModifiersChanged(m) => {

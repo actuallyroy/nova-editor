@@ -1638,6 +1638,7 @@ pub struct IconList {
     active_row: Option<usize>, // selected/open row — its parent guide stays highlighted
     hover_row: Option<usize>,  // hovered row — its parent guide highlights while hovering
     measure: Buffer,           // scratch buffer for measuring label widths (ellipsis fitting)
+    truncated_rows: Vec<bool>, // per-row: did `set_rows_fit` ellipsize it? (hover tooltip)
 }
 
 impl IconList {
@@ -1652,7 +1653,14 @@ impl IconList {
             active_row: None,
             hover_row: None,
             measure: make_ui_buffer(fs, 4000.0, row_h),
+            truncated_rows: Vec::new(),
         }
+    }
+
+    /// Whether the row at `idx` had its label ellipsized by the last `set_rows_fit`
+    /// — used to show a full-text tooltip only when text is actually clipped.
+    pub fn row_truncated(&self, idx: usize) -> bool {
+        self.truncated_rows.get(idx).copied().unwrap_or(false)
     }
 
     /// Pixel width of `text` shaped in `attrs` (UI or icon font), using the scratch
@@ -1775,6 +1783,7 @@ impl IconList {
         let ui = Attrs::new().family(Family::Name(theme::UI_FAMILY()));
         let icon_attrs = Attrs::new().family(Family::Name(theme::ICON_FAMILY));
         let pad = self.list.pad_x();
+        let mut truncated: Vec<bool> = Vec::with_capacity(rows.len());
         let fitted: Vec<IconRow> = rows
             .iter()
             .map(|row| {
@@ -1784,10 +1793,14 @@ impl IconList {
                     None => 0.0,
                 };
                 let avail = w - reserve_right - pad - indent_px - icon_px - theme::zpx(4.0);
-                IconRow { depth: row.depth, icon: row.icon, label: self.fit_label(fs, &row.label, avail) }
+                let label = self.fit_label(fs, &row.label, avail);
+                // fit_label appends '…' when it clips; flag the row for the tooltip.
+                truncated.push(label.iter().any(|(s, _)| s.contains('…')));
+                IconRow { depth: row.depth, icon: row.icon, label }
             })
             .collect();
         self.set_rows(fs, key, &fitted, w, h);
+        self.truncated_rows = truncated;
     }
 
     /// Re-shape every cached icon after a zoom change.
@@ -2521,6 +2534,13 @@ impl Splitter {
 
     pub fn size(&self) -> f32 {
         self.size
+    }
+
+    /// Restore a persisted size, clamped into the current bounds.
+    pub fn set_size(&mut self, size: f32) {
+        if size > 0.0 {
+            self.size = size.clamp(self.min, self.max);
+        }
     }
 
     /// Scale the size + bounds by `factor` (for a zoom change), so a sidebar/panel that

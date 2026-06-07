@@ -46,6 +46,17 @@ pub fn check_async(tx: Sender<WorkerMsg>, manual: bool) {
     });
 }
 
+/// Re-check for a newer release every `interval` on a background thread, sending
+/// `UpdateAvailable` each time one is found. Runs for the life of the process.
+pub fn check_periodic(tx: Sender<WorkerMsg>, interval: std::time::Duration) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(interval);
+        if let Some(version) = latest_newer() {
+            let _ = tx.send(WorkerMsg::UpdateAvailable { version });
+        }
+    });
+}
+
 fn latest_newer() -> Option<String> {
     let releases = self_update::backends::github::ReleaseList::configure()
         .repo_owner(OWNER)

@@ -1416,6 +1416,79 @@ impl SourceControlPanel {
 
     /// The file row under `pt` as (repo-relative path, in-staged-group, untracked) —
     /// drives the right-click context menu.
+    /// True when `pt` is over any clickable list row — a changed file OR a
+    /// collapsible folder header. Drives the pointer cursor (folders toggle on
+    /// click just like files open). Wider than [`row_at_point`], which is
+    /// file-only for the open-diff action.
+    pub fn over_row(&self, pt: (f32, f32), region: Rect) -> bool {
+        if !self.groups_viewport(region).contains(pt) {
+            return false;
+        }
+        for staged in [true, false] {
+            let (lr, vis, list): (Rect, &[Vis], &IconList) = if staged {
+                (self.staged_list(region), &self.staged_vis, &self.staged)
+            } else {
+                (self.unstaged_list(region), &self.unstaged_vis, &self.unstaged)
+            };
+            if !lr.contains(pt) {
+                continue;
+            }
+            if let Some(i) = list.row_at(lr, pt, vis.len()) {
+                return matches!(vis[i], Vis::File { .. } | Vis::Folder { .. });
+            }
+            return false;
+        }
+        false
+    }
+
+    /// Full text for the hovered row when its label is ellipsized — drives the
+    /// "show full text on hover" tooltip (#40). Returns the repo-relative file or
+    /// folder path; `None` when nothing is hovered or the label already fits.
+    pub fn row_tip_at(&self, pt: (f32, f32), region: Rect) -> Option<String> {
+        if !self.groups_viewport(region).contains(pt) {
+            return None;
+        }
+        let z = theme::ui_zoom();
+        let avail = (region.w - pad_x() - status_w() - 8.0 * z).max(20.0);
+        let hover_reserve = 3.0 * action_w() + 4.0 * z;
+        for staged in [true, false] {
+            let (lr, vis, rows, list): (Rect, &[Vis], &[Row], &IconList) = if staged {
+                (self.staged_list(region), &self.staged_vis, &self.staged_rows, &self.staged)
+            } else {
+                (self.unstaged_list(region), &self.unstaged_vis, &self.unstaged_rows, &self.unstaged)
+            };
+            if !lr.contains(pt) {
+                continue;
+            }
+            let Some(i) = list.row_at(lr, pt, vis.len()) else { return None };
+            // The hovered row reserves its action column, so it ellipsizes earlier.
+            let row_avail = (avail - hover_reserve).max(20.0);
+            match &vis[i] {
+                Vis::Folder { key, label, depth, .. } => {
+                    let ta = (row_avail - *depth as f32 * 11.0 * z - 20.0 * z).max(20.0);
+                    if Self::display(label, "", ta).0.contains('…') {
+                        return Some(key.clone());
+                    }
+                }
+                Vis::File { row, depth } => {
+                    let r = &rows[*row];
+                    let truncated = if self.tree_mode {
+                        let ta = (row_avail - *depth as f32 * 11.0 * z - 20.0 * z).max(20.0);
+                        Self::display(&r.fname, "", ta).0.contains('…')
+                    } else {
+                        let la = (row_avail - 20.0 * z).max(20.0);
+                        Self::display(&r.fname, &r.dir, la).0.contains('…')
+                    };
+                    if truncated {
+                        return Some(r.path.clone());
+                    }
+                }
+            }
+            return None;
+        }
+        None
+    }
+
     pub fn row_at_point(&self, pt: (f32, f32), region: Rect) -> Option<(String, bool, bool)> {
         if !self.groups_viewport(region).contains(pt) {
             return None;
@@ -1476,18 +1549,24 @@ impl SourceControlPanel {
         self.graph_resizing
     }
 
+    /// Half-height of the CHANGES/GRAPH divider grab strip. Wide enough that the
+    /// last change rows sitting right above the divider don't steal the drag (#41).
+    fn divider_grab() -> f32 {
+        9.0 * theme::ui_zoom()
+    }
+
     /// True when `pt` is on the draggable CHANGES/GRAPH divider (for the cursor).
     pub fn over_divider(&self, pt: (f32, f32), region: Rect) -> bool {
         self.graph.is_some()
             && self.graph_open
-            && (pt.1 - self.graph_section_top(region)).abs() <= 5.0 * theme::ui_zoom()
+            && (pt.1 - self.graph_section_top(region)).abs() <= Self::divider_grab()
     }
 
     pub fn on_press(&mut self, pt: (f32, f32), region: Rect, clicks: u32, out: &mut Vec<Intent>) -> bool {
         // Grab the CHANGES/GRAPH divider to resize the split.
         if self.graph.is_some() && self.graph_open {
             let div = self.graph_section_top(region);
-            if (pt.1 - div).abs() <= 5.0 * theme::ui_zoom() {
+            if (pt.1 - div).abs() <= Self::divider_grab() {
                 self.graph_resizing = true;
                 return true;
             }

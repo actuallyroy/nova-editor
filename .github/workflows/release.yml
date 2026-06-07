@@ -60,7 +60,15 @@ jobs:
             libfontconfig1-dev \
             clang libclang-dev
 
+      # Bake the Azure OpenAI key + endpoint into the binary so AI commit messages
+      # work out of the box (option_env! reads these at compile time). Set these as
+      # repo Actions secrets. NOTE: a key compiled into a distributed binary is
+      # extractable — scope/rate-limit it and rotate if abused.
       - name: Build release
+        env:
+          AETHER_AZURE_API_KEY: ${{ secrets.AETHER_AZURE_API_KEY }}
+          AETHER_AZURE_ENDPOINT: ${{ secrets.AETHER_AZURE_ENDPOINT }}
+          AETHER_AZURE_DEPLOYMENT: ${{ secrets.AETHER_AZURE_DEPLOYMENT }}
         run: cargo build --release -p aether-renderer
 
       - name: Stage binary

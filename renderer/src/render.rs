@@ -3047,7 +3047,9 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Reused for the per-block diff buttons (Stage/Revert/Unstage) and the editor
     // tab full-name on hover (tabs truncate to fit). Only one is set at a time.
     if app.dialog.is_none() && app.feedback_form.is_none() {
-        if let Some((text, ax, ay)) = app.block_tip.clone().or_else(|| app.tab_tip.clone()) {
+        if let Some((text, ax, ay)) =
+            app.block_tip.clone().or_else(|| app.tab_tip.clone()).or_else(|| app.row_tip.clone())
+        {
             gpu.ui.block_tip.set(&mut gpu.font_system, &text, theme::UI_FAMILY());
             let padx = theme::zpx(7.0);
             let w = gpu.ui.block_tip.width() + padx * 2.0;
