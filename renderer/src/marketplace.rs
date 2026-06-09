@@ -36,6 +36,9 @@ pub enum WorkerMsg {
     CommitMessage { result: Result<String, String> },
     // Inline git blame (GitLens-style): per-line authorship for `path`.
     Blame { path: std::path::PathBuf, lines: Vec<crate::git::BlameLine> },
+    // Filesystem watcher: paths under the workspace changed on disk (debounced in
+    // the UI). Drives Source Control refresh + external-edit reload of open docs.
+    FsChanged { paths: Vec<std::path::PathBuf> },
     // ---- Language server (see lsp.rs) ----
     LspInitialized { sem_token_types: Vec<String> },            // initialize response (+ semantic legend)
     LspDiagnostics { server: &'static str, uri: String, diags: Vec<crate::lsp::Diagnostic> }, // push publishDiagnostics

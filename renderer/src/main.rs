@@ -332,6 +332,12 @@ pub(crate) struct App {
     /// Commit author name (`git config user.name`), resolved once — blame shows
     /// "You" instead of this name. `None` = not a repo / git missing.
     pub(crate) git_user: Option<String>,
+    /// Filesystem watcher on the workspace root (kept alive so it keeps firing).
+    pub(crate) fs_watcher: Option<notify::RecommendedWatcher>,
+    /// Debounce for fs-change handling: paths changed since the last flush + when
+    /// to flush them (refresh Source Control + reload externally-edited open docs).
+    pub(crate) fs_dirty: std::collections::HashSet<PathBuf>,
+    pub(crate) fs_flush_due: Option<Instant>,
     pub(crate) settings_editor: ui::settings_editor::SettingsEditor,
     pub(crate) debug: Option<ui::debug_panel::DebugPanel>,
     pub(crate) dap: Option<dap::DapClient>,
@@ -495,6 +501,9 @@ impl App {
             search: None, // built in `resumed` once the font system exists
             source_control: None, // built in `resumed`
             git_user: None,       // resolved in `open_initial`
+            fs_watcher: None,     // started in `open_initial`
+            fs_dirty: std::collections::HashSet::new(),
+            fs_flush_due: None,
             settings_editor: ui::settings_editor::SettingsEditor::default(),
             debug: None, // built in `resumed`
             dap: None,
@@ -1323,6 +1332,10 @@ impl App {
         // Resolve the commit author once so blame can render "You" for the user's
         // own lines instead of their full name.
         self.git_user = git::user_name(&git::repo_root(&self.cwd));
+
+        // Watch the workspace so Source Control + open files react to external
+        // changes (terminal commands, other windows, `claude code`, another editor).
+        self.start_fs_watcher();
 
         // Scan installed extensions up front so "Installed" status is accurate from
         // the start and grammar extensions (rainbow-csv, …) activate on launch.
@@ -2414,6 +2427,61 @@ impl App {
         }
         if let Some(p) = path {
             self.request_blame(p);
+        }
+    }
+
+    /// Start (or restart) the workspace filesystem watcher. Debounced fs events
+    /// post `WorkerMsg::FsChanged`; the UI flushes them into a Source Control
+    /// refresh + external-edit reload of open documents.
+    fn start_fs_watcher(&mut self) {
+        use notify::{RecursiveMode, Watcher};
+        let tx = self.worker_tx.clone();
+        let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res {
+                if !ev.paths.is_empty() {
+                    let _ = tx.send(WorkerMsg::FsChanged { paths: ev.paths });
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        let root = git::repo_root(&self.cwd);
+        if watcher.watch(&root, RecursiveMode::Recursive).is_ok() {
+            self.fs_watcher = Some(watcher);
+        }
+    }
+
+    /// Flush a debounced batch of filesystem changes: refresh Source Control, and
+    /// reload any open document whose file changed on disk and has no unsaved edits
+    /// (so an external editor / `claude code` / another window is reflected live).
+    fn flush_fs_changes(&mut self) {
+        let paths = std::mem::take(&mut self.fs_dirty);
+        if paths.is_empty() {
+            return;
+        }
+        // Reload externally-changed, non-dirty docs from disk (skip dirty ones so we
+        // never clobber unsaved local edits).
+        let mut reloaded = false;
+        if let Some(g) = self.gpu.as_mut() {
+            for d in self.workspace.documents.iter_mut() {
+                let Some(path) = d.path.clone() else { continue };
+                if d.dirty || !paths.contains(&path) {
+                    continue;
+                }
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    if text != d.text() {
+                        d.set_text_external(&text, &mut g.font_system);
+                        d.blame_requested = false; // re-blame the new content
+                        reloaded = true;
+                    }
+                }
+            }
+        }
+        // Any change (working tree or .git) can move the git status.
+        self.refresh_source_control();
+        if reloaded {
+            self.redraw();
         }
     }
 
@@ -7235,7 +7303,12 @@ impl App {
                             .get(self.terminal.active)
                             .and_then(|g| g.panes.get(g.focused))
                             .map_or(false, |p| p.term.is_alt());
-                        if !in_alt && !self.terminal.focused_term_busy() {
+                        // Windows can't detect a running foreground process
+                        // (`shell_busy` is Unix-only), so the idle check is always
+                        // false there — rewriting would eat Esc inside inline TUIs
+                        // (claude code). Only apply the kill-line convenience where
+                        // busy-detection is reliable; otherwise send the real Esc.
+                        if cfg!(not(windows)) && !in_alt && !self.terminal.focused_term_busy() {
                             bytes = vec![0x15]; // ^U — kill the whole input line
                         }
                     }
@@ -8247,6 +8320,14 @@ impl ApplicationHandler for App {
                     }
                     self.redraw();
                 }
+                WorkerMsg::FsChanged { paths } => {
+                    // Coalesce bursts: accumulate paths, flush ~500ms after the first
+                    // event of a quiet-ish window (npm install etc. won't thrash git).
+                    self.fs_dirty.extend(paths);
+                    if self.fs_flush_due.is_none() {
+                        self.fs_flush_due = Some(Instant::now() + Duration::from_millis(500));
+                    }
+                }
                 WorkerMsg::Blame { path, lines } => {
                     // Attach to the matching open document (by path); ignore if it
                     // closed or its content changed enough that blame is stale-on-arrival.
@@ -8397,6 +8478,15 @@ impl ApplicationHandler for App {
         }
         let blame_wake = self.blame_pending.as_ref().map(|(.., t0)| *t0 + BLAME_DELAY);
 
+        // Flush a debounced batch of filesystem changes (Source Control + reload).
+        if let Some(due) = self.fs_flush_due {
+            if now >= due {
+                self.fs_flush_due = None;
+                self.flush_fs_changes();
+            }
+        }
+        let fs_wake = self.fs_flush_due;
+
         // Debounced marketplace search: fire once the user pauses typing. While a search
         // is staged or in flight, keep ticking ~110ms so the loader spinner animates.
         let (debounce_wake, searching) = self
@@ -8510,8 +8600,11 @@ impl ApplicationHandler for App {
             let daemon_wake = self.terminal.connected().then(|| now + Duration::from_millis(500));
             let wake = min_instant(
                 min_instant(
-                    min_instant(min_instant(min_instant(scroll_wake, autosave_wake), hover_wake), search_wake),
-                    blame_wake,
+                    min_instant(
+                        min_instant(min_instant(min_instant(scroll_wake, autosave_wake), hover_wake), search_wake),
+                        blame_wake,
+                    ),
+                    fs_wake,
                 ),
                 daemon_wake,
             );
