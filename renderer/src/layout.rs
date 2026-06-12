@@ -441,17 +441,20 @@ impl Layout {
 // These derive sub-region rects from a parent rect; re-exported at the crate root
 // so existing `crate::<fn>` references keep working.
 
-pub(crate) fn create_row_geometry(tr: Rect, row: usize, depth: usize) -> (Rect, Rect, Rect) {
+/// `icon_x` is the ABSOLUTE x of the icon column for this row's depth — the caller
+/// sources it from the tree (`IconList::icon_x_for_depth`) so the inline input lines
+/// up with sibling rows exactly, instead of re-deriving the indent math (which drifts
+/// from the tree's character-based indentation at non-100% zoom).
+pub(crate) fn create_row_geometry(tr: Rect, row: usize, icon_x: f32) -> (Rect, Rect, Rect) {
     let row_y = tr.y + row as f32 * theme::TREE_ROW_HEIGHT();
-    // Match the file tree: 12px left pad + ~8px per depth, left-aligned icon.
-    let indent = theme::zpx(12.0) + depth as f32 * theme::zpx(8.0);
     let icon_w = theme::zpx(16.0);
+    let field_x = icon_x + icon_w + theme::zpx(4.0);
     let row_rect = Rect { x: tr.x, y: row_y, w: tr.w, h: theme::TREE_ROW_HEIGHT() };
-    let icon_rect = Rect { x: tr.x + indent, y: row_y, w: icon_w, h: theme::TREE_ROW_HEIGHT() };
+    let icon_rect = Rect { x: icon_x, y: row_y, w: icon_w, h: theme::TREE_ROW_HEIGHT() };
     let field = Rect {
-        x: tr.x + indent + icon_w + theme::zpx(4.0),
+        x: field_x,
         y: row_y,
-        w: (tr.w - indent - icon_w - theme::zpx(4.0)).max(0.0),
+        w: (tr.x + tr.w - field_x).max(0.0),
         h: theme::TREE_ROW_HEIGHT(),
     };
     (row_rect, icon_rect, field)

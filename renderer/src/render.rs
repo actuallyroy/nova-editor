@@ -59,6 +59,14 @@ fn rel_time(secs_ago: i64) -> String {
     format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
+/// Absolute icon-column x for the inline new-file/folder input at `depth`, taken from
+/// the tree so it aligns with siblings; falls back to the legacy indent math.
+fn create_icon_x(list: &crate::widgets::IconList, tr: Rect, depth: usize) -> f32 {
+    list.icon_x_for_depth(depth)
+        .map(|x0| tr.x + list.pad_x() + x0)
+        .unwrap_or(tr.x + theme::zpx(12.0) + depth as f32 * theme::zpx(8.0))
+}
+
 /// Geometry of the inline gutter-diff peek zone (shared by the renderer and input
 /// hit-testing so the close/nav buttons, scrollbar, and wheel all use one layout).
 pub(crate) struct PeekGeom {
@@ -1079,7 +1087,7 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             }
             // Inline-create row highlight (at the insert position).
             if let Some(pc) = app.explorer.creating.as_ref() {
-                let (row_rect, _, _) = create_row_geometry(tr, pc.row, pc.depth);
+                let (row_rect, _, _) = create_row_geometry(tr, pc.row, create_icon_x(&gpu.ui.sidebar, tr, pc.depth));
                 if let Some(rr) = clip_row(row_rect) {
                     bg_quads.push(rr.quad(theme::TREE_SELECTED()));
                 }
@@ -1871,14 +1879,29 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
             let track = d.scroll.vtrack_rect();
             let total = d.rope.len_lines().max(1) as f32;
             let mh = theme::zpx(3.0).max(2.0);
-            for &(line, kind) in &d.gutter_changes {
-                let color = match kind {
-                    crate::gutter_diff::Change::Added => theme::GUTTER_ADD(),
-                    crate::gutter_diff::Change::Modified => theme::GUTTER_MOD(),
-                    crate::gutter_diff::Change::Deleted => theme::GUTTER_DEL(),
-                };
-                let y = track.y + (line as f32 / total) * track.h - mh * 0.5;
-                fg_quads.push(Quad::new(track.x, y, track.w, mh, color));
+            let col = |k: crate::gutter_diff::Change| match k {
+                crate::gutter_diff::Change::Added => theme::GUTTER_ADD(),
+                crate::gutter_diff::Change::Modified => theme::GUTTER_MOD(),
+                crate::gutter_diff::Change::Deleted => theme::GUTTER_DEL(),
+            };
+            // Merge consecutive same-kind lines into one bar so a big block of changes
+            // reads as a solid mark, not a dashed strip of per-line ticks.
+            let marks = &d.gutter_changes; // sorted by line
+            let mut i = 0;
+            while i < marks.len() {
+                let (start_line, kind) = marks[i];
+                let mut j = i;
+                while j + 1 < marks.len()
+                    && marks[j + 1].1 == kind
+                    && marks[j + 1].0 == marks[j].0 + 1
+                {
+                    j += 1;
+                }
+                let y0 = track.y + (start_line as f32 / total) * track.h;
+                let y1 = track.y + ((marks[j].0 + 1) as f32 / total) * track.h;
+                let h = (y1 - y0).max(mh);
+                fg_quads.push(Quad::new(track.x, y0, track.w, h, col(kind)));
+                i = j + 1;
             }
         }
         // Overview markers: a tick on the scrollbar track per match — find results
@@ -2063,7 +2086,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
     // Text-input carets (blink-gated, drawn on top via fg_quads).
     if app.cursor_blink_on {
         if let Some(pc) = app.explorer.creating.as_ref() {
-            let (_, _, field) = create_row_geometry(layout.tree_region(), pc.row, pc.depth);
+            let tr = layout.tree_region();
+            let (_, _, field) = create_row_geometry(tr, pc.row, create_icon_x(&gpu.ui.sidebar, tr, pc.depth));
             fg_quads.push(gpu.create_input.caret_quad(field, 0.0));
         }
         // (The Extensions and Search panels draw their carets in their own draw_quads.)
@@ -2219,7 +2243,8 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
                 let rowh = theme::TREE_ROW_HEIGHT();
                 // Scrolled tree origin: rows (and the inline create field) shift up by `sy`.
                 let stop = tr.y - sy;
-                let (_, icon_rect, field) = create_row_geometry(Rect { y: stop, ..tr }, pc.row, pc.depth);
+                let crow = Rect { y: stop, ..tr };
+                let (_, icon_rect, field) = create_row_geometry(crow, pc.row, create_icon_x(&gpu.ui.sidebar, crow, pc.depth));
                 let split = stop + pc.row as f32 * rowh; // top of the create row
                 if split > tr.y {
                     let clip_a = Rect { x: tr.x, y: tr.y, w: tr.w, h: (split - tr.y).min(tr.h) };

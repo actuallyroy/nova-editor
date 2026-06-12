@@ -2259,6 +2259,16 @@ impl App {
             }
             menus::MenuCmd::NewWindow => self.open_new_window(),
             menus::MenuCmd::OpenRecent => self.open_recent_picker(),
+            menus::MenuCmd::OpenRecentPath(i) => {
+                // Same filter/order the native submenu was built with.
+                let recents: Vec<PathBuf> =
+                    state::State::load().recent.into_iter().filter(|p| p.is_dir()).collect();
+                if let Some(p) = recents.get(i).cloned() {
+                    self.open_folder(p);
+                } else {
+                    self.show_info_dialog("That folder no longer exists.");
+                }
+            }
             menus::MenuCmd::AutoSave => {
                 settings::set_auto_save(!settings::auto_save());
             }
@@ -4710,6 +4720,12 @@ impl App {
         }
         self.refresh_source_control(); // update the change-count badge for the new repo
         self.persist_state(); // remember this folder for the next launch
+        self.start_fs_watcher(); // watch the new workspace root
+        // Rebuild the native menu so the "Open Recent" submenu reflects the new entry.
+        #[cfg(target_os = "macos")]
+        {
+            self.macos_menu = Some(macos_menu::install());
+        }
         self.redraw();
     }
 

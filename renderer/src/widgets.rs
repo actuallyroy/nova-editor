@@ -1848,6 +1848,13 @@ impl IconList {
         let (_, _, _, b0, b1) = self.row_icons.get(row).copied().flatten()?;
         self.list.line_x_range(row, b0, b1)
     }
+    /// Where a row's icon column starts (relative to the list's left edge) for the
+    /// given indent `depth` — taken from a real row at that depth so the inline
+    /// new-file/folder input aligns to the tree exactly (no hard-coded indent math).
+    pub fn icon_x_for_depth(&self, depth: usize) -> Option<f32> {
+        let row = self.row_depths.iter().position(|&d| d == depth)?;
+        self.icon_x_span(row).map(|(x0, _)| x0)
+    }
     /// Pixel x-span of a byte range within a row's text — for highlighting substrings
     /// (e.g. search matches). Byte offsets are into the full rendered row text, so
     /// callers add the row's indent/icon prefix length themselves.

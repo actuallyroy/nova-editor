@@ -17,7 +17,8 @@ pub enum MenuCmd {
     CheckUpdate,  // check GitHub for a newer release
     About,        // show version info
     NewWindow,    // open a new app window
-    OpenRecent,   // quick-pick of recent folders
+    OpenRecent,   // quick-pick of recent folders (fallback, e.g. empty list)
+    OpenRecentPath(usize), // open the Nth recent folder (native Open Recent submenu)
     AutoSave,     // toggle files.autoSave (afterDelay)
     RevertFile,   // reload the active doc from disk
     CloseFolder,  // back to a folder-less window
