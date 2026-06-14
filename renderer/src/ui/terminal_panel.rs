@@ -704,9 +704,10 @@ impl TerminalPanel {
         self.url_span_at(pt, layout, cell_w).map(|(_, url)| url)
     }
 
-    /// The URL under `pt` plus the screen rect of its cells (for the Ctrl-hover
-    /// underline highlight).
-    pub fn url_span_at(&self, pt: (f32, f32), layout: &Layout, cell_w: f32) -> Option<(Rect, String)> {
+    /// The URL under `pt` plus the screen rects of its cells — one rect per row the
+    /// link spans (a hard-wrapped URL occupies several rows) for the Ctrl-hover
+    /// underline highlight.
+    pub fn url_span_at(&self, pt: (f32, f32), layout: &Layout, cell_w: f32) -> Option<(Vec<Rect>, String)> {
         if !self.visible {
             return None;
         }
@@ -721,27 +722,76 @@ impl TerminalPanel {
         let r = rects[i];
         let pane = self.groups.get(self.active)?.panes.get(i)?;
         let (line, col) = Self::cell_at(r, pt, cell_w, pane);
-        let chars = pane.term.line_chars(line);
+        // A long URL the shell hard-wraps spans several rows. Rebuild the logical
+        // line by stitching wrap-continued rows together (a row is a continuation
+        // when the row above it fills every column), so the whole link resolves —
+        // not just the first row's slice. `click_col` is the click's offset into
+        // the joined buffer; `row_off` is where the clicked row starts in it.
+        let (cols, _) = pane.term.dims();
+        let is_wrapped = |ln: usize| -> bool {
+            if cols == 0 {
+                return false;
+            }
+            let c = pane.term.line_chars(ln);
+            c.len() >= cols && !matches!(c.get(cols - 1), None | Some(' ') | Some('\0'))
+        };
+        let mut start = line;
+        while start > 0 && is_wrapped(start - 1) {
+            start -= 1;
+        }
+        let mut chars: Vec<char> = Vec::new();
+        let mut click_col = col;
+        let mut row_off = 0usize;
+        let mut ln = start;
+        loop {
+            let c = pane.term.line_chars(ln);
+            if ln == line {
+                row_off = chars.len();
+                click_col = chars.len() + col;
+            }
+            let wrapped = is_wrapped(ln);
+            let take = if wrapped { cols.min(c.len()) } else { c.len() };
+            chars.extend(c[..take].iter());
+            if wrapped {
+                ln += 1;
+            } else {
+                break;
+            }
+        }
+        let col = click_col;
+        let _ = row_off;
         // Prefer the shell's live cwd (OSC 7) for resolving relative paths, falling
         // back to the workspace root the terminal was opened in.
         let base = pane.term.cwd().unwrap_or(&self.cwd);
         let url = url_token_at(&chars, col)
             .or_else(|| path_token_at(&chars, col).and_then(|p| resolve_against(base, &p)))?;
         // On-screen cell span: the whitespace-delimited token minus trailing
-        // punctuation (which `url_token_at` also trims).
+        // punctuation (which `url_token_at` also trims). Every joined row above the
+        // last contributes exactly `cols` chars, so a joined index maps uniformly to
+        // (row, col): the token may span several wrapped rows — emit one rect each.
         let (s, e) = word_bounds(&chars, col);
         let mut end = e;
         while end > s && matches!(chars[end - 1], '.' | ',' | ';' | ':' | ')' | ']' | '}' | '>' | '"' | '\'' | '\0') {
             end -= 1;
         }
-        let len = end.saturating_sub(s);
         let line_h = theme::LINE_HEIGHT();
         let top_line = (pane.scroll.offset().1 / line_h).round() as usize;
-        let vis_row = line.saturating_sub(top_line);
-        let x0 = r.x + theme::zpx(8.0) + s as f32 * cell_w;
-        let y0 = r.y + theme::zpx(4.0) + vis_row as f32 * line_h;
-        let rect = Rect { x: x0, y: y0, w: len as f32 * cell_w, h: line_h };
-        Some((rect, url))
+        let mut rects = Vec::new();
+        if cols > 0 && end > s {
+            let first_row = s / cols;
+            let last_row = (end - 1) / cols;
+            for rw in first_row..=last_row {
+                let base_idx = rw * cols;
+                let cs = s.max(base_idx) - base_idx;
+                let ce = end.min(base_idx + cols) - base_idx;
+                let abs_line = start + rw;
+                let vis_row = abs_line.saturating_sub(top_line);
+                let x0 = r.x + theme::zpx(8.0) + cs as f32 * cell_w;
+                let y0 = r.y + theme::zpx(4.0) + vis_row as f32 * line_h;
+                rects.push(Rect { x: x0, y: y0, w: (ce - cs) as f32 * cell_w, h: line_h });
+            }
+        }
+        Some((rects, url))
     }
 
     fn cell_at(rect: Rect, pt: (f32, f32), cell_w: f32, pane: &terminal::Pane) -> (usize, usize) {

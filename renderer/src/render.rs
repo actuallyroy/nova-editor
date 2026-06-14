@@ -2059,9 +2059,11 @@ pub(crate) fn render(app: &mut App) -> Result<()> {
         let link_mod = app.mods.control_key() || (cfg!(target_os = "macos") && app.mods.super_key());
         if link_mod {
             let mp = (app.mouse_pos.x as f32, app.mouse_pos.y as f32);
-            if let Some((r, _)) = app.terminal.url_span_at(mp, &layout, app.terminal_cell_w) {
-                bg_quads.push(Quad::new(r.x, r.y, r.w, r.h, theme::LINK_BG()));
-                fg_quads.push(Quad::new(r.x, r.y + r.h - theme::zpx(2.0), r.w, theme::zpx(1.5), theme::LINK()));
+            if let Some((rects, _)) = app.terminal.url_span_at(mp, &layout, app.terminal_cell_w) {
+                for r in rects {
+                    bg_quads.push(Quad::new(r.x, r.y, r.w, r.h, theme::LINK_BG()));
+                    fg_quads.push(Quad::new(r.x, r.y + r.h - theme::zpx(2.0), r.w, theme::zpx(1.5), theme::LINK()));
+                }
             }
         }
     }
